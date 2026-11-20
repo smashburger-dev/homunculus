@@ -14,6 +14,11 @@ blocker forces ``keep``, extends ``valid_until`` by 7 days and asks the owner.
 Every LLM output is scanned for diagnostic vocabulary; a hit is re-asked once
 and a second hit aborts the review. Aborts keep the plan and alert the owner.
 
+The packet's ``frontier`` section carries the novelty lane (docs/NOVELTY_LANE.md):
+deep-dive candidates, running frontier experiments and the quota. A draft
+that would run more than one frontier experiment is re-asked, and Amygdala
+round 1 must challenge every frontier promotion with the deep-dive ref.
+
 ``run_insula`` and ``run_motor_cortex`` are the Saturday steps,
 ``run_thalamus`` the Thursday batch extraction. All LLM calls go through
 ``agents.call`` or the roster provider's batch API, priced by ``Budget``.
@@ -33,7 +38,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
-from homunculus import agents, beliefs, evidence, experiments, guardrails, insula, metrics, plans, scouts
+from homunculus import agents, beliefs, deepdive, evidence, experiments, guardrails, insula, metrics, plans, scouts
 from homunculus.agents import BotSpec, Budget, LLMRequest, LLMResponse, Provider
 from homunculus.checkins import NOTE_ITEM, SESSION_ITEM, SYMPTOM_PREFIX, subjective_scores
 from homunculus.evidence import OwnerProfile
@@ -59,6 +64,9 @@ WEIGHT_METRICS = ("weight_body_mass", "body_mass")
 INSULA_FILE = "00-insula-reconciliation.json"
 MOTOR_CORTEX_FILE = "00-motor-cortex-proposals.json"
 THALAMUS_BATCH = "evidence/batches/thalamus.json"
+FRONTIER_MAX_RUNNING = 1  # frontier experiments running at once
+FRONTIER_MIN_PER_MONTH = 1  # frontier candidates surfaced in review packets per calendar month
+FRONTIER_PACKET_MAX = 3
 
 _WEEK_RE = re.compile(r"^(\d{4})-W(\d{2})$")
 _PRIVATE_KEYS = frozenset({
@@ -275,6 +283,7 @@ def build_packet(store: Store, ledger: Ledger, week: str, cfg: MetricsConfig, no
         "papers_actionable": _papers_actionable(ledger),
         "beliefs_changed": _beliefs_changed(ledger, days),
         "experiments": _experiments(ledger),
+        "frontier": _frontier(ledger, week),
         "guard_context": _guard_dict(ctx),
         "freshness": metrics.freshness(store.latest_ts(), now, FRESHNESS_H),
         "budget": _budget_summary(ledger, now),
@@ -376,6 +385,134 @@ def _experiment_summary(ledger: Ledger, rel: str) -> dict:
 
 def _experiments(ledger: Ledger) -> list[dict]:
     return [_experiment_summary(ledger, rel) for rel in ledger.glob("experiments/*/protocol.json")]
+
+
+# -- frontier lane
+
+
+def _dives(ledger: Ledger) -> list[tuple[str, dict]]:
+    out = []
+    for rel in ledger.glob(f"{deepdive.DIVES_DIR}/*.json"):
+        rec = ledger.read_json(rel)
+        if isinstance(rec, Mapping) and isinstance(rec.get("belief_id"), str):
+            out.append((rel, dict(rec)))
+    return out
+
+
+def _running(exp: Mapping[str, Any]) -> bool:
+    result = exp.get("result")
+    return not isinstance(result, Mapping) or result.get("decision") == "extend"
+
+
+def _dive_rank(item: tuple[str, Mapping[str, Any]]) -> tuple:
+    rel, rec = item
+    support = float((rec.get("chain") or {}).get("support") or 0.0)
+    return rec.get("decision") != "n_of_1_candidate", -support, rel
+
+
+def _dive_summary(rel: str, rec: Mapping[str, Any]) -> dict:
+    return {
+        "ref": rel, "paper": rec.get("paper"), "belief_id": rec["belief_id"], "decision": rec.get("decision"),
+        "claim": rec.get("claim"), "chain": rec.get("chain"), "reasons": list(rec.get("reasons") or ()),
+        "open_questions": [q.get("text") for q in rec.get("open_questions") or () if isinstance(q, Mapping)],
+    }
+
+
+def _month(week: str) -> str:
+    return _week_days(week)[-1][:7]
+
+
+def _surfaced_before(ledger: Ledger, week: str) -> int:
+    """Frontier candidates in other packets of the same calendar month (by the week's Sunday)."""
+    total = 0
+    for rel in ledger.glob("reviews/*/packet.json"):
+        other = rel.split("/")[1]
+        if other == week or not _WEEK_RE.match(other) or _month(other) != _month(week):
+            continue
+        frontier = (ledger.read_json(rel) or {}).get("frontier") or {}
+        total += len(frontier.get("candidates") or ())
+    return total
+
+
+def select_frontier(dives: Sequence[tuple[str, Mapping[str, Any]]], tested: set[str],
+                    surfaced_before: int) -> list[tuple[str, Mapping[str, Any]]]:
+    """Untested N-of-1 candidates, best chain first; without any, the best watch dive when the month's quota is due."""
+    untested = sorted((d for d in dives if d[1]["belief_id"] not in tested), key=_dive_rank)
+    promoted = [d for d in untested if d[1].get("decision") == "n_of_1_candidate"]
+    if promoted:
+        return promoted[:FRONTIER_PACKET_MAX]
+    return untested[:1] if surfaced_before < FRONTIER_MIN_PER_MONTH else []
+
+
+def frontier_quota(running: int, surfaced_before: int, surfaced_now: int) -> dict:
+    surfaced = surfaced_before + surfaced_now
+    return {"max_running": FRONTIER_MAX_RUNNING, "running": running, "may_start": running < FRONTIER_MAX_RUNNING,
+            "min_per_month": FRONTIER_MIN_PER_MONTH, "surfaced_this_month": surfaced,
+            "met": surfaced >= FRONTIER_MIN_PER_MONTH}
+
+
+def _frontier(ledger: Ledger, week: str) -> dict:
+    dives = _dives(ledger)
+    beliefs_map = {rec["belief_id"]: rel for rel, rec in dives}
+    frontier_exps = [e for e in _experiments(ledger) if e.get("belief_id") in beliefs_map]
+    running = [e["ref"] for e in frontier_exps if _running(e)]
+    before = _surfaced_before(ledger, week)
+    chosen = select_frontier(dives, {str(e.get("belief_id")) for e in frontier_exps}, before)
+    return {"quota": frontier_quota(len(running), before, len(chosen)),
+            "candidates": [_dive_summary(rel, rec) for rel, rec in chosen], "running": running,
+            "beliefs": beliefs_map}
+
+
+def _surfaced_in(ledger: Ledger, month: str) -> int:
+    """Frontier candidates in the packets of the weeks whose Sunday falls in month."""
+    total = 0
+    for rel in ledger.glob("reviews/*/packet.json"):
+        week = rel.split("/")[1]
+        if _WEEK_RE.match(week) and _month(week) == month:
+            total += len(((ledger.read_json(rel) or {}).get("frontier") or {}).get("candidates") or ())
+    return total
+
+
+def frontier_month(ledger: Ledger, month: str) -> dict:
+    """Monthly frontier review: candidates the month's packets surfaced, running frontier experiments, next pick."""
+    surfaced = _surfaced_in(ledger, month)
+    dives = _dives(ledger)
+    beliefs_map = {rec["belief_id"]: rel for rel, rec in dives}
+    exps = [e for e in _experiments(ledger) if e.get("belief_id") in beliefs_map]
+    chosen = select_frontier(dives, {str(e.get("belief_id")) for e in exps}, surfaced)
+    return {"schema": 1, "month": month, "surfaced": surfaced, "met": surfaced >= FRONTIER_MIN_PER_MONTH,
+            "running": [e["ref"] for e in exps if _running(e)],
+            "next": [_dive_summary(rel, rec) for rel, rec in chosen]}
+
+
+def _frontier_proposals(draft: Mapping[str, Any], frontier: Any) -> list[tuple[str, str]]:
+    """(belief_id, deep-dive ref) for every proposed experiment on a frontier belief."""
+    beliefs_map = frontier.get("beliefs") if isinstance(frontier, Mapping) else None
+    if not isinstance(beliefs_map, Mapping):
+        return []
+    proposed = [e.get("belief_id") for e in draft.get("experiments_proposed") or () if isinstance(e, Mapping)]
+    return [(b, beliefs_map[b]) for b in proposed if b in beliefs_map]
+
+
+def frontier_promotions(draft: Mapping[str, Any], frontier: Any) -> dict[str, str]:
+    """belief_id -> deep-dive ref for every frontier belief the draft proposes to test."""
+    return dict(_frontier_proposals(draft, frontier))
+
+
+def frontier_quota_problems(draft: Mapping[str, Any], frontier: Any) -> list[str]:
+    """A draft may start a frontier experiment only while none is running, and only one."""
+    proposals = _frontier_proposals(draft, frontier)
+    if not proposals:
+        return []
+    excess = int((frontier.get("quota") or {}).get("running", 0)) + len(proposals) - FRONTIER_MAX_RUNNING
+    return [f"frontier_quota:{excess}_over_max_{FRONTIER_MAX_RUNNING}"] if excess > 0 else []
+
+
+def unchallenged_frontier(draft: Mapping[str, Any], challenge: Mapping[str, Any], frontier: Any) -> list[str]:
+    """Frontier promotions in the draft that no challenge item cites by their deep-dive ref."""
+    cited = {i.get("ref") for i in challenge.get("items") or () if isinstance(i, Mapping)}
+    promoted = frontier_promotions(draft, frontier)
+    return [f"frontier_unchallenged:{b}" for b, ref in sorted(promoted.items()) if ref not in cited]
 
 
 def _budget_summary(ledger: Ledger, now: datetime) -> dict:
@@ -740,8 +877,9 @@ def _guarded(rv: _Review) -> ReviewOutcome:
         return _loop(rv)
     except _Abort as exc:
         return _abort(rv, exc.reason)
-    except _Rejected:
-        return _abort(rv, "scan_text")
+    except _Rejected as exc:
+        frontier = all(p.startswith("frontier_") for p in exc.problems)
+        return _abort(rv, "frontier" if frontier else "scan_text")
     except agents.BudgetExceeded:
         return _abort(rv, "budget")
     except agents.ProviderError:
@@ -749,7 +887,7 @@ def _guarded(rv: _Review) -> ReviewOutcome:
 
 
 def _loop(rv: _Review) -> ReviewOutcome:
-    draft = _turn(rv, STEPS["draft"], {"task": "draft"}, DRAFT_SCHEMA, _draft_shape(rv))
+    draft = _turn(rv, STEPS["draft"], {"task": "draft"}, DRAFT_SCHEMA, _draft_shape(rv), _draft_check(rv))
     diff = [dict(op) for op in draft["plan_diff"]]
     blockers: dict[str, dict] = {}
     diff, changed = _round(rv, 1, diff, None, blockers)
@@ -762,7 +900,8 @@ def _round(rv: _Review, round_: int, diff: list[dict], changed: set[str] | None,
            blockers: dict[str, dict]) -> tuple[list[dict], set[str]]:
     """One challenge and, when anything survived the filters, one answer."""
     extra = {"task": "challenge", "round": round_, "changed_paths": sorted(changed) if changed else None}
-    out = _turn(rv, STEPS[f"challenge{round_}"], extra, CHALLENGE_SCHEMA, _challenge_shape(rv, round_, changed))
+    out = _turn(rv, STEPS[f"challenge{round_}"], extra, CHALLENGE_SCHEMA, _challenge_shape(rv, round_, changed),
+                _challenge_check(rv, round_))
     items, _ = _filter_challenges(out["items"], rv.refs, round_, changed)
     if not items:
         return diff, set()
@@ -795,12 +934,30 @@ def _context(rv: _Review, step: _Step, extra: Mapping[str, Any]) -> dict:
     }
 
 
-def _turn(rv: _Review, step: _Step, extra: Mapping[str, Any], schema: Mapping[str, Any], shape: Shape) -> dict:
+def _draft_check(rv: _Review) -> Callable[[Any], list[str]]:
+    def check(s: Any) -> list[str]:
+        return _scan_problems(s) + frontier_quota_problems(s, rv.packet.get("frontier"))
+    return check
+
+
+def _challenge_check(rv: _Review, round_: int) -> Callable[[Any], list[str]]:
+    """Round 1 must challenge every frontier promotion of the draft; round 2 only scans."""
+    if round_ != 1 or not rv.thread:
+        return _scan_problems
+    draft = rv.thread[0].get("payload") or {}
+
+    def check(s: Any) -> list[str]:
+        return _scan_problems(s) + unchallenged_frontier(draft, s, rv.packet.get("frontier"))
+    return check
+
+
+def _turn(rv: _Review, step: _Step, extra: Mapping[str, Any], schema: Mapping[str, Any], shape: Shape,
+          check: Callable[[Any], list[str]] = _scan_problems) -> dict:
     """Ask one bot, check the loop bounds, and store its message."""
     if len(rv.paths) >= MAX_MESSAGES:
         raise _Abort("loop")
     run_id = _run_id(rv.week, step.bot, step.round)
-    structured, resp = rv.caller.ask(step.bot, _context(rv, step, extra), schema, run_id)
+    structured, resp = rv.caller.ask(step.bot, _context(rv, step, extra), schema, run_id, check)
     digest = _sha(structured)
     if digest in rv.hashes:
         raise _Abort("loop")

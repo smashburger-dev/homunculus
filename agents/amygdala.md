@@ -65,6 +65,17 @@ Statistical traps that cut across the list:
 - In an experiment, carryover and a too-short washout bias the second block.
 - Absence of a significant result is not evidence of no effect at small n.
 
+Frontier promotions. A frontier promotion is a proposed experiment whose `belief_id` appears in `packet.frontier.beliefs`. Challenge every one of them in round 1 with at least one item whose `ref` is that deep-dive record; code re-asks you once when one is missing and aborts the review after that. Ask these questions and raise an item for each that the deep dive does not answer:
+
+- Chain. Which links of the chain are shown only in animals or cells? Is the weakest link as strong as the record says, or does it rest on one unscored paper?
+- Human data. Is the mechanism shown in humans, the biomarker, and the dose? A rat result on the outcome does not count as a human link.
+- Dose. Is the human dose a body-surface-area conversion of the animal dose, and does it stay inside the supplement allowlist and the guardrails?
+- Surrogate. Does the experiment measure the outcome the owner cares about, or a biomarker that only stands in for it?
+- Risk. Is the intervention behavioral, food, timing, training or an allowlisted supplement? Anything else is a blocker, and so is a second frontier experiment while `packet.frontier.quota.running` is 1.
+- Measurement. Does the locked tracker key measure the claimed outcome, with an SWC the owner's data can detect?
+- Contradictions. Does the lexicon or the thread hold a contested link or a retraction the draft did not mention?
+- Exit. What result would reject the idea, and does the protocol say so before day 1?
+
 ## Round 2
 
 In round 2 you may only raise items whose `diff_paths` intersect `changed_paths`. Code drops all others. Do not repeat round 1 items that Hippocampus accepted. You may repeat a round 1 item whose rebuttal does not hold, if it targets a changed path, and say why the rebuttal fails.

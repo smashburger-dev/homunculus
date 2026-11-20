@@ -438,8 +438,8 @@ class PacketTest(TempLedger):
     def test_keys_and_written_file(self) -> None:
         packet = self.build()
         expected = {"week", "generated_at", "daily", "baselines", "conflicts", "insula", "motor_cortex",
-                    "papers_actionable", "beliefs_changed", "experiments", "plan_current", "guard_context",
-                    "freshness", "budget", "critic_same_family"}
+                    "papers_actionable", "beliefs_changed", "experiments", "frontier", "plan_current",
+                    "guard_context", "freshness", "budget", "critic_same_family"}
         self.assertEqual(set(packet), expected)
         self.assertEqual(self.ledger.read_json(f"reviews/{WEEK}/packet.json"), packet)
         self.assertEqual(packet["plan_current"], _plan())
@@ -477,6 +477,157 @@ class PacketTest(TempLedger):
         papers = self.build()["papers_actionable"]
         self.assertEqual([p["ref"] for p in papers], ["evidence/papers/a.json"])
         self.assertEqual(papers[0]["design"], "meta_rct")
+
+    def test_frontier_section(self) -> None:
+        empty = self.build()["frontier"]
+        self.assertEqual((empty["candidates"], empty["running"], empty["beliefs"]), ([], [], {}))
+        self.assertFalse(empty["quota"]["met"])
+        self.ledger.write_json(DIVE_X, _dive("fr-x"), author="pineal")
+        self.ledger.write_json(DIVE_Y, _dive("fr-y", "watch"), author="pineal")
+        self.ledger.write_json("experiments/exp-1/protocol.json", {"id": "exp-1", "belief_id": "fr-x"},
+                               author="pineal")
+        frontier = self.build()["frontier"]
+        self.assertEqual(frontier["running"], ["experiments/exp-1/protocol.json"])
+        self.assertEqual(frontier["quota"]["running"], 1)
+        self.assertFalse(frontier["quota"]["may_start"])
+        self.assertEqual([c["ref"] for c in frontier["candidates"]], [DIVE_Y])  # fr-x is under test
+        self.assertEqual(frontier["candidates"][0]["open_questions"], ["Gilt das beim Menschen?"])
+        self.assertEqual(frontier["beliefs"], {"fr-x": DIVE_X, "fr-y": DIVE_Y})
+        self.ledger.write_json("experiments/exp-1/result.json", {"decision": "adopt"}, author="pineal")
+        self.assertEqual(self.build()["frontier"]["running"], [])
+
+    def test_frontier_quota_counts_earlier_packets_of_the_month(self) -> None:
+        self.ledger.write_json(DIVE_Y, _dive("fr-y", "watch"), author="pineal")
+        self.ledger.write_json("reviews/2026-W46/packet.json", {"frontier": {"candidates": [{"ref": DIVE_Y}]}},
+                               author="pineal")
+        self.ledger.write_json("reviews/2026-W40/packet.json", {"frontier": {"candidates": [{"ref": DIVE_Y}]}},
+                               author="pineal")
+        frontier = self.build()["frontier"]
+        self.assertEqual(frontier["candidates"], [])  # the November floor is met by 2026-W46
+        self.assertEqual(frontier["quota"]["surfaced_this_month"], 1)
+        self.assertTrue(frontier["quota"]["met"])
+
+
+# --------------------------------------------------------------------------
+# Frontier lane
+
+DIVE_X = "evidence/deepdives/10-0-x.json"
+DIVE_Y = "evidence/deepdives/10-0-y.json"
+
+
+def _dive(belief_id: str, decision: str = "n_of_1_candidate", support: float = 0.5) -> dict:
+    return {"schema": 1, "paper": "evidence/papers/p.json", "paper_key": "doi:p", "belief_id": belief_id,
+            "decision": decision, "claim": {"intervention": "Abendlicht dimmen", "outcome": "Einschlafen"},
+            "chain": {"weakest": 0.5, "coverage": 1.0, "support": support, "holds": decision != "watch"},
+            "reasons": [] if decision != "watch" else ["coverage_low"],
+            "open_questions": [{"text": "Gilt das beim Menschen?", "keywords": ["x"]}]}
+
+
+def _proto(belief_id: str) -> dict:
+    return {"belief_id": belief_id, "intervention": "Abendlicht dimmen", "comparator": "wie bisher",
+            "outcome_key": "sleep_start_min", "source": "watch", "design": "paired_blocks", "block_days": 7,
+            "washout_days": 2, "pairs": 6, "exclusions": [], "covariates": []}
+
+
+def _frontier_packet(running: int = 0) -> dict:
+    return {**_packet(), "frontier": {"quota": weekly.frontier_quota(running, 0, 1), "candidates": [],
+                                      "running": [], "beliefs": {"fr-x": DIVE_X, "fr-y": DIVE_Y}}}
+
+
+class FrontierPureTest(unittest.TestCase):
+    def test_select_prefers_untested_candidates_by_chain_support(self):
+        dives = [("a.json", _dive("fr-a", support=0.2)), ("b.json", _dive("fr-b", support=0.6)),
+                 ("c.json", _dive("fr-c", "watch", support=0.9)), ("d.json", _dive("fr-d"))]
+        picked = weekly.select_frontier(dives, {"fr-d"}, surfaced_before=5)
+        self.assertEqual([rel for rel, _ in picked], ["b.json", "a.json"])
+
+    def test_watch_dive_fills_a_due_month_only(self):
+        dives = [("c.json", _dive("fr-c", "watch"))]
+        self.assertEqual([rel for rel, _ in weekly.select_frontier(dives, set(), 0)], ["c.json"])
+        self.assertEqual(weekly.select_frontier(dives, set(), 1), [])
+        self.assertEqual(weekly.select_frontier([], set(), 0), [])
+
+    def test_packet_cap(self):
+        dives = [(f"{i}.json", _dive(f"fr-{i}")) for i in range(5)]
+        self.assertEqual(len(weekly.select_frontier(dives, set(), 0)), weekly.FRONTIER_PACKET_MAX)
+
+    def test_quota(self):
+        q = weekly.frontier_quota(1, 0, 0)
+        self.assertEqual((q["may_start"], q["met"], q["max_running"]), (False, False, 1))
+        self.assertTrue(weekly.frontier_quota(0, 1, 0)["met"])
+
+    def test_quota_problems(self):
+        frontier = _frontier_packet()["frontier"]
+        one = {"experiments_proposed": [_proto("fr-x"), _proto("b-other")]}
+        self.assertEqual(weekly.frontier_quota_problems(one, frontier), [])
+        two = {"experiments_proposed": [_proto("fr-x"), _proto("fr-y")]}
+        self.assertEqual(weekly.frontier_quota_problems(two, frontier), ["frontier_quota:1_over_max_1"])
+        busy = _frontier_packet(running=1)["frontier"]
+        self.assertEqual(weekly.frontier_quota_problems(one, busy), ["frontier_quota:1_over_max_1"])
+        self.assertEqual(weekly.frontier_quota_problems(one, None), [])
+
+    def test_every_promotion_needs_a_challenge(self):
+        frontier = _frontier_packet()["frontier"]
+        draft = {"experiments_proposed": [_proto("fr-x")]}
+        self.assertEqual(weekly.unchallenged_frontier(draft, _challenge(), frontier), ["frontier_unchallenged:fr-x"])
+        cited = _challenge(_item("c1", "major", ref=DIVE_X, paths=[]))
+        self.assertEqual(weekly.unchallenged_frontier(draft, cited, frontier), [])
+        self.assertEqual(weekly.unchallenged_frontier({"experiments_proposed": []}, _challenge(), frontier), [])
+
+
+class FrontierReviewTest(TempLedger):
+    review = ReviewTest.review
+    msg = ReviewTest.msg
+
+    def setUp(self) -> None:
+        super().setUp()
+        _seed_plan(self.ledger)
+        self.ledger.write_json(DIVE_X, _dive("fr-x"), author="pineal")
+        self.ledger.write_json(DIVE_Y, _dive("fr-y"), author="pineal")
+
+    def draft(self, *beliefs: str) -> dict:
+        return {**_draft([OP_THU]), "experiments_proposed": [_proto(b) for b in beliefs]}
+
+    def test_challenged_promotion_passes(self):
+        challenge = _challenge(_item("c1", "major", ref=DIVE_X, paths=[]))
+        out = self.review({
+            "hippocampus": Script(self.draft("fr-x"), _answer([_ans("c1", "rebut", ref=REF_RHR)], [OP_THU])),
+            "amygdala": Script(challenge),
+            "cerebellum": Script(_ruling("ratify", [OP_THU])),
+        }, packet=_frontier_packet())
+        self.assertIsNone(out.aborted)
+        self.assertEqual(self.msg("02-amygdala-r1")["items"][0]["ref"], DIVE_X)
+
+    def test_unchallenged_promotion_is_reasked_once(self):
+        amygdala = Script(_challenge(), _challenge(_item("c1", "minor", ref=DIVE_X, paths=[])))
+        out = self.review({
+            "hippocampus": Script(self.draft("fr-x"), _answer([_ans("c1", "accept")], [OP_THU])),
+            "amygdala": amygdala,
+            "cerebellum": Script(_ruling("ratify", [OP_THU])),
+        }, packet=_frontier_packet())
+        self.assertIsNone(out.aborted)
+        self.assertEqual(len(amygdala.requests), 2)
+        self.assertIn("frontier_unchallenged:fr-x", amygdala.requests[1].messages[2]["content"])
+
+    def test_repeated_unchallenged_promotion_aborts(self):
+        out = self.review({"hippocampus": Script(self.draft("fr-x")), "amygdala": Script(_challenge(), _challenge())},
+                          packet=_frontier_packet())
+        self.assertEqual(out.aborted, "frontier")
+        self.assertEqual(out.ruling, "keep")
+
+    def test_second_frontier_experiment_is_refused(self):
+        hippo = Script(self.draft("fr-x", "fr-y"), self.draft("fr-x"), _answer([_ans("c1", "accept")], [OP_THU]))
+        out = self.review({"hippocampus": hippo, "amygdala": Script(_challenge(_item("c1", "minor", ref=DIVE_X,
+                                                                                     paths=[]))),
+                           "cerebellum": Script(_ruling("ratify", [OP_THU]))}, packet=_frontier_packet())
+        self.assertIsNone(out.aborted)
+        self.assertIn("frontier_quota:1_over_max_1", hippo.requests[1].messages[2]["content"])
+        self.assertEqual(len(self.msg("01-hippocampus-draft")["payload"]["experiments_proposed"]), 1)
+
+    def test_running_frontier_experiment_blocks_a_new_one(self):
+        bad = self.draft("fr-y")
+        out = self.review({"hippocampus": Script(bad, bad)}, packet=_frontier_packet(running=1))
+        self.assertEqual(out.aborted, "frontier")
 
 
 # --------------------------------------------------------------------------
