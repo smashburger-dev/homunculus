@@ -1,0 +1,6 @@
+#!/bin/sh
+# Blocks commits that would leak personal health data or secrets into this public repo.
+# Enable once per clone: git config core.hooksPath .githooks
+set -e
+cd "$(git rev-parse --show-toplevel)"
+exec python3 tools/leak_guard.py
