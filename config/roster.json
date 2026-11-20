@@ -1,0 +1,281 @@
+{
+  "schema": 1,
+  "bots": [
+    {
+      "name": "cerebellum",
+      "anatomy": "Cerebellum: compares intended with actual movement and corrects the error",
+      "role": "Orchestrator. Holds goals, relays them as goal.update, issues the weekly ruling, runs the monthly goal review",
+      "tier": "frontier-top",
+      "provider": "anthropic",
+      "model": "claude-fable-5-2",
+      "alt_provider": null,
+      "alt_model": null,
+      "effort": "high",
+      "user_facing": true,
+      "cadence": "Weekly ruling Sun 21:00; monthly goal review; on owner message",
+      "prompt_file": "cerebellum.md",
+      "writes": [
+        "reviews/*/06-cerebellum-ruling.json",
+        "plans/pending/*.json",
+        "config/goals.md",
+        "mail/*/inbox/*.json"
+      ],
+      "max_tokens": 16000,
+      "daily_usd_cap": 3.0,
+      "_note": "Alternative Gemini 4 Carbon has no verified model ID; no fallback until one is confirmed. Needs 30-day retention, so it gets goal-level context and aggregates only."
+    },
+    {
+      "name": "hippocampus",
+      "anatomy": "Hippocampus: consolidates the day's memories during sleep",
+      "role": "Weekly reviewer. Drafts the review and typed plan_diff, answers each challenge with accept or rebut, designs N-of-1 protocols",
+      "tier": "frontier",
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "alt_provider": null,
+      "alt_model": null,
+      "effort": "high",
+      "user_facing": false,
+      "cadence": "Weekly Sun 17:00 draft, rounds 1 and 2 until 20:30; experiment design on demand",
+      "prompt_file": "hippocampus.md",
+      "writes": [
+        "reviews/*/01-hippocampus-draft.json",
+        "reviews/*/03-hippocampus-r1.json",
+        "reviews/*/05-hippocampus-r2.json",
+        "experiments/*/protocol.json"
+      ],
+      "max_tokens": 16000,
+      "daily_usd_cap": 4.0
+    },
+    {
+      "name": "amygdala",
+      "anatomy": "Amygdala: threat detection",
+      "role": "Adversarial critic. Challenges Hippocampus and Cerebellum with ref-backed items; re-extracts 10% of papers as an audit",
+      "tier": "frontier",
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "alt_provider": null,
+      "alt_model": null,
+      "effort": "high",
+      "user_facing": false,
+      "cadence": "Weekly Sun rounds 1 and 2; Thu audit of 10% of new extractions",
+      "prompt_file": "amygdala.md",
+      "writes": [
+        "reviews/*/02-amygdala-r1.json",
+        "reviews/*/04-amygdala-r2.json",
+        "evidence/papers/*.audit.json"
+      ],
+      "max_tokens": 12000,
+      "daily_usd_cap": 3.0,
+      "_note": "Intended primary is a paid Gemini frontier model (different family). Switch provider to gemini once its model ID is confirmed; until then critic and drafter share a family."
+    },
+    {
+      "name": "thalamus",
+      "anatomy": "Thalamus: gates which sensory signals reach the cortex",
+      "role": "Evidence extraction. Fills paper.json fields with verbatim quotes; never scores",
+      "tier": "frontier",
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "alt_provider": "anthropic",
+      "alt_model": "claude-sonnet-5-5",
+      "effort": "medium",
+      "user_facing": false,
+      "cadence": "Weekly Thu, top 10 candidates via Message Batches",
+      "prompt_file": "thalamus.md",
+      "writes": [
+        "evidence/papers/*.json"
+      ],
+      "max_tokens": 8000,
+      "daily_usd_cap": 2.0,
+      "_note": "Sonnet is mid tier, so agents.call never uses it as a fallback; it stays the second extractor."
+    },
+    {
+      "name": "motor_cortex",
+      "anatomy": "Primary motor cortex: plans and issues movement",
+      "role": "Proposes session changes and novel exercises as feature records; the guardrails solver admits or rejects them",
+      "tier": "frontier",
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "alt_provider": null,
+      "alt_model": null,
+      "effort": "medium",
+      "user_facing": false,
+      "cadence": "Weekly Sat",
+      "prompt_file": "motor_cortex.md",
+      "writes": [
+        "reviews/*/00-motor-cortex-proposals.json"
+      ],
+      "max_tokens": 12000,
+      "daily_usd_cap": 1.5
+    },
+    {
+      "name": "insula",
+      "anatomy": "Insular cortex: interoception, links body signals to feelings",
+      "role": "Explains code-detected conflicts, judges the noisier signal, drafts at most 3 owner questions",
+      "tier": "mid",
+      "provider": "anthropic",
+      "model": "claude-sonnet-5-5",
+      "alt_provider": "anthropic",
+      "alt_model": "claude-haiku-5-5",
+      "effort": "medium",
+      "user_facing": false,
+      "cadence": "Weekly Sat",
+      "prompt_file": "insula.md",
+      "writes": [
+        "reviews/*/00-insula-reconciliation.json",
+        "mail/sartorius/inbox/*.json",
+        "mail/vagus/inbox/*.json"
+      ],
+      "max_tokens": 6000,
+      "daily_usd_cap": 1.0
+    },
+    {
+      "name": "sartorius",
+      "anatomy": "Sartorius: the tailor's muscle, longest in the body",
+      "role": "Fitness coach. Morning session from plans.modulate_day, post-session RPE and gym feel; never adds load",
+      "tier": "frontier",
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "alt_provider": "anthropic",
+      "alt_model": "claude-sonnet-5-5",
+      "effort": "low",
+      "user_facing": true,
+      "cadence": "Daily 07:00; after each workout; on owner message",
+      "prompt_file": "sartorius.md",
+      "writes": [
+        "checkins/*.json",
+        "mail/owner/inbox/*.json"
+      ],
+      "max_tokens": 4000,
+      "daily_usd_cap": 1.5
+    },
+    {
+      "name": "vagus",
+      "anatomy": "Vagus nerve: rest-and-digest, the source of HRV",
+      "role": "Well-being coach. Sleep, mood, stress, enjoyment; morning greeting and 21:00 evening check-in",
+      "tier": "frontier",
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "alt_provider": "anthropic",
+      "alt_model": "claude-sonnet-5-5",
+      "effort": "low",
+      "user_facing": true,
+      "cadence": "Daily 07:00 and 21:00; on owner message",
+      "prompt_file": "vagus.md",
+      "writes": [
+        "checkins/*.json",
+        "mail/owner/inbox/*.json"
+      ],
+      "max_tokens": 4000,
+      "daily_usd_cap": 1.5
+    },
+    {
+      "name": "retina",
+      "anatomy": "Retina: turns light into neural signal",
+      "role": "Paper scout for biology, physiology and neurobiology; classifies into enums only",
+      "tier": "small",
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "alt_provider": null,
+      "alt_model": null,
+      "effort": "low",
+      "user_facing": false,
+      "cadence": "Daily 03:00, cap 30 candidates",
+      "prompt_file": "retina.md",
+      "writes": [
+        "evidence/candidates/*.jsonl",
+        "quarantine/*.txt",
+        "evidence/cache/*"
+      ],
+      "max_tokens": 1024,
+      "daily_usd_cap": 0.25
+    },
+    {
+      "name": "spindle",
+      "anatomy": "Muscle spindle: senses stretch and length change",
+      "role": "Workout and sport-methods scout; outputs exercise feature records",
+      "tier": "small",
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "alt_provider": null,
+      "alt_model": null,
+      "effort": "low",
+      "user_facing": false,
+      "cadence": "Daily 03:00, cap 30",
+      "prompt_file": "spindle.md",
+      "writes": [
+        "evidence/candidates/*.jsonl",
+        "quarantine/*.txt",
+        "evidence/cache/*"
+      ],
+      "max_tokens": 1024,
+      "daily_usd_cap": 0.25
+    },
+    {
+      "name": "papilla",
+      "anatomy": "Lingual papilla: carries the taste buds",
+      "role": "Nutrition and supplement scout; enums only, product names go through the forbidden-list check",
+      "tier": "small",
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "alt_provider": null,
+      "alt_model": null,
+      "effort": "low",
+      "user_facing": false,
+      "cadence": "Daily 03:00, cap 30",
+      "prompt_file": "papilla.md",
+      "writes": [
+        "evidence/candidates/*.jsonl",
+        "quarantine/*.txt",
+        "evidence/cache/*"
+      ],
+      "max_tokens": 1024,
+      "daily_usd_cap": 0.25
+    },
+    {
+      "name": "brainstem",
+      "anatomy": "Brainstem: keeps the vital signs running",
+      "role": "Ingest server for Health Auto Export, check-ins and owner messages",
+      "tier": "code",
+      "provider": "none",
+      "model": "none",
+      "alt_provider": null,
+      "alt_model": null,
+      "effort": "none",
+      "user_facing": false,
+      "cadence": "On event",
+      "prompt_file": "",
+      "writes": [],
+      "max_tokens": 0,
+      "daily_usd_cap": 0.0,
+      "_note": "Writes SQLite and health_raw/, never the ledger."
+    },
+    {
+      "name": "pineal",
+      "anatomy": "Pineal gland: sets the circadian clock",
+      "role": "Scheduler, single git writer, budget guard, alert delivery",
+      "tier": "code",
+      "provider": "none",
+      "model": "none",
+      "alt_provider": null,
+      "alt_model": null,
+      "effort": "none",
+      "user_facing": true,
+      "cadence": "Every minute",
+      "prompt_file": "",
+      "writes": [],
+      "max_tokens": 0,
+      "daily_usd_cap": 0.0,
+      "_note": "Ledger superuser; may write any path."
+    }
+  ],
+  "devin": {
+    "enabled": false,
+    "base_url": "https://api.devin.ai",
+    "api_key_env": "DEVIN_API_KEY",
+    "poll_interval_s": 30,
+    "max_polls": 120,
+    "max_acu_limit": 5,
+    "bots": [],
+    "_note": "Off by default. Devin cannot pin a model and runs on Cognition's machines; list only bots whose context holds no health data. Endpoint paths UNVERIFIED: check docs.devin.ai."
+  }
+}
