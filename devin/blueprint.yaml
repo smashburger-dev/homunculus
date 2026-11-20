@@ -1,0 +1,51 @@
+# Devin environment for the homunculus Bots (Cerebellum, Sartorius, Vagus, Hippocampus).
+#
+# Paste the steps into the environment setup of each Bot, or of the shared
+# environment they use. The key names below are this repo's shorthand; Devin's
+# blueprint schema is not documented in docs/DEVIN_BOTS.md (UNVERIFIED), so map
+# each step onto the fields the setup page shows.
+#
+# Secrets: names only. Set the values in Devin's secret store, per Bot. Never
+# write a value into this file, the engine repo or the ledger repo.
+
+runtime:
+  python: "3.11"          # standard library only; no pip install step
+
+repositories:
+  - name: homunculus                      # engine, public
+    url: https://github.com/<you>/homunculus
+    access: read
+    path: ~/homunculus
+  - name: homunculus-ledger               # owner data, private
+    url: https://github.com/<you>/homunculus-ledger-<you>
+    access: read-write
+    path: ~/homunculus-ledger
+
+env:
+  HOMUNCULUS_LEDGER: ~/homunculus-ledger
+  PYTHONDONTWRITEBYTECODE: "1"
+
+secrets:
+  - ANTHROPIC_API_KEY     # every Bot whose Automations call a model
+  - GEMINI_API_KEY        # only once roster.json moves Amygdala to a paid Gemini model
+  - HOMUNCULUS_MAILTO     # contact address PubMed and Crossref ask scripted clients for; Hippocampus only
+
+setup:
+  - python3 --version     # must print 3.11 or newer
+  - git -C ~/homunculus pull --ff-only
+  - git -C ~/homunculus-ledger pull --ff-only
+  - mkdir -p ~/homunculus-ledger/.private && chmod 700 ~/homunculus-ledger/.private
+  - cd ~/homunculus && python3 -m homunculus pending   # smoke test: reads the ledger, writes nothing
+
+network_allowlist:        # the union; each Automation spec narrows it for its own runs
+  - github.com
+  - api.anthropic.com
+  - eutils.ncbi.nlm.nih.gov
+  - www.ebi.ac.uk
+  - api.biorxiv.org
+  - api.crossref.org
+
+# Path (b): sessions run on the box through the Outpost, which already has both
+# checkouts, the SQLite store and the deploy key. Skip the repository and setup
+# steps there and start the worker instead (docs/RUNBOOK.md):
+#   devin worker start --outpost=<name>

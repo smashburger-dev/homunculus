@@ -1,0 +1,18 @@
+{
+  "bot": "cerebellum",
+  "max_acu_limit": 1,
+  "name": "homunculus-cerebellum-sunday",
+  "network_allowlist": [
+    "github.com"
+  ],
+  "path": "a",
+  "prompt": "homunculus automation cerebellum-sunday, path a. You are the Cerebellum Bot.\n\nRun in order, in the engine checkout:\n    git -C \"$HOMUNCULUS_LEDGER\" pull --ff-only\n    python -m homunculus pending\n    git -C \"$HOMUNCULUS_LEDGER\" push\n\nFor each change in the approve tier that `pending` prints, put one Decision into Needs You: options approve and veto, approve marked as recommended because the ruling ratified it, body the reasons line and the path plans/pending/<id>.json. When the owner answers, run `python -m homunculus approve <id>` or `python -m homunculus veto <id>`.\n\nA failed command: put a Report into Needs You with the job name and the exit code only. Never paste health values, payloads or ledger file contents into any chat.",
+  "runs_on": "cloud",
+  "schema": 1,
+  "secrets": [],
+  "trigger": {
+    "rrule": "FREQ=WEEKLY;BYDAY=SU;BYHOUR=21;BYMINUTE=0;BYSECOND=0",
+    "timezone": "UTC",
+    "type": "schedule"
+  }
+}
