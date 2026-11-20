@@ -21,7 +21,9 @@ Env (see ``load_config``):
     HEALTH_PORT        default 8787
     HEALTH_DB          SQLite path, default <HOMUNCULUS_LEDGER>/.private/health.sqlite
     HEALTH_RAW         raw payload dir, default <HOMUNCULUS_LEDGER>/.private/raw
-    HEALTH_SOURCE_MAP  JSON {substring: 'watch'|'phone'|'garmin'|'other'}
+    HEALTH_SOURCE_MAP  JSON {substring: one of store.SOURCES}
+    HEALTH_API_SOURCES comma list of store.SOURCES polled directly by a tracker
+                       adapter; HAE rows from them are dropped (no double count)
 """
 
 from __future__ import annotations
@@ -78,6 +80,7 @@ class IngestConfig:
     max_body: int = 200 * 1024 * 1024
     max_limit: int = 5000
     source_map: Mapping[str, str] = field(default_factory=dict)
+    api_sources: frozenset[str] = frozenset()
 
     def __repr__(self) -> str:  # never print the token
         return f"IngestConfig(host={self.host!r}, port={self.port}, db_path={self.db_path!r}, raw_dir={self.raw_dir!r})"
@@ -132,6 +135,14 @@ def _source_map(text: str | None) -> dict[str, str]:
     return dict(obj)
 
 
+def _api_sources(text: str | None) -> frozenset[str]:
+    names = frozenset(n.strip() for n in (text or "").split(",") if n.strip())
+    unknown = sorted(names - set(SOURCES))
+    if unknown:
+        raise ConfigError(f"HEALTH_API_SOURCES entries must be in {SOURCES}, got {unknown}")
+    return names
+
+
 def _path_from(value: str | None, private: Path | None, name: str, var: str) -> Path:
     if value:
         return Path(value).expanduser()
@@ -153,6 +164,7 @@ def load_config(env: Mapping[str, str]) -> IngestConfig:
         raw_dir=_path_from(env.get("HEALTH_RAW"), private, "raw", "HEALTH_RAW"),
         token=token,
         source_map=_source_map(env.get("HEALTH_SOURCE_MAP")),
+        api_sources=_api_sources(env.get("HEALTH_API_SOURCES")),
     )
 
 
@@ -461,8 +473,26 @@ def _data_root(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     return data
 
 
-def parse_payload(payload: Mapping[str, Any], source_map: Mapping[str, str]) -> ParsedBatch:
-    """Parse a Health Auto Export payload ({'data': {...}} or bare) into store rows."""
+_ROW_LISTS = ("samples", "sleep_segments", "sleep_nights", "workouts", "events")
+
+
+def _drop_api_sources(batch: ParsedBatch, api_sources: frozenset[str]) -> None:
+    """Remove rows of sources a tracker adapter polls directly; count them as 'api_source'."""
+    for name in _ROW_LISTS:
+        rows = getattr(batch, name)
+        kept = [r for r in rows if r.source not in api_sources]
+        if len(kept) < len(rows):
+            _skip(batch, "api_source", len(rows) - len(kept))
+            setattr(batch, name, kept)
+
+
+def parse_payload(payload: Mapping[str, Any], source_map: Mapping[str, str],
+                  api_sources: frozenset[str] = frozenset()) -> ParsedBatch:
+    """Parse a Health Auto Export payload ({'data': {...}} or bare) into store rows.
+
+    Rows whose normalized source is in api_sources are dropped: that vendor is
+    polled directly, and its Apple Health copy would count twice.
+    """
     batch = ParsedBatch([], [], [], [], [], {})
     for key, value in _data_root(payload).items():
         parser, items = _SECTIONS.get(key), _dicts(value)
@@ -472,6 +502,7 @@ def parse_payload(payload: Mapping[str, Any], source_map: Mapping[str, str]) -> 
         if len(items) < len(value):
             _skip(batch, str(key), len(value) - len(items))
         parser(items, source_map, batch)
+    _drop_api_sources(batch, frozenset(api_sources))
     return batch
 
 
@@ -489,7 +520,7 @@ def _store_batch(store: Store, batch: ParsedBatch) -> tuple[dict[str, int], list
 
 def ingest_payload(store: Store, payload: Mapping[str, Any], cfg: IngestConfig) -> tuple[dict[str, int], list[HealthEvent]]:
     """Parse and store a payload; returns counts per table and the newly inserted events."""
-    batch = parse_payload(payload, cfg.source_map)
+    batch = parse_payload(payload, cfg.source_map, cfg.api_sources)
     if batch.skipped:
         logger.info("skipped items: %s", batch.skipped)
     return _store_batch(store, batch)
@@ -746,7 +777,7 @@ class _App:
     def _ingest(self, body: bytes) -> Response:
         payload = _json_object(body)
         save_raw(self.cfg.raw_dir, body, _utcnow())
-        batch = parse_payload(payload, self.cfg.source_map)
+        batch = parse_payload(payload, self.cfg.source_map, self.cfg.api_sources)
         counts, new = _store_batch(self.store, batch)
         alerts = self._notify(new)
         logger.info("ingested %s, skipped %s", counts, batch.skipped)

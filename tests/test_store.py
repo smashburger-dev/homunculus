@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -28,6 +29,7 @@ from homunculus.store import (
     Workout,
     canonical_json,
 )
+from homunculus.trackers.base import TrackerBatch
 
 RNG_SEED = 1234
 
@@ -331,6 +333,130 @@ class LedgerCommitTests(unittest.TestCase):
         ledger.write_json("a.json", {}, author="pineal")
         with self.assertRaises(FileNotFoundError):
             ledger.commit(author="pineal", message="m", trailers={})
+
+
+def _seg(start: str, end: str, source: str = "google", stage: str = "core") -> SleepSegment:
+    return SleepSegment(start, end, stage, source)
+
+
+class TrackerStoreTests(unittest.TestCase):
+    """Schema 2, tracker_state and the window replacement used by tracker adapters."""
+
+    SINCE, UNTIL = "2026-11-17T10:00:00+01:00", "2026-11-20T10:00:00+01:00"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp()
+        self.db = Path(self.tmp) / "raw.sqlite"
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp)
+
+    def _store(self) -> Store:
+        st = Store(self.db)
+        self.addCleanup(st.close)
+        return st
+
+    def test_migration_1_to_2_keeps_rows(self) -> None:
+        conn = sqlite3.connect(self.db)
+        conn.executescript(f"BEGIN;\n{store._MIGRATIONS[0]}\nPRAGMA user_version = 1;\nCOMMIT;")
+        conn.execute("INSERT INTO samples VALUES ('m', 'ms', '2026-01-01T00:00:00+00:00', 'qty', 1.0, 'watch')")
+        conn.commit()
+        conn.close()
+        st = self._store()
+        self.assertEqual(st.migrate(), 2)
+        self.assertEqual(len(st.samples("m", "2026")), 1)
+        self.assertIsNone(st.tracker_state("garmin"))
+
+    def test_tracker_state_round_trip_and_validation(self) -> None:
+        st = self._store()
+        row = store.TrackerState("whoop", '{"watermark":"2026-11-20T10:00:00+01:00"}', "2026-11-20T09:00:00Z",
+                                 "2026-11-20T09:00:00Z", None, "2026-11-20T07:00:00+01:00", 4, "2026-11-20")
+        st.put_tracker_state(row)
+        self.assertEqual(st.tracker_state("whoop"), row)
+        st.put_tracker_state(store.TrackerState("whoop", "{}", None, None, "auth_required", None, 0, None))
+        self.assertEqual(st.tracker_state("whoop").last_error, "auth_required")
+        for bad in (dict(last_error="boom"), dict(cursor_json='{"x":"' + "y" * 5000 + '"}'),
+                    dict(name="fitbit"), dict(cursor_json="not json")):
+            fields = dict(name="garmin", cursor_json="{}", last_ok=None, last_attempt=None, last_error=None,
+                          newest_data_ts=None, requests_today=0, requests_day=None)
+            fields.update(bad)
+            with self.subTest(bad=list(bad)), self.assertRaises(ValueError):
+                store.TrackerState(**fields)
+
+    def test_replace_window_moves_rebucketed_sleep(self) -> None:
+        st = self._store()
+        old = _seg("2026-11-19T23:00:00+01:00", "2026-11-20T01:00:00+01:00")
+        watch = _seg("2026-11-19T23:00:00+01:00", "2026-11-20T01:00:00+01:00", "watch")
+        before = _seg("2026-11-16T23:00:00+01:00", "2026-11-17T01:00:00+01:00")
+        st.upsert_sleep_segments([old, watch, before])
+        moved = _seg("2026-11-19T23:05:00+01:00", "2026-11-20T01:00:00+01:00")
+        counts = st.replace_source_window("google", self.SINCE, self.UNTIL, TrackerBatch(sleep_segments=(moved,)))
+        self.assertEqual((counts["deleted"], counts["sleep_segments"]), (1, 1))
+        self.assertEqual(st.sleep_segments("2026-11-16"), [before, watch, moved])
+
+    def test_replace_window_dates_and_vendor_keys(self) -> None:
+        st = self._store()
+        night = SleepNight("2026-11-18", None, None, None, None, 7.0, 7.0, 4.0, 1.0, 2.0, 0.0, "whoop")
+        st.upsert_sleep_nights([night, replace(night, wake_date="2026-11-17")])
+        st.put_daily([DailyValue("2026-11-18", "whoop.recovery", 40.0, "whoop", 1, "ok"),
+                      DailyValue("2026-11-18", "hrv_rmssd_ln", 4.0, "whoop", 1, "ok")])
+        score = DailyValue("2026-11-20", "whoop.recovery", 55.0, "whoop", 1, "ok")
+        st.replace_source_window("whoop", self.SINCE, self.UNTIL, TrackerBatch(daily_vendor_scores=(score,)))
+        # 2026-11-17 starts before since and stays; 2026-11-18 is replaced; canonical rows survive.
+        self.assertEqual([n.wake_date for n in st.sleep_nights("2026-11-01")], ["2026-11-17"])
+        self.assertEqual([r.value for r in st.daily("whoop.recovery", "2026-11-01")], [55.0])
+        self.assertEqual(len(st.daily("hrv_rmssd_ln", "2026-11-01")), 1)
+
+    def test_replace_window_rejects_bad_rows_before_writing(self) -> None:
+        st = self._store()
+        keep = _seg("2026-11-19T23:00:00+01:00", "2026-11-20T01:00:00+01:00")
+        st.upsert_sleep_segments([keep])
+        bad = [
+            TrackerBatch(sleep_segments=(_seg("2026-11-16T23:00:00+01:00", "2026-11-17T00:00:00+01:00"),)),
+            TrackerBatch(sleep_segments=(_seg("2026-11-19T23:00:00+01:00", "2026-11-20T00:00:00+01:00", "watch"),)),
+            TrackerBatch(daily_vendor_scores=(DailyValue("2026-11-19", "recovery", 1.0, "google", 1, "ok"),)),
+            TrackerBatch(daily_vendor_scores=(DailyValue("2026-11-19", "whoop.recovery", 1.0, "google", 1, "ok"),)),
+        ]
+        for batch in bad:
+            with self.subTest(batch=batch), self.assertRaises(ValueError):
+                st.replace_source_window("google", self.SINCE, self.UNTIL, batch)
+        with self.assertRaises(ValueError):
+            st.replace_source_window("google", self.UNTIL, self.SINCE, TrackerBatch())
+        self.assertEqual(st.sleep_segments("2026"), [keep])
+
+    def test_replace_window_adds_events_without_deleting(self) -> None:
+        st = self._store()
+        ev = HealthEvent("hr_notification", "2026-11-19T12:00:00+01:00", None, "{}", "garmin")
+        for _ in range(2):
+            counts = st.replace_source_window("garmin", self.SINCE, self.UNTIL, TrackerBatch(events=(ev,)))
+        self.assertEqual(counts["events"], 0)
+        self.assertEqual(st.events(None, "2026"), [ev])
+
+    def test_put_daily_vendor_key_needs_own_source(self) -> None:
+        st = self._store()
+        for row in (DailyValue("2026-11-19", "whoop.recovery", 1.0, "garmin", 1, "ok"),
+                    DailyValue("2026-11-19", "whoop.", 1.0, "whoop", 1, "ok")):
+            with self.subTest(key=row.key), self.assertRaises(ValueError):
+                st.put_daily([row])
+        self.assertEqual(st.put_daily([DailyValue("2026-11-19", "whoop.recovery", 1.0, "whoop", 1, "ok")]), 1)
+
+    def test_purge_source(self) -> None:
+        st = self._store()
+        st.upsert_samples([Sample("m", None, "2026-11-19T01:00:00+01:00", "qty", 1.0, s) for s in ("whoop", "watch")])
+        st.upsert_workouts([replace(_workout("whoop:1"), source="whoop")])
+        st.put_daily([DailyValue("2026-11-19", "whoop.recovery", 1.0, "whoop", 1, "ok")])
+        st.put_tracker_state(store.TrackerState("whoop", "{}", None, None, None, None, 0, None))
+        counts = st.purge_source("whoop")
+        self.assertEqual((counts["samples"], counts["workouts"], counts["daily"], counts["tracker_state"]), (1, 1, 1, 1))
+        self.assertEqual([s.source for s in st.samples("m", "2026")], ["watch"])
+        self.assertIsNone(st.tracker_state("whoop"))
+
+    def test_day_ceil(self) -> None:
+        self.assertEqual(store._day_ceil("2026-11-18"), "2026-11-18")
+        self.assertEqual(store._day_ceil("2026-11-18T00:00:00+01:00"), "2026-11-18")
+        self.assertEqual(store._day_ceil("2026-11-18T06:00:00+01:00"), "2026-11-19")
+
+
 
 
 if __name__ == "__main__":

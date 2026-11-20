@@ -118,6 +118,17 @@ class BuildDailyTests(StoreCase):
         self.assertEqual(by_key["rhr"].quality, "missing")
         self.assertEqual(by_key["load_srpe"].value, 0.0)  # rest day
 
+    def test_watch_segments_beat_a_second_trackers_night_row(self) -> None:
+        self.store.upsert_sleep_segments([
+            SleepSegment("2026-03-09 23:30:00 +0100", "2026-03-10 06:30:00 +0100", "core", "watch")])
+        self.store.upsert_sleep_nights([SleepNight(
+            DAY, "2026-03-09T22:00:00+01:00", "2026-03-10T05:00:00+01:00", None, None,
+            7.0, 6.0, 3.0, 1.5, 1.5, 1.0, "garmin")])
+        by_key = {r.key: r for r in build_daily(self.store, DAY, _cfg())}
+        self.assertEqual((by_key["tst_h"].source, by_key["tst_h"].value), ("watch", 7.0))
+        garmin_first = MetricsConfig(tz=TZ, source_priority={"tst_h": ["garmin", "watch"]}, hrmax=190.0)
+        self.assertEqual({r.key: r for r in build_daily(self.store, DAY, garmin_first)}["tst_h"].value, 6.0)
+
     def test_hrv_mean_ln_inside_sleep_window(self) -> None:
         self._seed_night()
         self.store.upsert_samples([
@@ -459,6 +470,119 @@ class FreshnessTests(unittest.TestCase):
         self.assertFalse(out["heart_rate_variability"]["stale"])
         self.assertTrue(out["workouts"]["stale"])
         self.assertEqual(out["sleep_nights"], {"latest": None, "age_h": None, "stale": True})
+
+
+class TrackerSourceTests(StoreCase):
+    """Nightly summaries, locks and vendor keys (docs/TRACKER_CONTRACT.md)."""
+
+    WHOOP_CFG = {"hrv_rmssd_ln": ["garmin", "whoop"], "tst_h": ["whoop", "watch"]}
+
+    def _whoop_night(self) -> None:
+        self.store.upsert_sleep_nights([SleepNight(
+            DAY, "2026-03-09T23:00:00+01:00", "2026-03-10T07:00:00+01:00", None, None,
+            8.0, 7.5, 4.0, 1.5, 2.0, 0.5, "whoop")])
+
+    def _rmssd(self, *rows: tuple[str, str, float, str]) -> DailyValue:
+        self.store.upsert_samples([Sample("heart_rate_variability_rmssd", "ms", ts, f, v, src) for ts, f, v, src in rows])
+        cfg = MetricsConfig(TZ, self.WHOOP_CFG, locked=self._locked)
+        return {r.key: r for r in build_daily(self.store, DAY, cfg)}["hrv_rmssd_ln"]
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._locked = {}
+        self._whoop_night()
+
+    def test_one_nightly_row_gives_ln_value(self) -> None:
+        row = self._rmssd(("2026-03-10T03:00:00+01:00", "nightly", 62.0, "whoop"))
+        self.assertAlmostEqual(row.value, math.log(62.0))
+        self.assertEqual((row.n, row.source, row.quality), (1, "whoop", "ok"))
+
+    def test_two_nightly_rows_are_sparse(self) -> None:
+        row = self._rmssd(("2026-03-10T02:00:00+01:00", "nightly", 60.0, "whoop"),
+                          ("2026-03-10T03:00:00+01:00", "nightly", 64.0, "whoop"))
+        self.assertIsNone(row.value)
+        self.assertEqual(row.quality, "sparse")
+
+    def test_readings_win_over_nightly_and_priority_holds(self) -> None:
+        row = self._rmssd(("2026-03-10T03:00:00+01:00", "nightly", 62.0, "whoop"),
+                          ("2026-03-10T02:00:00+01:00", "qty", 40.0, "garmin"),
+                          ("2026-03-10T04:00:00+01:00", "qty", 60.0, "garmin"))
+        self.assertAlmostEqual(row.value, (math.log(40) + math.log(60)) / 2)
+        self.assertEqual((row.n, row.source), (2, "garmin"))
+
+    def test_nightly_outside_sleep_window_is_missing(self) -> None:
+        row = self._rmssd(("2026-03-10T12:00:00+01:00", "nightly", 62.0, "whoop"))
+        self.assertIsNone(row.value)
+        self.assertEqual(row.quality, "missing")
+
+    def test_lock_ignores_other_sources(self) -> None:
+        self._locked = {"hrv_rmssd_ln": "garmin"}
+        row = self._rmssd(("2026-03-10T03:00:00+01:00", "nightly", 62.0, "whoop"))
+        self.assertIsNone(row.value)
+        self.assertEqual((row.source, row.quality), (metrics.NO_SOURCE, "missing"))
+
+    def test_sdnn_default_lock_drops_phone(self) -> None:
+        self.store.upsert_samples([
+            Sample("heart_rate_variability", "ms", f"2026-03-10T0{h}:00:00+01:00", "qty", 50.0, "phone") for h in (2, 3)])
+        cfg = MetricsConfig(TZ, {"tst_h": ["whoop"]})
+        self.assertIsNone(build_daily(self.store, DAY, cfg)[0].value)
+        self.assertEqual(cfg.priority("hrv_sdnn_ln"), ("watch", "phone"))
+        self.assertEqual(cfg.sources("hrv_sdnn_ln"), ("watch",))
+
+    def test_from_dict_merges_default_locks(self) -> None:
+        cfg = MetricsConfig.from_dict({"tz": TZ, "locked": {"rhr": "garmin"}})
+        self.assertEqual(dict(cfg.locked), {"hrv_sdnn_ln": "watch", "rhr": "garmin"})
+        self.assertEqual(cfg.sources("rhr"), ("garmin",))
+        self.assertEqual(cfg.sources("steps"), ("watch", "garmin", "phone"))
+
+    def test_skin_temperature_and_spo2_readings_only(self) -> None:
+        self.store.upsert_samples([
+            Sample("skin_temperature", "°C", "2026-03-10T07:00:00+01:00", "qty", 34.5, "whoop"),
+            Sample("blood_oxygen_saturation", "%", "2026-03-10T03:00:00+01:00", "nightly", 90.0, "watch"),
+            Sample("blood_oxygen_saturation", "%", "2026-03-10T09:00:00+01:00", "qty", 96.0, "watch"),
+        ])
+        cfg = MetricsConfig(TZ, {"wrist_temp_c": ["whoop"]})
+        by_key = {r.key: r for r in build_daily(self.store, DAY, cfg)}
+        self.assertEqual((by_key["wrist_temp_c"].value, by_key["wrist_temp_c"].source), (34.5, "whoop"))
+        self.assertEqual(by_key["spo2_min"].value, 96.0)
+
+    def test_states_filter_to_locked_source(self) -> None:
+        series = [DailyValue(_shift(DAY, k), "hrv_rmssd_ln", math.log(50) + 0.01 * (k % 3), "whoop", 1, "ok")
+                  for k in range(-70, 1)]
+        self.assertEqual(hrv_state(series, DAY).reason, "ok")
+        self.assertEqual(hrv_state(series, DAY, "garmin").reason, "insufficient_m7")
+        rhr = [DailyValue(_shift(DAY, k), "rhr", 50.0 + k % 2, "whoop", 1, "ok") for k in range(-40, 1)]
+        self.assertIsNotNone(rhr_state(rhr, DAY).z)
+        self.assertIsNone(rhr_state(rhr, DAY, "watch").z)
+
+
+class VendorKeyTests(unittest.TestCase):
+    def test_daily_keys_are_canonical(self) -> None:
+        self.assertFalse(any(metrics.is_vendor_key(k) for k in DAILY_KEYS))
+        self.assertTrue(metrics.is_vendor_key("whoop.recovery"))
+        with self.assertRaises(ValueError):
+            metrics._series(None, "whoop.recovery", DAY, 7)
+
+    def test_vendor_rows_never_reach_baselines(self) -> None:
+        rng = random.Random(RNG_SEED)
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            plain, mixed = Store(tmp / "a.db"), Store(tmp / "b.db")
+            canonical, vendor = [], []
+            for k in range(-90, 1):
+                d = _shift(DAY, k)
+                canonical += [_dv(d, "hrv_sdnn_ln", math.log(50) + rng.gauss(0, 0.05)),
+                              _dv(d, "rhr", 50.0 + rng.choice([-1, 0, 1])),
+                              _dv(d, "tst_h", 7.0 + rng.gauss(0, 0.3))]
+                for src, name in (("whoop", "recovery"), ("whoop", "day_strain"), ("garmin", "body_battery_max")):
+                    vendor.append(DailyValue(d, f"{src}.{name}", rng.uniform(-100, 100), src, 1, "ok"))
+            plain.put_daily(canonical)
+            mixed.put_daily(canonical + vendor)
+            self.assertEqual(baselines(plain, DAY, _cfg()), baselines(mixed, DAY, _cfg()))
+            plain.close()
+            mixed.close()
+        finally:
+            shutil.rmtree(tmp)
 
 
 if __name__ == "__main__":

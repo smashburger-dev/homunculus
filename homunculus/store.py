@@ -6,6 +6,9 @@ Two halves:
   box. Every range query is half-open, ``since <= col < until``, using plain
   string comparison, so callers must pass timestamps in the same format the
   rows were stored in (ISO-8601 dates or the timestamp format ingest writes).
+  Tracker adapters write only through ``replace_source_window`` and keep
+  their poll bookkeeping (cursor, last error, never a token) in
+  ``tracker_state``.
 * ``Ledger`` reads and writes the private ledger repo. Writes are checked
   against per-author fnmatch globs, land through an atomic rename, and are
   committed by ``commit`` under the bot's git identity.
@@ -23,16 +26,20 @@ import subprocess
 import tempfile
 import threading
 from dataclasses import astuple, dataclass, fields
+from datetime import date as Date
+from datetime import datetime, time, timedelta
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-SCHEMA_VERSION: int = 1
-SOURCES = ("watch", "phone", "garmin", "other")
+SCHEMA_VERSION: int = 2
+SOURCES = ("watch", "phone", "garmin", "whoop", "google", "polar", "withings", "oura", "other")
 SLEEP_STAGES = frozenset({"awake", "asleep", "inbed", "core", "rem", "deep", "unspecified"})
 EVENT_KINDS = frozenset({"hr_notification", "ecg", "symptom", "state_of_mind"})
 DAILY_QUALITIES = frozenset({"ok", "sparse", "missing"})
 CHECKIN_ORIGINS = frozenset({"form", "coach", "hae"})
+TRACKER_ERRORS = frozenset({"auth_required", "rate_limited", "http_5xx", "schema", "network"})
+MAX_CURSOR_BYTES = 4096
 
 SUPERUSER = "pineal"
 COMMITTER = ("Pineal", "pineal@homunculus.local")
@@ -145,6 +152,28 @@ class DailyValue:
 
 
 @dataclass(frozen=True)
+class TrackerState:
+    """Poll bookkeeping for one tracker adapter; never holds a token."""
+
+    name: str
+    cursor_json: str
+    last_ok: str | None
+    last_attempt: str | None
+    last_error: str | None
+    newest_data_ts: str | None
+    requests_today: int
+    requests_day: str | None
+
+    def __post_init__(self) -> None:
+        _require(self.name, SOURCES, "tracker name")
+        if self.last_error is not None:
+            _require(self.last_error, TRACKER_ERRORS, "tracker error")
+        if len(self.cursor_json.encode("utf-8")) > MAX_CURSOR_BYTES:
+            raise ValueError(f"cursor_json exceeds {MAX_CURSOR_BYTES} bytes")
+        json.loads(self.cursor_json)
+
+
+@dataclass(frozen=True)
 class CheckinItem:
     date: str
     item: str
@@ -214,6 +243,7 @@ _WORKOUTS = _Table("workouts", Workout, '"start", "id"', _encode_workout, _decod
 _EVENTS = _Table("events", HealthEvent, '"start", "kind", "source"')
 _DAILY = _Table("daily", DailyValue, '"date", "key"')
 _CHECKINS = _Table("checkins", CheckinItem, '"date", "item", "ts", "ref"', _encode_checkin, _decode_checkin)
+_TRACKERS = _Table("tracker_state", TrackerState, '"name"')
 
 _MIGRATIONS: tuple[str, ...] = (
     """
@@ -253,6 +283,12 @@ _MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX events_start ON events ("start");
     CREATE INDEX daily_key_date ON daily ("key", "date");
     """,
+    """
+    CREATE TABLE tracker_state (
+        "name" TEXT PRIMARY KEY, "cursor_json" TEXT NOT NULL, "last_ok" TEXT, "last_attempt" TEXT,
+        "last_error" TEXT, "newest_data_ts" TEXT, "requests_today" INTEGER NOT NULL DEFAULT 0,
+        "requests_day" TEXT);
+    """,
 )
 
 # Latest timestamp per table, keyed by the table name.
@@ -285,6 +321,79 @@ def _range_sql(table: _Table, col: str, until: str | None, filters: Mapping[str,
             params.append(value)
     sql = f"SELECT {cols} FROM {table.name} WHERE {' AND '.join(where)} ORDER BY {table.order}"
     return sql, params
+
+
+def _check_daily_key(row: DailyValue) -> None:
+    """A dotted key is a vendor key and must carry its own vendor as source."""
+    prefix, dot, rest = row.key.partition(".")
+    if dot and (prefix != row.source or not rest):
+        raise ValueError(f"vendor key {row.key!r} needs source {prefix!r}, got {row.source!r}")
+
+
+# --------------------------------------------------------------------------
+# Source windows (tracker adapters)
+
+
+@dataclass(frozen=True)
+class _WindowPart:
+    attr: str  # TrackerBatch attribute
+    table: _Table
+    col: str
+    is_date: bool
+    replace: bool  # False: rows are only added (events), never deleted
+
+
+_WINDOW_PARTS = (
+    _WindowPart("samples", _SAMPLES, "ts", False, True),
+    _WindowPart("sleep_segments", _SEGMENTS, "start", False, True),
+    _WindowPart("sleep_nights", _NIGHTS, "wake_date", True, True),
+    _WindowPart("workouts", _WORKOUTS, "start", False, True),
+    _WindowPart("events", _EVENTS, "start", False, False),
+    _WindowPart("daily_vendor_scores", _DAILY, "date", True, True),
+)
+_SOURCE_TABLES = (_SAMPLES, _SEGMENTS, _NIGHTS, _WORKOUTS, _EVENTS, _DAILY)
+
+
+def _day_ceil(ts: str) -> str:
+    """First date whose 00:00 is at or after ts, in ts's own clock.
+
+    '2026-11-18' and '2026-11-18T00:00:00+01:00' give '2026-11-18';
+    '2026-11-18T06:00:00+01:00' gives '2026-11-19'. Date columns use this, so a
+    date lies in a window exactly when the start of that day does.
+    """
+    if len(ts) == 10:
+        return Date.fromisoformat(ts).isoformat()
+    dt = datetime.fromisoformat(ts)
+    day = dt.date() if dt.time() == time(0) else dt.date() + timedelta(days=1)
+    return day.isoformat()
+
+
+def _part_bounds(part: _WindowPart, since: str, until: str) -> tuple[str, str]:
+    return (_day_ceil(since), _day_ceil(until)) if part.is_date else (since, until)
+
+
+def _check_window_row(row: Any, part: _WindowPart, source: str, lo: str, hi: str) -> None:
+    if row.source != source:
+        raise ValueError(f"{part.attr} row has source {row.source!r}, expected {source!r}")
+    value = getattr(row, part.col)
+    if not lo <= value < hi:
+        raise ValueError(f"{part.attr} row {part.col}={value!r} lies outside [{lo}, {hi})")
+    if part.table is _DAILY and not row.key.startswith(f"{source}."):
+        raise ValueError(f"tracker daily key {row.key!r} must start with {source + '.'!r}")
+
+
+def _window_values(part: _WindowPart, batch: Any, source: str, lo: str, hi: str) -> list[tuple]:
+    rows = list(getattr(batch, part.attr))
+    for row in rows:
+        _check_window_row(row, part, source, lo, hi)
+    return [part.table.encode(astuple(r)) for r in rows]
+
+
+def _delete_window_sql(part: _WindowPart, source: str) -> tuple[str, list]:
+    sql = f'DELETE FROM {part.table.name} WHERE "source" = ? AND "{part.col}" >= ? AND "{part.col}" < ?'
+    if part.table is _DAILY:
+        return sql + ' AND substr("key", 1, ?) = ?', [len(source) + 1, f"{source}."]
+    return sql, []
 
 
 class Store:
@@ -336,10 +445,56 @@ class Store:
         return self._write(_EVENTS, rows, "OR IGNORE")
 
     def put_daily(self, rows: Iterable[DailyValue]) -> int:
+        """Upsert daily rows; a dotted (vendor) key must be prefixed by its own source."""
+        rows = list(rows)
+        for row in rows:
+            _check_daily_key(row)
         return self._write(_DAILY, rows, "OR REPLACE")
 
     def put_checkins(self, rows: Iterable[CheckinItem]) -> int:
         return self._write(_CHECKINS, rows, "OR REPLACE")
+
+    def put_tracker_state(self, row: TrackerState) -> None:
+        self._write(_TRACKERS, [row], "OR REPLACE")
+
+    def replace_source_window(self, source: str, since: str, until: str, batch: Any) -> dict[str, int]:
+        """Swap one source's rows in since <= col < until for the batch, in one transaction.
+
+        ``batch`` is a ``trackers.base.TrackerBatch``. Every row must carry
+        ``source`` and lie inside the window, and daily rows must use
+        ``f'{source}.'`` keys, else ValueError before anything is written.
+        Date columns (wake_date, date) compare by the start of the day, see
+        ``_day_ceil``. Events are only added, never deleted. Returns rows
+        inserted per batch attribute plus the total under 'deleted'.
+        """
+        _require(source, SOURCES, "source")
+        if not since < until:
+            raise ValueError(f"empty window: {since!r} .. {until!r}")
+        plan = [(p, *_part_bounds(p, since, until)) for p in _WINDOW_PARTS]
+        values = [_window_values(p, batch, source, lo, hi) for p, lo, hi in plan]
+        with self._lock, self._conn:
+            return self._replace_locked(source, plan, values)
+
+    def _replace_locked(self, source: str, plan: list, values: list[list[tuple]]) -> dict[str, int]:
+        counts = {"deleted": 0}
+        for (part, lo, hi), rows in zip(plan, values):
+            if part.replace:
+                sql, extra = _delete_window_sql(part, source)
+                counts["deleted"] += self._conn.execute(sql, [source, lo, hi, *extra]).rowcount
+            before = self._conn.total_changes
+            self._conn.executemany(_insert_sql(part.table, "OR REPLACE" if part.replace else "OR IGNORE"), rows)
+            counts[part.attr] = self._conn.total_changes - before
+        return counts
+
+    def purge_source(self, source: str) -> dict[str, int]:
+        """Delete every row of one source in every table, plus its tracker state."""
+        _require(source, SOURCES, "source")
+        with self._lock, self._conn:
+            counts = {t.name: self._conn.execute(f'DELETE FROM {t.name} WHERE "source" = ?', [source]).rowcount
+                      for t in _SOURCE_TABLES}
+            counts["tracker_state"] = self._conn.execute(
+                'DELETE FROM tracker_state WHERE "name" = ?', [source]).rowcount
+        return counts
 
     # -- reads
 
@@ -370,6 +525,12 @@ class Store:
 
     def checkins(self, since: str, until: str | None = None, item: str | None = None) -> list[CheckinItem]:
         return self._range(_CHECKINS, "date", since, until, item=item)
+
+    def tracker_state(self, name: str) -> TrackerState | None:
+        cols = ", ".join(f'"{c}"' for c in _TRACKERS.columns)
+        with self._lock:
+            row = self._conn.execute(f'SELECT {cols} FROM tracker_state WHERE "name" = ?', [name]).fetchone()
+        return None if row is None else TrackerState(*row)
 
     def latest_ts(self) -> dict[str, str]:
         """Latest timestamp per sample metric and per table; empty ones are absent."""

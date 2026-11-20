@@ -5,6 +5,10 @@ Raw samples, sleep, workouts and session RPE become one ``DailyValue`` per
 canonical source picked by configured priority; sources are never averaged.
 Baselines, states, load, trends and readiness are pure functions over those
 rows. Every derived value is ``None`` when coverage is insufficient.
+
+A key may be locked to one source (``MetricsConfig.locked``); then only that
+source counts. Vendor scores live under dotted keys such as ``whoop.recovery``
+and never enter this module's daily rows, baselines or readiness.
 """
 
 from __future__ import annotations
@@ -28,6 +32,9 @@ DAILY_KEYS = (
 DEFAULT_PRIORITY: tuple[str, ...] = ("watch", "garmin", "phone")
 # Garmin reports RMSSD, never SDNN, so it is not a default SDNN source.
 _KEY_PRIORITY: Mapping[str, tuple[str, ...]] = {"hrv_sdnn_ln": ("watch", "phone")}
+# Only Apple reports SDNN; other vendors' HRV is RMSSD and must never feed this key.
+DEFAULT_LOCKS: Mapping[str, str] = {"hrv_sdnn_ln": "watch"}
+NIGHTLY_FIELD = "nightly"  # one per-night summary value, e.g. WHOOP or Polar RMSSD
 DEFAULT_READINESS_WEIGHTS: Mapping[str, float] = {
     "hrv": 1.0, "rhr": 1.0, "tst": 1.0, "midpoint_sd": 1.0, "wellness": 1.0,
 }
@@ -60,6 +67,7 @@ class MetricsConfig:
     sex: str | None = None
     work_days: tuple[int, ...] = (0, 1, 2, 3, 4)
     readiness_weights: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_READINESS_WEIGHTS))
+    locked: Mapping[str, str] = field(default_factory=lambda: dict(DEFAULT_LOCKS))
 
     def __post_init__(self) -> None:
         ZoneInfo(self.tz)  # raises on an unknown zone
@@ -75,12 +83,23 @@ class MetricsConfig:
             sex=d.get("sex"),
             work_days=tuple(int(x) for x in d.get("work_days", (0, 1, 2, 3, 4))),
             readiness_weights=dict(d.get("readiness_weights") or DEFAULT_READINESS_WEIGHTS),
+            locked={**DEFAULT_LOCKS, **{str(k): str(v) for k, v in dict(d.get("locked") or {}).items()}},
         )
 
     def priority(self, key: str) -> tuple[str, ...]:
         """Configured order for key, else the 'default' entry, else the built-in order."""
         chosen = self.source_priority.get(key) or self.source_priority.get("default")
         return tuple(chosen) if chosen else _KEY_PRIORITY.get(key, DEFAULT_PRIORITY)
+
+    def sources(self, key: str) -> tuple[str, ...]:
+        """Sources that may feed key: the lock alone when locked, else the priority order."""
+        lock = self.locked.get(key)
+        return (lock,) if lock else self.priority(key)
+
+
+def is_vendor_key(key: str) -> bool:
+    """Dotted keys ('whoop.recovery') are vendor scores, never canonical metrics."""
+    return "." in key
 
 
 def _opt_float(value: object) -> float | None:
@@ -160,16 +179,18 @@ class _Spec:
     agg: str  # mean | mean_ln | sum | min | max
     dating: str  # local | wake | sleep
     min_n: int = 1
+    nightly: bool = False  # fall back to a single NIGHTLY_FIELD row when no readings exist
 
 
 _SAMPLE_SPECS: Mapping[str, _Spec] = {
     "hrv_sdnn_ln": _Spec(("heart_rate_variability",), "qty", "mean_ln", "sleep", 2),
-    "hrv_rmssd_ln": _Spec(("heart_rate_variability_rmssd", "recovery_hrv"), "qty", "mean_ln", "sleep", 2),
+    "hrv_rmssd_ln": _Spec(("heart_rate_variability_rmssd", "recovery_hrv"), "qty", "mean_ln", "sleep", 2,
+                          nightly=True),
     "rhr": _Spec(("resting_heart_rate",), "qty", "mean", "local"),
     "weight_kg": _Spec(("weight_body_mass", "body_mass"), "qty", "mean", "local"),
     "vo2max": _Spec(("vo2_max",), "qty", "mean", "local"),
     "resp_rate": _Spec(("respiratory_rate",), "qty", "mean", "wake"),
-    "wrist_temp_c": _Spec(("apple_sleeping_wrist_temperature",), "qty", "mean", "wake"),
+    "wrist_temp_c": _Spec(("apple_sleeping_wrist_temperature", "skin_temperature"), "qty", "mean", "wake"),
     "spo2_min": _Spec(("blood_oxygen_saturation",), "qty", "min", "local"),
     "steps": _Spec(("step_count",), "qty", "sum", "local"),
     "active_kcal": _Spec(("active_energy",), "qty", "sum", "local"),
@@ -218,12 +239,29 @@ def _quality(value: float | None, rows: Sequence) -> str:
     return "sparse" if rows else "missing"
 
 
+def _aggregate(spec: _Spec, rows: Sequence[Sample]) -> float | None:
+    if len(rows) < spec.min_n:
+        return None
+    return _AGGREGATORS[spec.agg]([_canonical_value(r) for r in rows])
+
+
+def _nightly_value(rows: Sequence[Sample]) -> float | None:
+    """ln of the one nightly summary; None for zero, several or non-positive values."""
+    if len(rows) != 1:
+        return None
+    value = _canonical_value(rows[0])
+    return math.log(value) if value > 0 else None
+
+
 def _sample_row(key: str, spec: _Spec, day: str, ctx: _DayContext) -> DailyValue:
-    candidates = [r for r in ctx.samples.get(key, []) if r.field == spec.field]
-    source, rows = _canonical(_dated(candidates, spec, day, ctx), ctx.cfg.priority(key))
-    value = None
-    if len(rows) >= spec.min_n:
-        value = _AGGREGATORS[spec.agg]([_canonical_value(r) for r in rows])
+    wanted = (spec.field, NIGHTLY_FIELD) if spec.nightly else (spec.field,)
+    candidates = [r for r in ctx.samples.get(key, []) if r.field in wanted]
+    source, rows = _canonical(_dated(candidates, spec, day, ctx), ctx.cfg.sources(key))
+    readings = [r for r in rows if r.field == spec.field]
+    if readings or not spec.nightly:
+        value = _aggregate(spec, readings)
+        return DailyValue(day, key, value, source or NO_SOURCE, len(readings), _quality(value, readings))
+    value = _nightly_value(rows)
     return DailyValue(day, key, value, source or NO_SOURCE, len(rows), _quality(value, rows))
 
 
@@ -254,7 +292,7 @@ def _main_sleep(seg: SleepSegment, day: str, tz: str) -> bool:
 
 def _night_from_segments(segments: Sequence[SleepSegment], day: str, cfg: MetricsConfig) -> _Night | None:
     main = [s for s in segments if _main_sleep(s, day, cfg.tz)]
-    source, rows = _canonical(main, cfg.priority("tst_h"))
+    source, rows = _canonical(main, cfg.sources("tst_h"))
     if not rows:
         return None
     spans = [(_parse_ts(s.start, cfg.tz), _parse_ts(s.end, cfg.tz)) for s in rows]
@@ -264,10 +302,14 @@ def _night_from_segments(segments: Sequence[SleepSegment], day: str, cfg: Metric
 
 def _night_for(nights: Sequence[SleepNight], segments: Sequence[SleepSegment], day: str,
                cfg: MetricsConfig) -> _Night | None:
-    _, rows = _canonical([n for n in nights if n.wake_date == day], cfg.priority("tst_h"))
-    if rows:
-        return _night_from_row(rows[0], cfg.tz)
-    return _night_from_segments(segments, day, cfg)
+    """The canonical source's night: nights and segments compete by source priority, not by table."""
+    rows = [n for n in nights if n.wake_date == day]
+    main = [s for s in segments if _main_sleep(s, day, cfg.tz)]
+    source = pick_source([*rows, *main], cfg.sources("tst_h"))
+    own = [n for n in rows if n.source == source]
+    if own:
+        return _night_from_row(own[0], cfg.tz)
+    return _night_from_segments([s for s in main if s.source == source], day, cfg)
 
 
 def _clock_of(dt: datetime | None, tz: str) -> float | None:
@@ -355,7 +397,7 @@ def _sleep_window(night: _Night | None) -> tuple[datetime, datetime] | None:
 
 def _load_rows(store: Store, day: str, cfg: MetricsConfig) -> list[DailyValue]:
     found = [w for w in store.workouts(_shift(day, -2), _shift(day, 2)) if _local_date(w.start, cfg.tz) == day]
-    source, workouts = _canonical(found, cfg.priority("load_srpe"))
+    source, workouts = _canonical(found, cfg.sources("load_srpe"))
     rpe = _latest_rpe(store.checkins(_shift(day, -1), _shift(day, 3), item=SESSION_ITEM))
     return [_srpe_row(day, source, workouts, rpe), _edwards_row(day, source, workouts, cfg.hrmax)]
 
@@ -418,14 +460,19 @@ def _hrv_gap(m7: float | None, base: Sequence[float]) -> str | None:
     return "no_spread" if stats.sd(base) <= 0 else None
 
 
-def hrv_state(series: Sequence[DailyValue], day: str) -> HrvState:
+def _only_source(series: Sequence[DailyValue], source: str | None) -> Sequence[DailyValue]:
+    return series if source is None else [r for r in series if r.source == source]
+
+
+def hrv_state(series: Sequence[DailyValue], day: str, source: str | None = None) -> HrvState:
     """7-day mean of daily ln HRV against the days -67..-8 baseline.
 
     m7 needs 5 of 7 days, the baseline 30 values with spread. overreach_hint
     fires when the state is suppressed and day-to-day variation (cv7) exceeds
-    the baseline's own coefficient of variation.
+    the baseline's own coefficient of variation. With source (the key's lock)
+    only that source's rows count.
     """
-    by_date = _by_date(series)
+    by_date = _by_date(_only_source(series, source))
     week, base = _window(by_date, day, -6, 0), _window(by_date, day, -67, -8)
     m7 = stats.mean(week) if len(week) >= 5 else None
     cv7 = _cv(week) if m7 is not None else None
@@ -462,9 +509,12 @@ def _rhr_high(delta: float | None, raw_mad: float | None) -> bool:
     return delta is not None and raw_mad is not None and delta >= max(5.0, 2 * _MAD_K * raw_mad)
 
 
-def rhr_state(series: Sequence[DailyValue], day: str) -> RhrState:
-    """Resting HR delta and robust z against the days -35..-8 median and MAD (floor 1 bpm)."""
-    by_date = _by_date(series)
+def rhr_state(series: Sequence[DailyValue], day: str, source: str | None = None) -> RhrState:
+    """Resting HR delta and robust z against the days -35..-8 median and MAD (floor 1 bpm).
+
+    With source (the key's lock) only that source's rows count.
+    """
+    by_date = _by_date(_only_source(series, source))
     med, raw_mad, delta = _rhr_point(by_date, day)
     z = None if delta is None else delta / max(_MAD_K * raw_mad, _RHR_FLOOR)
     _, prev_mad, prev_delta = _rhr_point(by_date, _shift(day, -1))
@@ -756,6 +806,8 @@ def readiness(components: Mapping[str, float | None], weights: Mapping[str, floa
 
 
 def _series(store: Store, key: str, day: str, back: int) -> list[DailyValue]:
+    if is_vendor_key(key):
+        raise ValueError(f"vendor key {key!r} is never canonical")
     return store.daily(key, _shift(day, -back), _shift(day, 1))
 
 
@@ -833,8 +885,9 @@ def _vo2_block(series: Sequence[DailyValue]) -> dict:
 
 def baselines(store: Store, day: str, cfg: MetricsConfig) -> dict:
     """JSON-serializable snapshot of every baseline for data/baselines/<week>.json."""
-    hrv = {k: hrv_state(_series(store, f"hrv_{k}_ln", day, 67), day) for k in ("sdnn", "rmssd")}
-    rhr = rhr_state(_series(store, "rhr", day, 36), day)
+    hrv = {k: hrv_state(_series(store, f"hrv_{k}_ln", day, 67), day, cfg.locked.get(f"hrv_{k}_ln"))
+           for k in ("sdnn", "rmssd")}
+    rhr = rhr_state(_series(store, "rhr", day, 36), day, cfg.locked.get("rhr"))
     tst, mids = _series(store, "tst_h", day, 34), _series(store, "sleep_mid_min", day, 34)
     components = _readiness_components(store, day, hrv["sdnn"], rhr, _by_date(tst), _by_date(mids))
     return {

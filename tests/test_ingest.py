@@ -279,6 +279,45 @@ class IngestTests(_TmpStoreCase):
         self.assertEqual(len(new), 1)
 
 
+class ApiSourceTests(_TmpStoreCase):
+    """Vendors polled directly must not also arrive through Health Auto Export."""
+
+    def _garmin_payload(self) -> dict:
+        garmin_run = {**_workout_v1(), "name": "Run", "source": "Garmin Connect"}
+        steps = [{"date": _ts(9, 0), "qty": 5000, "source": "Garmin Connect"},
+                 {"date": _ts(9, 0), "qty": 4000, "source": "Synthetic iPhone"}]
+        return {"workouts": [garmin_run, _workout_v2()],
+                "metrics": [{"name": "step_count", "units": "count", "data": steps}]}
+
+    def test_parse_drops_api_sources_and_counts_them(self) -> None:
+        batch = parse_payload(self._garmin_payload(), {}, frozenset({"garmin"}))
+        self.assertEqual([w.source for w in batch.workouts], ["watch"])
+        self.assertEqual([s.source for s in batch.samples], ["phone"])
+        self.assertEqual(batch.skipped["api_source"], 2)
+        kept = parse_payload(self._garmin_payload(), {})
+        self.assertEqual(sorted(w.source for w in kept.workouts), ["garmin", "watch"])
+        self.assertNotIn("api_source", kept.skipped)
+
+    def test_source_map_to_new_vendor(self) -> None:
+        payload = {"workouts": [{**_workout_v1(), "source": "WHOOP"}]}
+        batch = parse_payload(payload, {"WHOOP": "whoop"}, frozenset({"whoop"}))
+        self.assertEqual((batch.workouts, batch.skipped), ([], {"api_source": 1}))
+
+    def test_ingest_payload_uses_config(self) -> None:
+        cfg = _cfg(self.tmp, api_sources=frozenset({"garmin"}))
+        counts, _ = ingest_payload(self.store, self._garmin_payload(), cfg)
+        self.assertEqual((counts["workouts"], counts["samples"]), (1, 1))
+
+    def test_load_config_reads_api_sources(self) -> None:
+        base = {"HEALTH_TOKEN": TOKEN, "HOMUNCULUS_LEDGER": "/l"}
+        self.assertEqual(load_config(base).api_sources, frozenset())
+        cfg = load_config({**base, "HEALTH_API_SOURCES": " garmin, whoop ,", "HEALTH_SOURCE_MAP": '{"Ring": "oura"}'})
+        self.assertEqual(cfg.api_sources, frozenset({"garmin", "whoop"}))
+        self.assertEqual(dict(cfg.source_map), {"Ring": "oura"})
+        with self.assertRaises(ConfigError):
+            load_config({**base, "HEALTH_API_SOURCES": "garmin,fitbit"})
+
+
 class RawTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
