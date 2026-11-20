@@ -28,13 +28,16 @@ from types import ModuleType
 from typing import Any, Callable, Mapping, Sequence
 
 from homunculus import (
-    agents, beliefs, checkins, dashboard, evidence, experiments, guardrails, ingest, metrics, plans, scouts,
-    stats, weekly,
+    agents, beliefs, checkins, dashboard, deepdive, evidence, experiments, guardrails, ingest, lexicon, metrics, plans,
+    scouts, stats, weekly,
 )
 from homunculus.evidence import OwnerProfile
 from homunculus.ingest import ParsedBatch
 from homunculus.metrics import MetricsConfig
 from homunculus.store import SOURCES, DailyValue, Ledger, Store, canonical_json
+from homunculus.trackers import registry as tracker_registry
+from homunculus.trackers import run as tracker_run
+from homunculus.trackers.base import TrackerConfig, TrackerError
 
 EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, EXIT_HALTED = 0, 1, 2, 3
 ENGINE_ROOT = Path(__file__).resolve().parent.parent
@@ -215,6 +218,71 @@ def owner_profile(owner: Mapping[str, Any], today: date) -> OwnerProfile:
     return OwnerProfile(sex=owner.get("sex"), age=_owner_age(owner, today),
                         training_status=owner.get("training_status"),
                         conditions=tuple(str(c) for c in owner.get("conditions") or ()), swc=swc)
+
+
+def known_certainties(ledger: Ledger) -> dict[str, float]:
+    """dedupe key -> thal-2 certainty of every scored paper in the ledger, for deepdive.decide."""
+    out: dict[str, float] = {}
+    for rel in ledger.glob("evidence/papers/*.json"):
+        rec = ledger.read_json(rel) if not rel.endswith(".audit.json") else None
+        certainty = ((rec or {}).get("score") or {}).get("certainty") if isinstance(rec, Mapping) else None
+        if isinstance(certainty, (int, float)):
+            try:
+                out[evidence.dedupe_key(rec["extraction"])] = float(certainty)
+            except (KeyError, TypeError, ValueError):
+                continue
+    return out
+
+
+def _paper_key(extraction: Mapping[str, Any]) -> str | None:
+    try:
+        return evidence.dedupe_key(extraction)
+    except ValueError:
+        return None
+
+
+def appraise_record(ledger: Ledger, record: Mapping[str, Any], owner: OwnerProfile) -> tuple[Any, Any]:
+    """(Score, Appraisal) of a paper record: lexicon replications, and deep-dive promise inputs when a dive exists."""
+    extraction = record["extraction"]
+    key = _paper_key(extraction)
+    swc = _paper_swc(extraction, owner)
+    replications = lexicon.replications(lexicon.load_view(ledger), key) if key else 0
+    score = evidence.score(extraction, owner, update_to=record.get("update_to") or [], swc_paper_units=swc,
+                           replications=replications)
+    dive = ledger.read_json(deepdive.record_rel(key), default=None) if key else None
+    base = evidence.PromiseInput(swc_paper_units=swc)
+    inputs = deepdive.promise_inputs(dive, base) if isinstance(dive, Mapping) else base
+    return score, evidence.appraise(extraction, score, inputs)
+
+
+def _dive_check(dive: Any) -> list[str]:
+    return deepdive.validate(dive)
+
+
+def run_deep_dive(ledger: Ledger, llm: Mapping[str, Any], paper_rel: str, source_text: str,
+                  now: datetime) -> dict:
+    """Thalamus deep dive of the paper at paper_rel over source_text; code decides and stores the record.
+
+    The Thalamus answer is re-asked once when it fails the schema or chain checks.
+    """
+    record = ledger.read_json(paper_rel)
+    if not isinstance(record, Mapping) or not isinstance(record.get("extraction"), Mapping):
+        raise UsageError(f"{paper_rel} holds no paper extraction")
+    key = evidence.dedupe_key(record["extraction"])
+    view = lexicon.load_view(ledger)
+    meta = {"key": key, "doi": record.get("doi"), "title": (record.get("meta") or {}).get("title")}
+    context = {"paper_meta": deepdive.request_meta(meta, view)}
+    run_id = f"dd-{now:%Y%m%dT%H%M%SZ}-{evidence.slug(key)}"[:120]
+    try:
+        dive, _ = weekly._caller(llm).ask("thalamus", context, deepdive.DEEPDIVE_SCHEMA, run_id, _dive_check,
+                                          {"abstract": source_text})
+    except weekly._Rejected as exc:
+        raise RuntimeError(f"deep dive rejected after one re-ask: {exc}") from None
+    decided = deepdive.decide(dive, source_text=source_text, rules=guardrails.load_rules(ledger), paper_key=key,
+                              paper_ref=paper_rel, at=now.isoformat(timespec="seconds"),
+                              known=known_certainties(ledger), view=view)
+    deepdive.store(ledger, decided)
+    return decided
 
 
 def commit(ledger: Ledger, kind: str, message: str, *, author: str = CODE_AUTHOR) -> str | None:
@@ -452,6 +520,11 @@ def _source_map(env: Mapping[str, str]) -> dict[str, str]:
     return parsed
 
 
+def _api_sources(env: Mapping[str, str]) -> frozenset[str]:
+    """HEALTH_API_SOURCES: sources polled directly, whose Apple Health copies ingest drops (double-count guard)."""
+    return ingest._api_sources(env.get("HEALTH_API_SOURCES"))
+
+
 # --------------------------------------------------------------------------
 # Commands: server and scheduler
 
@@ -472,7 +545,12 @@ def _report_runs(results: Sequence[Mapping[str, Any]]) -> int:
 
 def cmd_tick(app: App) -> int:
     pineal = _pineal()
-    code = _report_runs(pineal.tick(_pineal_context(app, pineal), pineal.default_jobs()))
+    jobs = pineal.default_jobs()
+    if app.args.devin_path:
+        from homunculus import devin_layer
+
+        jobs = devin_layer.box_jobs(jobs, app.args.devin_path)
+    code = _report_runs(pineal.tick(_pineal_context(app, pineal), jobs))
     return EXIT_HALTED if code == EXIT_OK and app.ledger.halted() else code
 
 
@@ -494,8 +572,9 @@ def cmd_run(app: App) -> int:
 
 def cmd_import_history(app: App) -> int:
     payload = _read_json_file(Path(app.args.file))
+    sources = _source_map(app.env), _api_sources(app.env)
     try:
-        batch = ingest.parse_payload(payload, _source_map(app.env))
+        batch = ingest.parse_payload(payload, *sources)
     except ValueError as exc:
         raise UsageError(f"not a Health Auto Export payload: {exc}") from None
     counts = store_batch(app.store, batch)
@@ -776,11 +855,12 @@ def cmd_score_paper(app: App) -> int:
         _print(f"{path}: blocked by audit disagreements, not scored")
         return EXIT_RUNTIME
     owner = owner_profile(app.owner, app.now().date())
-    score = evidence.score(extraction, owner, update_to=record.get("update_to") or [],
-                           swc_paper_units=_paper_swc(extraction, owner))
-    _print(json.dumps(asdict(score), sort_keys=True, ensure_ascii=False))
+    score, appraisal = appraise_record(app.ledger, {**record, "extraction": extraction}, owner)
+    shown = {**asdict(score), "appraisal": asdict(appraisal)} if app.args.appraise else asdict(score)
+    _print(json.dumps(shown, sort_keys=True, ensure_ascii=False))
     if rel is not None and "extraction" in record:
-        updated = {**record, "score": asdict(score), "rubric_version": evidence.RUBRIC_VERSION}
+        extra = {"appraisal": asdict(appraisal)} if app.args.appraise else {}
+        updated = {**record, "score": asdict(score), "rubric_version": evidence.RUBRIC_VERSION, **extra}
         app.ledger.write_json(rel, updated, author=CODE_AUTHOR)
         commit(app.ledger, "evidence.appraisal", f"Rescore {rel} with {evidence.RUBRIC_VERSION}")
     return EXIT_OK
@@ -854,6 +934,371 @@ def cmd_doctor(app: App) -> int:
 
 
 # --------------------------------------------------------------------------
+# Commands: trackers
+#
+# `tracker status --json` prints a list of objects, one per tracker, with the
+# keys name, enabled, auth_ok, expires_at, refresh_expires_at (epoch seconds or
+# null), auth_detail, last_ok, last_attempt, last_error, newest_data_ts and
+# requests_today. No command prints a token, key or code.
+
+
+class ConsoleUI:
+    """AuthUI on the terminal: prints the URL, reads a pasted redirect URL from stdin."""
+
+    def show_url(self, url: str) -> None:
+        _print("Diese Adresse im Browser öffnen und zustimmen:")
+        _print(url)
+
+    def ask(self, prompt: str) -> str:
+        return input(prompt)
+
+    def info(self, text: str) -> None:
+        _print(text)
+
+
+def _tracker_name(name: str) -> str:
+    try:
+        return tracker_registry.check_name(name)
+    except ValueError as exc:
+        raise UsageError(str(exc)) from None
+
+
+def _tracker_config(app: App) -> TrackerConfig:
+    try:
+        return tracker_run.load_tracker_config(app.ledger, app.tz)
+    except ValueError as exc:
+        raise UsageError(str(exc)) from None
+
+
+def _with_options(cfg: TrackerConfig, name: str, options: Mapping[str, Any]) -> TrackerConfig:
+    merged = {**dict(cfg.per_source), name: {**dict(cfg.per_source.get(name) or {}), **options}}
+    return TrackerConfig(cfg.enabled, merged, cfg.tz)
+
+
+def _tracker_source(app: App, name: str, options: Mapping[str, Any] | None = None) -> Any:
+    cfg = _with_options(_tracker_config(app), name, options or {})
+    try:
+        return tracker_run.default_factory(app.env)(name, cfg)
+    except (ValueError, ingest.ConfigError) as exc:  # missing secret or adapter not installed
+        raise UsageError(str(exc)) from None
+
+
+def _port_options(port: int | None) -> dict[str, Any]:
+    if port is None:
+        return {}
+    return {"redirect_port": port, "redirect_uri": f"http://127.0.0.1:{port}/callback"}
+
+
+def cmd_tracker_auth(app: App) -> int:
+    name = _tracker_name(app.args.name)
+    source = _tracker_source(app, name, _port_options(app.args.port))
+    try:
+        status = source.authorize(ConsoleUI(), manual=bool(app.args.manual))
+    except TrackerError as exc:
+        _print(f"{name}: authorization failed ({type(exc).__name__})")
+        return EXIT_USAGE
+    except ValueError as exc:  # e.g. Withings refuses --manual
+        raise UsageError(f"{name}: {exc}") from None
+    _print(f"{name}: auth {'ok' if status.ok else 'not ok'} ({status.detail})")
+    return EXIT_OK if status.ok else EXIT_USAGE
+
+
+def _poll_line(r: Mapping[str, Any]) -> str:
+    if r["status"] == "failed":
+        return f"{r['name']}: failed {r.get('error')}" + (f" ({r['detail']})" if r.get("detail") else "")
+    counts = ", ".join(f"{k}={v}" for k, v in r["counts"].items())
+    prefix = "would write" if r.get("dry_run") else "wrote"
+    return f"{r['name']}: {r['status']} {r['window'][0]} .. {r['window'][1]}; {prefix} {counts}"
+
+
+def _poll_exit(results: Sequence[Mapping[str, Any]]) -> int:
+    if any(r.get("error") == "auth_required" for r in results):
+        return EXIT_USAGE
+    return EXIT_OK if all(r["status"] == "ok" for r in results) else EXIT_HALTED
+
+
+def cmd_tracker_poll(app: App) -> int:
+    names = [_tracker_name(n) for n in app.args.names]
+    cfg = _tracker_config(app)
+    if app.args.all or not names:
+        names = list(dict.fromkeys([*names, *tracker_registry.enabled(cfg)]))
+    if not names:
+        _print("no trackers enabled in config/trackers.json")
+        return EXIT_OK
+    dry = bool(app.args.dry_run or app.args.poll_dry_run)
+    results = tracker_run.poll_names(app.store, cfg, names, app.now(), tracker_run.default_factory(app.env),
+                                     backfill_days=app.args.backfill, dry_run=dry)
+    for r in results:
+        _print(_poll_line(r))
+    return _poll_exit(results)
+
+
+def _auth_entry(app: App, cfg: TrackerConfig, name: str) -> dict[str, Any]:
+    try:
+        auth = tracker_run.default_factory(app.env)(name, cfg).auth_status()
+    except (ValueError, ingest.ConfigError, TrackerError) as exc:
+        return {"auth_ok": False, "expires_at": None, "refresh_expires_at": None,
+                "auth_detail": f"not configured: {exc}"}
+    return {"auth_ok": auth.ok, "expires_at": auth.expires_at, "refresh_expires_at": auth.refresh_expires_at,
+            "auth_detail": auth.detail}
+
+
+def tracker_status(app: App) -> list[dict[str, Any]]:
+    cfg = _tracker_config(app)
+    names = [n for n in tracker_registry.REGISTRY if n in cfg.enabled or n in cfg.per_source]
+    return [{"name": n, "enabled": n in cfg.enabled, **_auth_entry(app, cfg, n),
+             **tracker_run.state_entry(app.store.tracker_state(n))} for n in names]
+
+
+def cmd_tracker_status(app: App) -> int:
+    rows = tracker_status(app)
+    if app.args.json:
+        _print(json.dumps(rows, sort_keys=True, ensure_ascii=False))
+        return EXIT_OK
+    for r in rows:
+        _print(f"{r['name']}: enabled={r['enabled']} auth={'ok' if r['auth_ok'] else 'no'} ({r['auth_detail']}) "
+               f"last_ok={r['last_ok'] or '-'} last_error={r['last_error'] or '-'} "
+               f"newest={r['newest_data_ts'] or '-'} requests_today={r['requests_today']}")
+    if not rows:
+        _print("no trackers configured in config/trackers.json")
+    return EXIT_OK
+
+
+def cmd_tracker_revoke(app: App) -> int:
+    name = _tracker_name(app.args.name)
+    _tracker_source(app, name).revoke()
+    _print(f"{name}: token deleted")
+    if not app.args.purge:
+        return EXIT_OK
+    if not app.args.yes and input(f"Alle {name}-Daten im Store löschen? [y/N] ").strip().lower() != "y":
+        _print("purge skipped")
+        return EXIT_OK
+    counts = app.store.purge_source(name)
+    _print("purged " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------
+# Commands: Devin layer
+
+
+def _devin() -> ModuleType:
+    from homunculus import devin_layer  # lazy: it imports pineal
+
+    return devin_layer
+
+
+def _json_out(obj: Any) -> None:
+    _print(json.dumps(obj, sort_keys=True, ensure_ascii=False, default=str))
+
+
+def cmd_devin_task(app: App) -> int:
+    pineal = _pineal()
+    try:
+        out = _devin().run_task(_pineal_context(app, pineal), app.args.automation, path=app.args.path)
+    except ValueError as exc:
+        raise UsageError(str(exc)) from None
+    _json_out(out)
+    return EXIT_RUNTIME if any(r.get("status") == "failed" for r in out.get("runs") or ()) else EXIT_OK
+
+
+def cmd_message(app: App) -> int:
+    path = Path(app.args.text_file).expanduser()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise UsageError(f"cannot read {path}: {exc}") from None
+    pineal = _pineal()
+    status, body = _devin().reply(_pineal_context(app, pineal), app.args.bot, text, path=app.args.path)
+    _json_out({"status": status, **body})
+    return EXIT_OK if status == 200 else EXIT_RUNTIME
+
+
+def cmd_ingest(app: App) -> int:
+    if bool(app.args.stdin) == bool(app.args.file):
+        raise UsageError("pass exactly one of --stdin or --file PATH")
+    source_map, api_sources = _source_map(app.env), _api_sources(app.env)
+    try:
+        out = _devin().ingest_stdin(app.store, app.ledger, app.cfg, stream=sys.stdin if app.args.stdin else None,
+                                    path=app.args.file, source_map=source_map, now=app.now(), api_sources=api_sources)
+    except ValueError as exc:
+        raise UsageError(f"no Health Auto Export payload: {exc}") from None
+    _json_out({"counts": out["counts"], "days": len(out["days"]), "skipped": out["skipped"],
+               "restored": out["restored"], "commit": out["commit"]})
+    return EXIT_OK
+
+
+def _json_object(raw: str, what: str) -> dict:
+    obj = _read_json_file(Path(raw).expanduser())
+    if not isinstance(obj, Mapping):
+        raise UsageError(f"{what} file must hold a JSON object")
+    return dict(obj)
+
+
+def cmd_run_bot(app: App) -> int:
+    app.require_running()
+    context, schema = _json_object(app.args.context, "--context"), _json_object(app.args.schema, "--schema")
+    run_id = app.args.run_id or f"cli-{app.args.bot}-{app.now():%Y%m%dT%H%M%SZ}"
+    try:
+        res = _devin().run_bot(app.args.bot, app.ledger, roster=app.roster, budget=app.budget, context=context,
+                               schema=schema, out_rel=app.args.out, run_id=run_id,
+                               providers=app.providers if app.args.dry_run else None, env=app.env, now=app.now)
+    except (ValueError, PermissionError) as exc:
+        raise UsageError(str(exc)) from None
+    _json_out({"path": res.path, "model": res.model, "usd": res.usd, "commit": res.commit})
+    return EXIT_OK
+
+
+def cmd_devin_export(app: App) -> int:
+    devin = _devin()
+    cadence = app.ledger.read_json("config/cadence.json", default=None)
+    keywords = app.ledger.read_json("config/keywords.json", default=None)
+    specs = devin.export_automations(cadence, path=app.args.path, tz=app.args.tz, roster=app.roster,
+                                     keywords=keywords, max_items=app.args.max_items)
+    if not app.args.out:
+        _json_out(specs)
+        return EXIT_OK
+    out = Path(app.args.out).expanduser().absolute()
+    if _inside(out, ENGINE_ROOT):
+        raise UsageError(f"refusing to write generated specs into the public engine repo: {out}")
+    for written in devin.write_automations(out, specs):
+        _print(written)
+    return EXIT_OK
+
+
+def cmd_scout_script(app: App) -> int:
+    keywords = app.ledger.read_json("config/keywords.json", default=None)
+    _print(_devin().scout_poll_script(app.args.scout, keywords, max_items=app.args.max_items))
+    return EXIT_OK
+
+
+def cmd_devin_restore(app: App) -> int:
+    rows = _devin().restore_store(app.store, app.ledger, app.now())
+    _print(f"restored {rows} rows into {app.db_path}")
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------
+# Commands: frontier lane, full text, lexicon
+
+
+def cmd_fulltext(app: App) -> int:
+    from homunculus import fulltext
+
+    try:
+        ids = fulltext.parse_id(app.args.ident)
+        access = fulltext.load_access(fulltext.default_access_path(app.env))
+    except ValueError as exc:
+        raise UsageError(str(exc)) from None
+    http = fulltext.FulltextHttp(app.root / "evidence" / "cache", mailto=app.env.get("HOMUNCULUS_MAILTO"),
+                                 access=access, offline=bool(app.args.dry_run))
+    result = fulltext.resolve_fulltext(http, app.ledger, ids, author=CODE_AUTHOR, now=app.now(),
+                                       known_urls=app.args.pdf_url or (), cand_id=app.args.id)
+    commit(app.ledger, "evidence.fulltext", f"Full text {result.id}: {result.source or 'not found'}")
+    _print(f"{result.id}: source={result.source or '-'} access={result.access or '-'} "
+           f"license={result.license or '-'} path={result.path or '-'} text_extraction={result.text_extraction or '-'}")
+    return EXIT_OK if result.path else EXIT_RUNTIME
+
+
+def _source_text(app: App, raws: Sequence[str]) -> str:
+    parts = []
+    for raw in raws:
+        path, _ = _paper_location(app, raw)
+        parts.append(f"[{path.name}]\n{path.read_text(encoding='utf-8')}")
+    return "\n\n".join(parts)
+
+
+def cmd_deep_dive(app: App) -> int:
+    app.require_running()
+    _, rel = _paper_location(app, app.args.paper)
+    if rel is None:
+        raise UsageError(f"paper must lie inside the ledger: {app.args.paper}")
+    record = run_deep_dive(app.ledger, app.llm(), rel, _source_text(app, app.args.source), app.now())
+    commit(app.ledger, "evidence.deepdive", f"Deep dive {rel}: {record['decision']}", author="thalamus")
+    chain = record["chain"]
+    _print(f"{deepdive.record_rel(record['paper_key'])}: decision={record['decision']} "
+           f"weakest={chain['weakest']} coverage={chain['coverage']} holds={chain['holds']} "
+           f"open_questions={len(record['open_questions'])}")
+    for reason in record["reasons"]:
+        _print(f"  reason: {reason}")
+    return EXIT_OK
+
+
+def cmd_hed(app: App) -> int:
+    try:
+        value = evidence.human_equivalent_dose(app.args.dose, app.args.species)
+    except ValueError as exc:
+        raise UsageError(str(exc)) from None
+    _print(f"HED {value:.4g} mg/kg ({app.args.dose:g} mg/kg in {app.args.species})")
+    return EXIT_OK
+
+
+def cmd_frontier(app: App) -> int:
+    week = app.args.week or _iso_week(app.now().date().isoformat())
+    if not _WEEK_RE.match(week):
+        raise UsageError(f"week must look like 2026-W47, got {week!r}")
+    block = weekly._frontier(app.ledger, week)
+    _json_out({k: v for k, v in block.items() if k != "beliefs"})
+    return EXIT_OK
+
+
+def _lexicon_show(app: App) -> int:
+    view = lexicon.load_view(app.ledger)
+    _print(f"lexicon: {len(view['nodes'])} nodes, {len(view['links'])} links, "
+           f"{len(view['questions'])} open questions, {len(view['retracted'])} retracted papers")
+    for link in sorted(view["links"].values(), key=lambda x: (x["src"], x["dst"])):
+        _print(f"  {link['src']} -> {link['dst']}: {link['verdict']} support={link['support']} "
+               f"contra={link['contra']} human={link['human']}")
+    return EXIT_OK
+
+
+def _lexicon_questions(app: App) -> int:
+    questions = lexicon.load_view(app.ledger)["questions"]
+    for q in questions:
+        _print(f"{q['src']} -> {q['dst']}: {q['text']} [{', '.join(q['keywords'])}]")
+    if not questions:
+        _print("no open questions")
+    return EXIT_OK
+
+
+def _lexicon_rebuild(app: App) -> int:
+    rel = lexicon.rebuild_view(app.ledger)
+    commit(app.ledger, "evidence.lexicon", "Rebuild lexicon view")
+    _print(rel)
+    return EXIT_OK
+
+
+def _lexicon_lookup(app: App) -> int:
+    if len(app.args.nodes) != 2:
+        raise UsageError("lexicon lookup needs SRC_NODE_ID DST_NODE_ID")
+    verdict = lexicon.lookup(lexicon.load_view(app.ledger), *app.args.nodes)
+    _json_out(asdict(verdict) if verdict else None)
+    return EXIT_OK
+
+
+def _lexicon_export(app: App) -> int:
+    export = lexicon.export_keywords(lexicon.load_view(app.ledger))
+    if not app.args.write:
+        _json_out(export)
+        return EXIT_OK
+    config = app.ledger.read_json("config/keywords.json", default={}) or {}
+    app.ledger.write_json("config/keywords.json", lexicon.merge_keywords(config, export), author=CODE_AUTHOR)
+    commit(app.ledger, "config.keywords", "Scout keywords from lexicon open questions")
+    _print("config/keywords.json updated")
+    return EXIT_OK
+
+
+_LEXICON_ACTIONS: Mapping[str, Callable[[App], int]] = {
+    "show": _lexicon_show, "questions": _lexicon_questions, "rebuild": _lexicon_rebuild,
+    "lookup": _lexicon_lookup, "export-keywords": _lexicon_export,
+}
+
+
+def cmd_lexicon(app: App) -> int:
+    return _LEXICON_ACTIONS[app.args.action](app)
+
+
+# --------------------------------------------------------------------------
 # Commands without a configured ledger
 
 
@@ -898,7 +1343,8 @@ def _add_plan_commands(subs: Any) -> None:
 
 def _add_data_commands(subs: Any) -> None:
     _sub(subs, "serve", cmd_serve, "run Brainstem (ingest server, check-in and message routes, dashboard)")
-    _sub(subs, "tick", cmd_tick, "run due Pineal jobs once")
+    _sub(subs, "tick", cmd_tick, "run due Pineal jobs once").add_argument(
+        "--devin-path", choices=("a", "b"), default=None, help="leave out the jobs Devin Automations run on that path")
     run = _sub(subs, "run", cmd_run, "run one Pineal job now")
     run.add_argument("job")
     run.add_argument("--period", default=None)
@@ -911,8 +1357,9 @@ def _add_tool_commands(subs: Any) -> None:
     exp = _sub(subs, "experiment", cmd_experiment, "N-of-1 experiment: design, allocate or analyze")
     exp.add_argument("action", choices=sorted(_EXPERIMENT_ACTIONS))
     exp.add_argument("id")
-    _sub(subs, "score-paper", cmd_score_paper, "rescore an extraction with the current rubric (offline)"
-         ).add_argument("path")
+    score = _sub(subs, "score-paper", cmd_score_paper, "rescore an extraction with the current rubric (offline)")
+    score.add_argument("path")
+    score.add_argument("--appraise", action="store_true", help="add promise, quality gate and frontier status")
     _sub(subs, "dashboard", cmd_dashboard, "rebuild site/")
     _sub(subs, "doctor", cmd_doctor, "check token, bind host, exposure, git, roster, freshness, budget")
     _sub(subs, "init-ledger", cmd_init_ledger, "create the private ledger skeleton and git init it"
@@ -921,6 +1368,77 @@ def _add_tool_commands(subs: Any) -> None:
     demo.add_argument("--out", default=None, help="new or empty directory for the demo ledger")
     demo.add_argument("--days", type=int, default=56)
     demo.add_argument("--seed", type=int, default=7)
+
+
+def _add_tracker_commands(subs: Any) -> None:
+    tracker = subs.add_parser("tracker", help="direct tracker pollers: auth, poll, status, revoke",
+                              description="direct tracker pollers: auth, poll, status, revoke")
+    actions = tracker.add_subparsers(dest="tracker_action", required=True, metavar="ACTION")
+    auth = _sub(actions, "auth", cmd_tracker_auth, "authorize a tracker (Garmin: mint a JWT from the key)")
+    auth.add_argument("name")
+    auth.add_argument("--manual", action="store_true", help="paste the redirect URL instead of the loopback")
+    auth.add_argument("--port", type=int, default=None, help="loopback redirect port")
+    poll = _sub(actions, "poll", cmd_tracker_poll, "poll trackers now (default: every enabled one)")
+    poll.add_argument("names", nargs="*")
+    poll.add_argument("--all", action="store_true")
+    poll.add_argument("--backfill", type=int, default=0, metavar="DAYS")
+    poll.add_argument("--dry-run", dest="poll_dry_run", action="store_true", help="fetch and count, write nothing")
+    _sub(actions, "status", cmd_tracker_status, "auth and poll state per tracker").add_argument(
+        "--json", action="store_true")
+    revoke = _sub(actions, "revoke", cmd_tracker_revoke, "delete the stored token (vendor revoke where one exists)")
+    revoke.add_argument("name")
+    revoke.add_argument("--purge", action="store_true", help="also delete every row of this source from the store")
+    revoke.add_argument("--yes", action="store_true", help="skip the y/N prompt of --purge")
+
+
+def _add_devin_commands(subs: Any) -> None:
+    task = _sub(subs, "devin-task", cmd_devin_task, "run one Devin Automation's Pineal jobs; prints JSON")
+    task.add_argument("automation")
+    task.add_argument("--path", choices=("a", "b"), default="a")
+    message = _sub(subs, "message", cmd_message, "an owner message from a Devin Bot chat; prints JSON")
+    message.add_argument("bot", choices=("sartorius", "vagus", "cerebellum"))
+    message.add_argument("--path", choices=("a", "b"), default="a")
+    message.add_argument("--text-file", required=True)
+    ing = subs.add_parser("ingest", aliases=["ingest-stdin"], help="ingest one Health Auto Export payload",
+                          description="ingest one Health Auto Export payload (bare, wrapped or inside prompt text)")
+    ing.set_defaults(func=cmd_ingest)
+    ing.add_argument("--stdin", action="store_true")
+    ing.add_argument("--file", default=None)
+    bot = _sub(subs, "run-bot", cmd_run_bot, "one validated LLM turn of a bot, written as that bot")
+    bot.add_argument("bot")
+    bot.add_argument("--context", required=True)
+    bot.add_argument("--schema", required=True)
+    bot.add_argument("--out", required=True, help="ledger-relative output path")
+    bot.add_argument("--run-id", default=None)
+    export = _sub(subs, "devin-export", cmd_devin_export, "Devin Automation specs (JSON to stdout or --out DIR)")
+    export.add_argument("--path", choices=("a", "b"), default="a")
+    export.add_argument("--out", default=None)
+    export.add_argument("--max-items", type=int, default=10)
+    script = _sub(subs, "scout-script", cmd_scout_script, "Python source of a scout's Devin script step")
+    script.add_argument("scout", choices=sorted(agents.SCOUTS))
+    script.add_argument("--max-items", type=int, default=10)
+    _sub(subs, "devin-restore", cmd_devin_restore, "rebuild the SQLite store from the ledger (Devin path a)")
+
+
+def _add_evidence_commands(subs: Any) -> None:
+    ft = _sub(subs, "fulltext", cmd_fulltext, "fetch a legal full text into quarantine (DOI, PMID or arXiv id)")
+    ft.add_argument("ident")
+    ft.add_argument("--pdf-url", action="append", default=None, help="known PDF URL, looked up in the Wayback Machine")
+    ft.add_argument("--id", default=None, help="candidate id c-xxxx")
+    dd = subs.add_parser("deep-dive", aliases=["deepdive"], help="Thalamus deep dive of a frontier paper",
+                         description="Thalamus deep dive of a frontier paper; code decides the N-of-1 candidacy")
+    dd.set_defaults(func=cmd_deep_dive)
+    dd.add_argument("paper", help="evidence/papers/<slug>.json")
+    dd.add_argument("--source", action="append", required=True, help="quarantined text (repeatable)")
+    hed = _sub(subs, "hed", cmd_hed, "human equivalent dose from an animal dose (Km factors)")
+    hed.add_argument("dose", type=float, help="mg/kg")
+    hed.add_argument("species")
+    _sub(subs, "frontier", cmd_frontier, "frontier lane status of a week (default: this week)").add_argument(
+        "week", nargs="?", default=None)
+    lex = _sub(subs, "lexicon", cmd_lexicon, "knowledge lexicon: show, questions, rebuild, lookup, export-keywords")
+    lex.add_argument("action", choices=sorted(_LEXICON_ACTIONS))
+    lex.add_argument("nodes", nargs="*", help="lookup: SRC_NODE_ID DST_NODE_ID")
+    lex.add_argument("--write", action="store_true", help="export-keywords: merge into config/keywords.json")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -933,6 +1451,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_data_commands(subs)
     _add_plan_commands(subs)
     _add_tool_commands(subs)
+    _add_tracker_commands(subs)
+    _add_devin_commands(subs)
+    _add_evidence_commands(subs)
     return parser
 
 

@@ -74,6 +74,7 @@ RED_FLAG_LOOKBACK_DAYS = 91
 FALLBACK_DE = "Ich kann gerade nicht antworten. Versuch es bitte später noch einmal."
 PLAN_RATIFIED_DE = Template("Neuer Plan $version gilt ab jetzt. Die Änderungen stehen im Dashboard unter Plan.")
 JOB_FAILED_DE = Template("Der Job $job ist im Zeitraum $period fehlgeschlagen. Details stehen unter ops/incidents.")
+FRONTIER_DE = Template("Frontier-Rückblick $month: kein neuer Kandidat geprüft. Nächster Kandidat: $claim.")
 MONTHLY_DE = Template("Monatsbericht $month: LLM-Kosten $usd USD. Experimente mit Ergebnis: $experiments.")
 BUDGET_DE: Mapping[str, Template] = MappingProxyType({
     "reduced": Template(
@@ -188,6 +189,7 @@ class Context:
     tz: str
     now: Callable[[], datetime]
     dry_run: bool = False
+    trackers: Callable[[str, Any], Any] | None = None  # (name, TrackerConfig) -> TrackerSource; None: registry
 
 
 # --------------------------------------------------------------------------
@@ -1011,6 +1013,35 @@ def _job_monthly_report(ctx: Context, period: str) -> JobResult:
     return JobResult("ok" if sent else "skipped", (), f"report {month}")
 
 
+def _job_tracker_poll(ctx: Context, period: str) -> JobResult:
+    """Hourly: poll each tracker whose poll_minutes passed; at 06:xx every enabled one, before finalize_day."""
+    from homunculus.trackers import run as tracker_run  # lazy: adapters load only when trackers are enabled
+
+    cfg = tracker_run.load_tracker_config(ctx.ledger, ctx.tz)
+    if not cfg.enabled:
+        return JobResult("skipped", (), "no trackers enabled")
+    factory = ctx.trackers or tracker_run.default_factory(os.environ)
+    now = ctx.now()
+    if period.endswith("T06"):
+        results = tracker_run.poll_names(ctx.store, cfg, cfg.enabled, now, factory)
+    else:
+        results = tracker_run.poll_due(ctx.store, cfg, factory, now)
+    summary = ", ".join(f"{r['name']}={r.get('error') or r['status']}" for r in results)
+    return JobResult("ok" if results else "skipped", (), summary or "nothing due")
+
+
+def _job_frontier_review(ctx: Context, period: str) -> JobResult:
+    """Monthly: did last month surface a frontier candidate? If not, name the next one to the owner."""
+    month = _previous_month(period)
+    review = weekly.frontier_month(ctx.ledger, month)
+    rel = f"evidence/frontier/{month}.json"
+    ctx.ledger.write_json(rel, review, author=WRITER)
+    if not review["met"] and review["next"]:
+        claim = (review["next"][0].get("claim") or {}).get("intervention") or review["next"][0]["belief_id"]
+        _notify_once(ctx, "frontier_review", month, FRONTIER_DE.substitute(month=month, claim=claim), "info")
+    return JobResult("ok", (rel,), f"frontier {month}: surfaced {review['surfaced']}, next {len(review['next'])}")
+
+
 def default_jobs() -> list[Job]:
     """The standing schedule, in the owner's time zone."""
     return [
@@ -1021,6 +1052,7 @@ def default_jobs() -> list[Job]:
         Job("red_flags", "hourly", ":05", None, None, True, _job_red_flags),
         *(Job(s, "daily", "03:00", None, s, False, _scout_job(s)) for s in ("retina", "spindle", "papilla")),
         Job("thalamus", "daily", "04:00", None, "thalamus", False, _job_thalamus),
+        Job("tracker_poll", "hourly", ":20", None, None, True, _job_tracker_poll),
         Job("finalize_day", "daily", "06:30", None, None, True, _job_finalize_day),
         Job("sartorius_morning", "daily", "07:00", None, "sartorius", False,
             _coach_job("sartorius_morning", "sartorius", "morning")),
@@ -1031,4 +1063,5 @@ def default_jobs() -> list[Job]:
         Job("weekly_review", "weekly", "17:00", 6, None, True, _job_weekly_review),
         Job("ratify_due", "minute", "*/15", None, None, False, _job_ratify_due),
         Job("monthly_report", "monthly", "08:00", None, None, False, _job_monthly_report),
+        Job("frontier_review", "monthly", "08:15", None, None, False, _job_frontier_review),
     ]

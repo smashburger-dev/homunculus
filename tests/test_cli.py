@@ -415,7 +415,7 @@ class ScorePaperTest(CliCase):
         out = self.cli_ok("score-paper", "evidence/papers/10-5555-demo-0001.json")
         self.assertEqual(json.loads(out)["gate"], "actionable")
         stored = self.ledger.read_json("evidence/papers/10-5555-demo-0001.json")
-        self.assertEqual(stored["score"]["rubric_version"], "thal-1")
+        self.assertEqual(stored["score"]["rubric_version"], "thal-2")
 
     def test_retraction_vetoes_and_blocked_is_not_scored(self) -> None:
         retracted = {"extraction": demo.extraction(demo.PAPERS[0]), "update_to": [{"type": "retraction"}]}
@@ -519,6 +519,221 @@ class PinealWiringTest(CliCase):
         self.assertEqual(cfg.host, "127.0.0.1")
         self.assertEqual(cfg.db_path, self.root / ".private" / "health.sqlite")
         self.assertEqual(set(serve.call_args.kwargs["post_routes"]), {"/checkin", "/message"})
+
+
+# --------------------------------------------------------------------------
+# Trackers, Devin layer, frontier lane
+
+
+class FakeTracker:
+    """TrackerSource double: one synthetic sample per poll, or the error it was given."""
+
+    name = "garmin"
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error, self.revoked = error, False
+
+    def poll(self, cursor, *, now, tz, backfill_days=0):  # noqa: ANN001
+        from homunculus.store import Sample
+        from homunculus.trackers.base import PollResult, TrackerBatch
+
+        if self.error:
+            raise self.error
+        sample = Sample("resting_heart_rate", "count/min", "2026-11-22T06:00:00+00:00", "qty", 51.0, "garmin")
+        return PollResult(TrackerBatch(samples=(sample,)), ("2026-11-21T00:00:00+00:00", "2026-11-22T16:00:00+00:00"),
+                          {"watermark": "2026-11-22T16:00:00+00:00"}, True, 2)
+
+    def auth_status(self):  # noqa: ANN201
+        from homunculus.trackers.base import AuthStatus
+
+        return AuthStatus(True, None, None, "fake")
+
+    def authorize(self, ui, *, manual=False):  # noqa: ANN001, ANN201
+        ui.info("fake auth")
+        return self.auth_status()
+
+    def revoke(self) -> None:
+        self.revoked = True
+
+
+class TrackerCliTest(CliCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.ledger = self.init()
+        self.ledger.write_json("config/trackers.json", {"enabled": ["garmin"], "garmin": {"poll_minutes": 60}},
+                               author="pineal")
+        self.fake = FakeTracker()
+        patch = mock.patch.object(cli.tracker_registry, "build", lambda name, **kw: self.fake)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_blocked_and_unknown_names_fail_before_any_io(self) -> None:
+        code, _, err = self.run_cli("tracker", "auth", "oura")  # no ledger needed
+        self.assertEqual(code, 2)
+        self.assertIn("API data may not be AI input", err)
+        self.assertEqual(self.run_cli("tracker", "poll", "nope")[0], 2)
+
+    def test_poll_dry_run_then_write_status_and_purge(self) -> None:
+        out = self.cli_ok("tracker", "poll", "--dry-run")
+        self.assertIn("garmin: ok", out)
+        self.assertIn("would write samples=1", out)
+        store = self.store()
+        self.assertIsNone(store.tracker_state("garmin"))
+        self.assertIn("wrote deleted=0, samples=1", self.cli_ok("tracker", "poll", "garmin"))
+        self.assertEqual(store.tracker_state("garmin").requests_today, 2)
+        rows = json.loads(self.cli_ok("tracker", "status", "--json"))
+        self.assertEqual([(r["name"], r["enabled"], r["auth_ok"]) for r in rows], [("garmin", True, True)])
+        self.assertEqual(rows[0]["last_ok"], "2026-11-22T16:00:00+00:00")
+        self.assertIn("purged", self.cli_ok("tracker", "revoke", "garmin", "--purge", "--yes"))
+        self.assertTrue(self.fake.revoked)
+        self.assertEqual(store.samples("resting_heart_rate", "2026-11-21"), [])
+
+    def test_auth_required_exits_2_and_records_the_kind(self) -> None:
+        from homunculus.trackers.base import AuthRequired
+
+        self.fake.error = AuthRequired("token expired")
+        code, out, _ = self.run_cli("--ledger", str(self.root), "tracker", "poll", "--all")
+        self.assertEqual(code, 2)
+        self.assertIn("failed auth_required", out)
+        self.assertEqual(self.store().tracker_state("garmin").last_error, "auth_required")
+        self.assertIn("auth ok", self.cli_ok("tracker", "auth", "garmin", "--port", "8765"))
+
+    def test_poll_minutes_below_60_is_a_config_error(self) -> None:
+        self.ledger.write_json("config/trackers.json", {"enabled": ["garmin"], "garmin": {"poll_minutes": 5}},
+                               author="pineal")
+        self.assertEqual(self.run_cli("--ledger", str(self.root), "tracker", "poll")[0], 2)
+
+
+class IngestCliTest(CliCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.init()
+        self.payload = self.tmp / "inbox.txt"
+        self.payload.write_text("Webhook body follows:\n" + json.dumps(_hae_payload()), encoding="utf-8")
+
+    def test_ingest_file_prints_counts_only(self) -> None:
+        out = json.loads(self.cli_ok("ingest", "--file", str(self.payload)))
+        self.assertEqual(out["counts"]["workouts"], 1)
+        self.assertGreaterEqual(out["days"], 2)
+        self.assertNotIn("53.0", json.dumps(out))
+        self.assertEqual(self.run_cli("--ledger", str(self.root), "ingest")[0], 2)
+
+    def test_api_sources_guard_drops_the_vendor_copy(self) -> None:
+        env = {"HEALTH_SOURCE_MAP": json.dumps({"Test Watch": "garmin"}), "HEALTH_API_SOURCES": "garmin"}
+        with mock.patch.dict(os.environ, env):
+            out = json.loads(self.cli_ok("ingest-stdin", "--file", str(self.payload)))
+            self.assertEqual(out["counts"]["workouts"], 0)
+            self.assertGreater(out["skipped"]["api_source"], 0)
+            path = self.tmp / "history.json"
+            path.write_text(json.dumps(_hae_payload()), encoding="utf-8")
+            self.assertIn("api_source=", self.cli_ok("import-history", str(path)))
+        with mock.patch.dict(os.environ, {"HEALTH_API_SOURCES": "fitbitx"}):
+            self.assertEqual(self.run_cli("--ledger", str(self.root), "ingest", "--file", str(self.payload))[0], 2)
+
+
+class DevinCliTest(CliCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.ledger = self.init()
+
+    def test_export_scout_script_and_restore(self) -> None:
+        specs = json.loads(self.cli_ok("devin-export", "--path", "b"))
+        self.assertIn("homunculus-weekly-review", [s["name"] for s in specs])
+        out_dir = self.tmp / "automations"
+        self.assertIn("homunculus-weekly-review.json", self.cli_ok("devin-export", "--out", str(out_dir)))
+        inside = cli.ENGINE_ROOT / "devin" / "automations" / "tmp-test"
+        self.assertEqual(self.run_cli("--ledger", str(self.root), "devin-export", "--out", str(inside))[0], 2)
+        self.assertFalse(inside.exists())
+        self.assertIn("STATE_FILE", self.cli_ok("scout-script", "retina", "--max-items", "3"))
+        self.assertIn("restored 0 rows", self.cli_ok("devin-restore"))
+
+    def test_unknown_automation_and_tick_on_path_b(self) -> None:
+        self.assertEqual(self.run_cli("--ledger", str(self.root), "devin-task", "nope")[0], 2)
+        stub = StubPineal()
+        with mock.patch.object(cli, "_pineal", lambda: stub):
+            self.assertIn("finalize_day p: ok", self.cli_ok("tick", "--devin-path", "b"))
+
+    def test_message_short_circuits_urgent_text(self) -> None:
+        text = self.tmp / "message.txt"
+        text.write_text("Ich habe seit einer Stunde Brustschmerzen.", encoding="utf-8")
+        out = json.loads(self.cli_ok("--dry-run", "message", "vagus", "--path", "b", "--text-file", str(text)))
+        self.assertEqual(out["status"], 200)
+        self.assertIn("112", out["reply_de"])
+
+    def test_run_bot_dry_run_writes_as_the_bot(self) -> None:
+        context, schema = self.tmp / "context.json", self.tmp / "schema.json"
+        context.write_text(json.dumps({"paper_meta": {"task": "test"}}), encoding="utf-8")
+        schema.write_text(json.dumps({"type": "object", "properties": {"note": {"type": "string"}},
+                                      "required": ["note"], "additionalProperties": False}), encoding="utf-8")
+        out = json.loads(self.cli_ok("--dry-run", "run-bot", "thalamus", "--context", str(context), "--schema",
+                                     str(schema), "--out", "evidence/papers/run-bot-test.json", "--run-id", "t-1"))
+        self.assertEqual(out["path"], "evidence/papers/run-bot-test.json")
+        self.assertEqual(self.ledger.read_json(out["path"])["bot"], "thalamus")
+        code = self.run_cli("--ledger", str(self.root), "--dry-run", "run-bot", "thalamus", "--context",
+                            str(context), "--schema", str(schema), "--out", "plans/CURRENT")[0]
+        self.assertEqual(code, 2)  # outside thalamus's write rules
+
+
+class FrontierCliTest(CliCase):
+    PAPER = "evidence/papers/10-5555-demo-0004.json"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ledger = self.init()
+        self.ledger.write_json("profile/owner.json", demo.OWNER, author="pineal")
+        paper = next(p for p in demo.PAPERS if p["doi"] == demo.FRONTIER_DOI)
+        rec = {"schema": 1, "doi": paper["doi"], "meta": {"title": paper["title"]},
+               "extraction": demo.extraction(paper), "update_to": [], "score": None, "blocked": False}
+        self.ledger.write_json(self.PAPER, rec, author="pineal")
+        self.ledger.write_text("quarantine/demo-c4.txt", demo.abstract(paper) + "\n\n" + demo.MECHANISM_SOURCES,
+                               author="pineal")
+
+    def dive(self, fixtures: dict | None) -> tuple[int, str, str]:
+        real = agents.FakeProvider
+        with mock.patch.object(agents, "FakeProvider", lambda: real(fixtures)):
+            return self.run_cli("--ledger", str(self.root), "--dry-run", "deepdive", self.PAPER,
+                                "--source", "quarantine/demo-c4.txt")
+
+    def test_deep_dive_lexicon_and_appraisal(self) -> None:
+        before = json.loads(self.cli_ok("score-paper", self.PAPER, "--appraise"))
+        self.assertEqual(before["appraisal"]["status"], "watchlist")
+        code, out, err = self.dive({"thalamus": demo.DEEP_DIVE})
+        self.assertEqual(code, 0, err)
+        self.assertIn("decision=n_of_1_candidate", out)
+        after = json.loads(self.cli_ok("score-paper", self.PAPER, "--appraise"))
+        self.assertEqual(after["appraisal"]["status"], "frontier")
+        self.assertEqual(self.ledger.read_json(self.PAPER)["appraisal"]["status"], "frontier")
+        self.assertIn("3 links, 1 open questions", self.cli_ok("lexicon", "show"))
+        self.assertIn("vagal tone", self.cli_ok("lexicon", "questions"))
+        verdict = json.loads(self.cli_ok("lexicon", "lookup", "intervention:time-restricted-eating",
+                                         "mechanism:circadian-clock-alignment"))
+        self.assertEqual(verdict["verdict"], "supported")
+        self.assertEqual(self.run_cli("--ledger", str(self.root), "lexicon", "lookup", "x")[0], 2)
+        self.cli_ok("lexicon", "export-keywords", "--write")
+        self.assertIn("vagal tone", self.ledger.read_json("config/keywords.json")["retina"]["terms"])
+        frontier = json.loads(self.cli_ok("frontier", WEEK))
+        self.assertEqual(frontier["candidates"][0]["decision"], "n_of_1_candidate")
+        self.assertIn("lexicon", self.cli_ok("lexicon", "rebuild"))
+
+    def test_plain_dry_run_stays_on_watch(self) -> None:
+        code, out, err = self.dive(None)  # FakeProvider's minimal instance: one link, no evidence
+        self.assertEqual(code, 0, err)
+        self.assertIn("decision=watch", out)
+
+    def test_invalid_dive_is_rejected_after_one_reask(self) -> None:
+        broken = {**demo.DEEP_DIVE, "links": demo.DEEP_DIVE["links"][:2]}  # chain stops before the outcome
+        code, _, err = self.dive({"thalamus": broken})
+        self.assertEqual(code, 1)
+        self.assertIn("re-ask", err)
+        self.assertEqual(list((self.root / "evidence").glob("deepdives/*.json")), [])
+
+    def test_hed_and_fulltext_usage(self) -> None:
+        self.assertIn("HED 8,1".replace(",", "."), self.cli_ok("hed", "50", "rat"))
+        self.assertEqual(self.run_cli("--ledger", str(self.root), "hed", "50", "dragon")[0], 2)
+        self.assertEqual(self.run_cli("--ledger", str(self.root), "fulltext", "not an id")[0], 2)
+        code, out, _ = self.run_cli("--ledger", str(self.root), "--dry-run", "fulltext", "10.5555/demo.0004")
+        self.assertEqual(code, 1)
+        self.assertIn("source=-", out)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ heart rate says.
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import random
@@ -28,6 +29,7 @@ import shutil
 import tempfile
 import urllib.parse
 import urllib.request
+from dataclasses import asdict as dataclasses_asdict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -35,9 +37,13 @@ from typing import Any, Iterator, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from homunculus import (
-    agents, checkins, cli, dashboard, evidence, experiments, guardrails, ingest, insula, metrics, plans, scouts, weekly,
+    agents, checkins, cli, dashboard, deepdive, evidence, experiments, guardrails, ingest, insula, lexicon, metrics,
+    plans, scouts, weekly,
 )
 from homunculus.store import Ledger, Store, canonical_json
+from homunculus.trackers import garmin
+from homunculus.trackers import run as tracker_run
+from homunculus.trackers.base import Request, Response
 
 MIN_DAYS = 28
 DEMO_TZ = "Europe/Berlin"
@@ -308,7 +314,40 @@ PAPERS: tuple[dict[str, Any], ...] = (
      "values": {"n_total": 1250, "sex": "mixed", "age_mean": 44.0, "training": "untrained", "k": None, "i2": None,
                 "outcome": "resting_hr", "unit": "bpm", "type": "MD", "est": -0.4, "lo": -0.6, "hi": -0.2,
                 "reg": None}},
+    # Frontier: a clean rodent study (randomized, blinded, preregistered) with a mechanism that is partly
+    # shown in humans and a low-risk timing intervention. Low certainty, high promise after the deep dive.
+    {"id": "demo-c4", "scout": "retina", "doi": "10.5555/demo.0004", "design": "animal",
+     "title": "Synthetic rodent study: time-restricted feeding and nocturnal heart rate variability in rats",
+     "sentences": {
+         "design": "In this randomized study, rats were assigned to time-restricted feeding or ad libitum feeding.",
+         "n_total": "Forty-eight rats completed the protocol.",
+         "population": "The animals were adult male rats.",
+         "effect": "Time-restricted feeding raised nocturnal heart rate variability by 0.80 SD "
+                   "(95% CI 0.35 to 1.25).",
+         "mechanism": "Time-restricted feeding raised nocturnal vagal tone through realigned clock gene expression.",
+         "blinded": "Outcome assessors were blinded to group allocation.",
+         "registration_id": "The protocol was preregistered.",
+         "dose_response": "Shorter daily feeding windows produced larger increases.",
+     },
+     "values": {"n_total": 48, "sex": "male", "age_mean": None, "training": None, "k": None, "i2": None,
+                "outcome": "nocturnal_hrv", "unit": "SD", "type": "SMD", "est": 0.80, "lo": 0.35, "hi": 1.25,
+                "reg": None, "prereg": True, "randomized": True, "blinded_outcome": True, "dose_response": True}},
+    # Weak methods: a tiny unblinded, unregistered pilot with a large effect. The quality gate caps both axes.
+    {"id": "demo-c5", "scout": "spindle", "doi": "10.5555/demo.0005", "design": "rct_parallel",
+     "title": "Synthetic pilot trial: a bedtime breathing app and sleep onset latency",
+     "sentences": {
+         "design": "In this small randomized pilot, adults used a breathing app or no app before bed.",
+         "n_total": "Twelve adults took part.",
+         "population": "Participants were recreationally active men and women aged 33 on average.",
+         "effect": "Sleep onset latency fell by 14 minutes (95% CI -26 to -2) versus control.",
+         "dose_response": "Longer app sessions went with shorter sleep onset.",
+     },
+     "values": {"n_total": 12, "sex": "mixed", "age_mean": 33.0, "training": "recreational", "k": None, "i2": None,
+                "outcome": "sleep_onset_latency", "unit": "min", "type": "MD", "est": -14.0, "lo": -26.0,
+                "hi": -2.0, "reg": None, "dose_response": True}},
 )
+FRONTIER_DOI = "10.5555/demo.0004"
+WEAK_DOI = "10.5555/demo.0005"
 JOURNAL = "Journal of Synthetic Examples"
 
 
@@ -320,12 +359,25 @@ def _f(value: Any, quote: str | None) -> dict:
     return {"value": value, "quote": quote if value is not None else None}
 
 
+def _optional_fields(v: Mapping[str, Any], q: Mapping[str, str]) -> dict:
+    """Method fields only some synthetic papers report, each quoted from its own sentence."""
+    out = {"randomized": _f(v["randomized"], q["design"])} if "randomized" in v else {}
+    for key, sentence in (("blinded_outcome", "blinded"), ("dose_response", "dose_response")):
+        if key in v:
+            out[key] = _f(v[key], q[sentence])
+    return out
+
+
 def extraction(paper: Mapping[str, Any]) -> dict:
     """A Thalamus-shaped extraction whose quotes are verbatim spans of the synthetic abstract."""
     v, q = paper["values"], paper["sentences"]
     pop, eff = q["population"], q["effect"]
+    return {**_base_extraction(paper["doi"], paper["design"], v, q, pop, eff), **_optional_fields(v, q)}
+
+
+def _base_extraction(doi: str, design: str, v: Mapping[str, Any], q: Mapping[str, str], pop: str, eff: str) -> dict:
     return {
-        "doi": _f(paper["doi"], None), "pmid": _f(None, None), "design": _f(paper["design"], q["design"]),
+        "doi": _f(doi, None), "pmid": _f(None, None), "design": _f(design, q["design"]),
         "n_total": _f(v["n_total"], q["n_total"]), "n_per_arm": _f(None, None),
         "population": {"sex": _f(v["sex"], pop), "age_mean": _f(v["age_mean"], pop),
                        "training_status": _f(v["training"], pop), "bmi_mean": _f(None, None),
@@ -334,7 +386,7 @@ def extraction(paper: Mapping[str, Any]) -> dict:
         "effect": {"type": _f(v["type"], eff), "est": _f(v["est"], eff), "ci_lo": _f(v["lo"], eff),
                    "ci_hi": _f(v["hi"], eff), "sd_pop": _f(None, None)},
         "registration_id": _f(v["reg"], q.get("registration_id")),
-        "preregistered": _f(True if v["reg"] else None, q.get("registration_id")),
+        "preregistered": _f(True if v["reg"] or v.get("prereg") else None, q.get("registration_id")),
         "attrition_pct": _f(None, None), "blinded_outcome": _f(None, None), "outcome_switched": _f(None, None),
         "funding_industry_product": _f(None, None), "i2": _f(v["i2"], q.get("i2")),
         "k_studies": _f(v["k"], q["design"]), "peer_reviewed": _f(True, None), "dose_response": _f(None, None),
@@ -365,6 +417,54 @@ def _write_candidates(ledger: Ledger, cal: Calendar) -> None:
                "query": "demo", "found_at": f"{day}T03:00:00+00:00", "quarantine_path": rel,
                "triage": {"relevance": 2}, "score": 1.0}
         ledger.append_jsonl(f"evidence/candidates/{day}.jsonl", rec, author=p["scout"])
+
+
+# --------------------------------------------------------------------------
+# Frontier deep dive: the sources Thalamus reads and its scripted chain
+
+MECHANISM_SOURCES = (
+    "Synthetic source A (doi:10.5555/demo.0101): in a randomized crossover trial in adults, eating within "
+    "an early ten-hour window improved circadian clock alignment. "
+    "Synthetic source C (doi:10.5555/demo.0102): in healthy adults, higher nocturnal vagal tone went with "
+    "higher overnight heart rate variability. "
+    "Synthetic source D: the feeding-entrained clock pathway is conserved across mammals. "
+    "All data in these sources are synthetic."
+)
+
+
+def _ev(paper: str, design: str, quote: str) -> dict:
+    return {"paper": paper, "design": design, "relation": "supports", "quote": quote}
+
+
+def _dive_link(lid: str, src: tuple[str, str], dst: tuple[str, str], kind: str, evidence_: list[dict],
+               question: str | None = None, keywords: Sequence[str] = ()) -> dict:
+    return {"id": lid, "src": src[1], "src_type": src[0], "dst": dst[1], "dst_type": dst[0], "kind": kind,
+            "evidence": evidence_, "open_question": question, "keywords": list(keywords)}
+
+
+_TRE = ("intervention", "Time-restricted eating")
+_CLOCK = ("mechanism", "Circadian clock alignment")
+_VAGAL = ("mechanism", "Nocturnal vagal tone")
+_HRV = ("outcome", "Overnight heart rate variability")
+
+DEEP_DIVE: dict[str, Any] = {
+    "claim": {"intervention": _TRE[1], "category": "timing", "outcome": _HRV[1], "tracker_key": "hrv_sdnn_ln",
+              "supplement": None},
+    "links": [
+        _dive_link("l1", _TRE, _CLOCK, "mechanism", [_ev(
+            "doi:10.5555/demo.0101", "rct_crossover",
+            "eating within an early ten-hour window improved circadian clock alignment")]),
+        _dive_link("l2", _CLOCK, _VAGAL, "biomarker", [_ev(
+            f"doi:{FRONTIER_DOI}", "animal",
+            "raised nocturnal vagal tone through realigned clock gene expression")],
+            "Hebt eine bessere Ausrichtung der inneren Uhr den nächtlichen Vagotonus auch beim Menschen?",
+            ["vagal tone", "time-restricted eating"]),
+        _dive_link("l3", _VAGAL, _HRV, "outcome", [_ev(
+            "doi:10.5555/demo.0102", "mechanistic_human",
+            "higher nocturnal vagal tone went with higher overnight heart rate variability")]),
+    ],
+    "conserved_pathway": {"value": True, "quote": "the feeding-entrained clock pathway is conserved across mammals"},
+}
 
 
 # --------------------------------------------------------------------------
@@ -460,6 +560,8 @@ class Script:
     def reply(self, req: agents.LLMRequest) -> dict:
         if req.output_schema is evidence.PAPER_SCHEMA:
             return _paper_for(req)  # Thalamus extraction and the Amygdala audit agree
+        if req.output_schema is deepdive.DEEPDIVE_SCHEMA:
+            return DEEP_DIVE
         if req.bot == "hippocampus":
             return self.draft() if req.output_schema is weekly.DRAFT_SCHEMA else self.answer(self.next("answer"))
         if req.bot == "amygdala":
@@ -579,6 +681,42 @@ def step_evidence(run: Run, llm: Mapping[str, Any]) -> dict[str, str]:
     return gates
 
 
+def _appraisal_line(rec: Mapping[str, Any]) -> dict:
+    a = rec["appraisal"]
+    return {"status": a["status"], "certainty": round(rec["score"]["certainty"], 2),
+            "certainty_capped": round(a["certainty"], 2), "promise": round(a["promise"], 2),
+            "flags": list(a["flags"]), "blockers": list(a["frontier_blockers"])}
+
+
+def _appraise_paper(run: Run, rel: str) -> dict:
+    rec = dict(run.ledger.read_json(rel))
+    score, appraisal = cli.appraise_record(run.ledger, rec, cli.owner_profile(OWNER, run.cal.now.date()))
+    rec.update(score=dataclasses_asdict(score), appraisal=dataclasses_asdict(appraisal))
+    run.ledger.write_json(rel, rec, author=cli.CODE_AUTHOR)
+    return _appraisal_line(rec)
+
+
+def step_frontier(run: Run, llm: Mapping[str, Any]) -> dict:
+    """Appraise the rodent study, deep-dive it into an N-of-1 candidate, then re-appraise; cap the weak pilot."""
+    frontier_rel = weekly._paper_rel(FRONTIER_DOI)
+    before = _appraise_paper(run, frontier_rel)
+    sources = scouts.quarantine_text(run.ledger, "demo-c4-sources", MECHANISM_SOURCES, author="retina")
+    paper = next(p for p in PAPERS if p["doi"] == FRONTIER_DOI)
+    text = f"{paper['title']}\n\n{abstract(paper)}\n\n{run.ledger.read_text(sources)}"
+    record = cli.run_deep_dive(run.ledger, llm, frontier_rel, text, run.cal.now)
+    after = _appraise_paper(run, frontier_rel)
+    weak = _appraise_paper(run, weekly._paper_rel(WEAK_DOI))
+    run.commit("evidence.deepdive", f"Deep dive {frontier_rel}: {record['decision']}", author="thalamus")
+    view = lexicon.load_view(run.ledger)
+    return {
+        "paper": frontier_rel, "before_dive": before, "after_dive": after, "weak": weak,
+        "dive": {"ref": deepdive.record_rel(record["paper_key"]), "decision": record["decision"],
+                 "belief_id": record["belief_id"], "chain": record["chain"], "reasons": record["reasons"]},
+        "lexicon": {"nodes": len(view["nodes"]), "links": len(view["links"]), "questions": len(view["questions"]),
+                    "keywords": lexicon.open_keywords(view)},
+    }
+
+
 def step_review(run: Run, llm: Mapping[str, Any]) -> weekly.ReviewOutcome:
     packet = weekly.build_packet(run.store, run.ledger, run.cal.week, run.cfg, run.cal.now)
     outcome = weekly.run_review(
@@ -660,6 +798,150 @@ def step_experiment(run: Run) -> dict:
     return {"id": p.id, "problems": [], "days": len(allocation), "start": start}
 
 
+# --------------------------------------------------------------------------
+# Fake tracker poll: synthetic Garmin-like data through an in-process transport
+
+GARMIN_ACTIVITY_ID = 9001
+DEMO_GARMIN_KEY = "demo-garmin-key-not-a-secret"  # GarminSource refuses to start without a key
+
+
+def _jwt(exp: float) -> str:
+    def part(obj: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+    return f"{part({'alg': 'none'})}.{part({'exp': exp})}.demo"
+
+
+def _ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
+
+def _local_ms(dt: datetime) -> int:
+    """Garmin's '*Local' epochs: local wall time read as if it were UTC."""
+    return _ms(dt.replace(tzinfo=timezone.utc))
+
+
+def _garmin_sleep(day: str) -> dict:
+    start, end = _ts(day, -55), _ts(day, 6 * 60 + 20)
+    return {"calendarDate": day, "sleepStartTimestampGMT": _ms(start), "sleepStartTimestampLocal": _local_ms(start),
+            "sleepEndTimestampGMT": _ms(end), "sleepEndTimestampLocal": _local_ms(end), "sleepTimeSeconds": 25200,
+            "deepSleepSeconds": 5000, "lightSleepSeconds": 14800, "remSleepSeconds": 5400, "awakeSleepSeconds": 1500,
+            "averageRespirationValue": 14.2, "sleepScores": {"overall": {"value": 78}}}
+
+
+def _garmin_daily(day: str) -> dict:
+    return {"calendarDate": day, "calories": {"burnedActive": 560}, "heartRate": {"restingValue": 54},
+            "bodyBattery": {"maxValue": 82, "minValue": 24}}
+
+
+def _garmin_activity(cal: Calendar) -> dict:
+    """The Saturday long run the watch recorded too (same session, second device)."""
+    start = _ts(cal.days[-2], 9 * 60 + 30)
+    gmt = start.astimezone(timezone.utc)
+    return {"activityId": GARMIN_ACTIVITY_ID, "activityName": "Langer Lauf", "startTimeGMT": f"{gmt:%Y-%m-%d %H:%M:%S}",
+            "startTimeLocal": f"{start:%Y-%m-%d %H:%M:%S}", "duration": 4200.0, "calories": 720, "bmrCalories": 95,
+            "averageHR": 142, "maxHR": 161, "activityType": {"typeKey": "running"}, "startLatitude": 0.0,
+            "startLongitude": 0.0}
+
+
+class GarminFake:
+    """In-process stand-in for the Garmin Personal API; only the window's days, no network."""
+
+    def __init__(self, cal: Calendar) -> None:
+        self.cal = cal
+        self.calls = 0
+        days = list(cal.days[-4:])
+        self.routes: dict[tuple[str, str], Any] = {
+            ("POST", garmin.TOKEN_PATH): {"accessToken": _jwt(cal.now.timestamp() + 86400)},
+            ("GET", garmin.SLEEP_PATH): [_garmin_sleep(d) for d in days],
+            ("GET", garmin.DAILY_PATH): [_garmin_daily(d) for d in days],
+            ("GET", garmin.ACTIVITIES_PATH): [_garmin_activity(cal)],
+        }
+        for d in days:
+            self.routes[("GET", garmin.HRV_PATH.format(day=d))] = {
+                "hrvSummary": {"calendarDate": d, "lastNightAvg": 46, "weeklyAvg": 48, "status": "BALANCED"}}
+
+    def __call__(self, req: Request) -> Response:
+        self.calls += 1
+        parts = urllib.parse.urlsplit(req.url)
+        if parts.hostname != garmin.HOST:
+            raise scouts.HostNotAllowed(f"demo has no network: {parts.hostname}")
+        body = self.routes.get((req.method, parts.path))
+        if body is None:
+            return Response(404, {}, b"")
+        return Response(200, {"content-type": "application/json"}, json.dumps(body).encode("utf-8"))
+
+
+class _MemoryTokens:
+    def __init__(self) -> None:
+        self.tokens: dict[str, Any] = {}
+
+    def load(self, name: str) -> Any:
+        return self.tokens.get(name)
+
+    def save(self, name: str, token: Any) -> None:
+        self.tokens[name] = token
+
+    def delete(self, name: str) -> None:
+        self.tokens.pop(name, None)
+
+
+def garmin_source(cal: Calendar, transport: GarminFake) -> garmin.GarminSource:
+    return garmin.GarminSource(env={garmin.KEY_ENV: DEMO_GARMIN_KEY}, options={}, tz=DEMO_TZ, transport=transport,
+                               token_store=_MemoryTokens(), clock=lambda: cal.now.timestamp(), sleep=lambda _s: None)
+
+
+def garmin_connect_copy(cal: Calendar) -> dict:
+    """What Garmin Connect writes back into Apple Health: the same run and resting HR, as HAE JSON."""
+    run_ = _garmin_activity(cal)
+    start = _ts(cal.days[-2], 9 * 60 + 30)
+    rhr = [{"date": _hae(_ts(d, 12 * 60)), "qty": 54.0, "source": "Garmin Connect"} for d in cal.days[-4:]]
+    workout = {"id": "hae-garmin-copy", "name": "Outdoor Run", "start": _hae(start),
+               "end": _hae(start + timedelta(seconds=run_["duration"])), "duration": run_["duration"],
+               "source": "Garmin Connect"}
+    return {"data": {"metrics": [{"name": "resting_heart_rate", "units": "count/min", "data": rhr}],
+                     "workouts": [workout]}}
+
+
+def _canonical(store: Store, days: Sequence[str]) -> dict[tuple[str, str], tuple[float | None, str]]:
+    return {(r.date, r.key): (r.value, r.source) for key in metrics.DAILY_KEYS
+            for r in store.daily(key, days[0], cli._shift(days[-1], 1))}
+
+
+def _changed(before: Mapping, after: Mapping) -> list[str]:
+    """Daily keys whose canonical value existed before and differs now (a double count would show here)."""
+    return sorted({k for (d, k), (v, _) in before.items() if v is not None and after.get((d, k), (None,))[0] != v})
+
+
+def _inserted(result: Mapping[str, Any]) -> dict[str, int]:
+    return {k: v for k, v in result["counts"].items() if k != "deleted"}
+
+
+def step_tracker(run: Run) -> dict:
+    """Poll the fake Garmin twice (overlapping windows) and ingest Garmin's Apple Health copy with the guard on."""
+    days = list(run.cal.days[-4:])
+    run.ledger.write_json(tracker_run.CONFIG_PATH, {"enabled": ["garmin"], "garmin": {"poll_minutes": 60}},
+                          author=cli.CODE_AUTHOR)
+    before = _canonical(run.store, days)
+    transport = GarminFake(run.cal)
+    source = garmin_source(run.cal, transport)
+    first = tracker_run.poll_one(run.store, source, now=run.cal.now, tz=DEMO_TZ)
+    second = tracker_run.poll_one(run.store, source, now=run.cal.now, tz=DEMO_TZ)
+    copy = ingest.parse_payload(garmin_connect_copy(run.cal), {"Garmin Connect": "garmin"}, frozenset({"garmin"}))
+    stored_copy = cli.store_batch(run.store, copy)
+    cli.finalize_days(run.store, run.ledger, run.cfg, days, run.cal.now)
+    after = _canonical(run.store, days)
+    run.commit("data.daily", f"Garmin poll merged, {days[0]}..{days[-1]}")
+    workouts = [w for w in run.store.workouts(f"{days[0]}T00:00") if w.source == "garmin"]
+    return {
+        "status": first["status"], "window": first["window"], "first": _inserted(first), "second": _inserted(second),
+        "repoll_deleted": second["counts"]["deleted"],
+        "requests": transport.calls, "hae_copy_dropped": copy.skipped.get("api_source", 0),
+        "hae_copy_stored": sum(stored_copy.values()), "garmin_workouts": len(workouts),
+        "changed_keys": _changed(before, after),
+        "filled_keys": sorted({k for (d, k), (v, src) in after.items() if src == "garmin" and v is not None}),
+    }
+
+
 def step_dashboard(run: Run) -> list[Path]:
     return dashboard.build(run.store, run.ledger, run.root / "site", run.cal.now, run.cfg)
 
@@ -707,10 +989,12 @@ def _pipeline(run: Run, seed: int) -> dict:
     llm = _llm(provider, run.ledger, run.cal)
     insula_out = step_insula(run, llm)
     gates = step_evidence(run, llm)
+    frontier = step_frontier(run, llm)
     outcome = step_review(run, llm)
     guards = step_guardrails(run)
     plan = step_plan(run)
     experiment = step_experiment(run)
+    tracker = step_tracker(run)
     pages = step_dashboard(run)
     return {
         "ledger": str(run.root), "dashboard": str(pages[0]), "week": run.cal.week,
@@ -719,7 +1003,8 @@ def _pipeline(run: Run, seed: int) -> dict:
         "review": {"ruling": outcome.ruling, "tier": outcome.verdict.tier if outcome.verdict else None,
                    "pending_id": outcome.pending_id, "messages": list(outcome.messages),
                    "open_blockers": list(outcome.open_blockers), "aborted": outcome.aborted},
-        "guardrails": guards, "plan": plan, "experiment": experiment, "llm_calls": len(provider.calls), "commits": run.commits,
+        "guardrails": guards, "plan": plan, "experiment": experiment, "frontier": frontier, "tracker": tracker,
+        "llm_calls": len(provider.calls), "commits": run.commits,
     }
 
 
@@ -745,4 +1030,26 @@ def summary_lines(s: Mapping[str, Any]) -> Iterator[str]:
     e = s["experiment"]
     yield (f"Experiment:  {e['id']} " + (f"not eligible: {', '.join(e['problems'])}" if e["problems"]
                                           else f"protocol frozen, {e['days']} days from {e['start']}"))
+    yield from _frontier_lines(s["frontier"])
+    yield _tracker_line(s["tracker"])
     yield f"LLM calls:   {s['llm_calls']} to FakeProvider, 0 network requests; git commits: {s['commits']}"
+
+
+def _frontier_lines(f: Mapping[str, Any]) -> Iterator[str]:
+    yield (f"Frontier:    {Path(f['paper']).stem} {f['before_dive']['status']} -> {f['after_dive']['status']} "
+           f"(certainty {f['after_dive']['certainty']}, promise {f['before_dive']['promise']} -> "
+           f"{f['after_dive']['promise']}); deep dive: {f['dive']['decision']} {f['dive']['belief_id']} "
+           f"(weakest link {f['dive']['chain']['weakest']}, human coverage {f['dive']['chain']['coverage']:.2f})")
+    w = f["weak"]
+    yield (f"Weak paper:  {WEAK_DOI} certainty {w['certainty']} -> {w['certainty_capped']}, "
+           f"promise {w['promise']}, flags {', '.join(w['flags']) or 'none'}")
+    lx = f["lexicon"]
+    yield (f"Lexicon:     {lx['nodes']} nodes, {lx['links']} links, {lx['questions']} open questions; "
+           f"scout keywords {', '.join(lx['keywords']) or 'none'}")
+
+
+def _tracker_line(t: Mapping[str, Any]) -> str:
+    return (f"Tracker:     garmin {t['status']}, " + ", ".join(f"{k}={v}" for k, v in t["first"].items() if v)
+            + f"; repoll replaced {t['repoll_deleted']} rows with "
+            + f"{'the same' if t['first'] == t['second'] else 'different'} counts; Apple Health copy dropped "
+            f"{t['hae_copy_dropped']} rows; canonical keys changed: {', '.join(t['changed_keys']) or 'none'}")

@@ -152,7 +152,7 @@ class PeriodTest(unittest.TestCase):
         jobs = {j.name: j for j in pineal.default_jobs()}
         self.assertEqual(len(jobs), len(pineal.default_jobs()))
         self.assertEqual({n for n, j in jobs.items() if j.essential},
-                         {"ingest-prune", "red_flags", "finalize_day", "weekly_review"})
+                         {"ingest-prune", "red_flags", "tracker_poll", "finalize_day", "weekly_review"})
         for name in ("freshness", "heartbeat", "budget", "red_flags"):
             self.assertEqual(jobs[name].cadence, "hourly")
         for scout in ("retina", "spindle", "papilla"):
@@ -164,6 +164,8 @@ class PeriodTest(unittest.TestCase):
         self.assertEqual((jobs["weekly_review"].weekday, jobs["weekly_review"].at), (6, "17:00"))
         self.assertEqual((jobs["ratify_due"].cadence, jobs["ratify_due"].at), ("minute", "*/15"))
         self.assertEqual(jobs["monthly_report"].cadence, "monthly")
+        self.assertEqual((jobs["tracker_poll"].cadence, jobs["tracker_poll"].at), ("hourly", ":20"))
+        self.assertEqual(jobs["frontier_review"].cadence, "monthly")
 
 
 # --------------------------------------------------------------------------
@@ -509,6 +511,74 @@ class IncidentTest(unittest.TestCase):
         self.assertEqual((req.get_method(), req.full_url), ("POST", "https://repair.invalid/hook"))
         self.assertEqual(req.get_header("X-webhook-secret"), "s" * 32)
         self.assertEqual(json.loads(req.data), incident)
+
+
+# --------------------------------------------------------------------------
+# Tracker polling and the monthly frontier review
+
+
+class FakeTracker:
+    """A TrackerSource double: one synthetic resting-HR sample per poll, no network."""
+
+    name = "garmin"
+
+    def __init__(self) -> None:
+        self.polls: list = []
+
+    def poll(self, cursor, *, now, tz, backfill_days=0):  # noqa: ANN001
+        from homunculus.store import Sample
+        from homunculus.trackers.base import PollResult, TrackerBatch
+
+        self.polls.append(cursor)
+        sample = Sample("resting_heart_rate", "count/min", "2026-11-20T06:00:00+00:00", "qty", 51.0, "garmin")
+        return PollResult(TrackerBatch(samples=(sample,)), ("2026-11-19T00:00:00+00:00", "2026-11-20T07:31:00+00:00"),
+                          {"watermark": "2026-11-20T07:31:00+00:00"}, True, 3)
+
+
+class TrackerJobTest(PinealCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.migrate()
+        self.fake_tracker = FakeTracker()
+        self.ctx.trackers = lambda name, cfg: self.fake_tracker
+
+    def job(self, name: str) -> Job:
+        return {j.name: j for j in pineal.default_jobs()}[name]
+
+    def test_skipped_without_enabled_trackers(self) -> None:
+        out = pineal.run_job(self.ctx, self.job("tracker_poll"), "2026-11-20T07")
+        self.assertEqual(out["status"], "skipped")
+
+    def test_polls_when_due_and_writes_state(self) -> None:
+        self.ledger.write_json("config/trackers.json", {"enabled": ["garmin"], "garmin": {"poll_minutes": 60}},
+                               author="pineal")
+        self.assertEqual(pineal.run_job(self.ctx, self.job("tracker_poll"), "2026-11-20T07")["status"], "ok")
+        state = self.store.tracker_state("garmin")
+        self.assertEqual((state.last_error, state.requests_today), (None, 3))
+        self.assertEqual(len(self.store.samples("resting_heart_rate", "2026-11-19")), 1)
+        self.clock.value += timedelta(minutes=30)
+        out = pineal.run_job(self.ctx, self.job("tracker_poll"), "2026-11-20T08")
+        self.assertEqual((out["status"], len(self.fake_tracker.polls)), ("skipped", 1))  # not due yet
+        pineal.run_job(self.ctx, self.job("tracker_poll"), "2026-11-21T06")  # morning: every enabled one
+        self.assertEqual(self.fake_tracker.polls[-1], {"watermark": "2026-11-20T07:31:00+00:00"})
+        self.assertEqual(len(self.store.samples("resting_heart_rate", "2026-11-19")), 1)  # replaced, not doubled
+
+    def test_too_frequent_polling_is_rejected(self) -> None:
+        self.ledger.write_json("config/trackers.json", {"enabled": ["garmin"], "garmin": {"poll_minutes": 15}},
+                               author="pineal")
+        self.assertEqual(pineal.run_job(self.ctx, self.job("tracker_poll"), "2026-11-20T07")["status"], "failed")
+
+    def test_frontier_review_names_the_next_candidate(self) -> None:
+        dive = {"belief_id": "fr-demo", "paper": "evidence/papers/x.json", "decision": "watch",
+                "claim": {"intervention": "Abendessen vor 19 Uhr"}, "chain": {"support": 0.5}, "reasons": [],
+                "open_questions": []}
+        self.ledger.write_json("evidence/deepdives/x.json", dive, author="pineal")
+        out = pineal.run_job(self.ctx, self.job("frontier_review"), "2026-11")
+        self.assertEqual(out["status"], "ok")
+        review = self.ledger.read_json("evidence/frontier/2026-10.json")
+        self.assertEqual((review["surfaced"], review["met"], len(review["next"])), (0, False, 1))
+        texts = [m.get("body", "") for m in self.owner_mail()]
+        self.assertTrue(any("Abendessen vor 19 Uhr" in t for t in texts), texts)
 
 
 if __name__ == "__main__":

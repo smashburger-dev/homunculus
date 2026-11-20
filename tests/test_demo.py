@@ -115,6 +115,33 @@ class DemoEndToEndTest(DemoCase):
         self.assertTrue((self.root / "experiments/exp-abendlicht/protocol.json").is_file())
         self.assertIn("exp-abendlicht", (site / "experiments.html").read_text(encoding="utf-8"))
 
+    def test_frontier_paper_becomes_n_of_1_candidate_and_weak_paper_is_capped(self) -> None:
+        f = self.summary["frontier"]
+        self.assertEqual((f["before_dive"]["status"], f["after_dive"]["status"]), ("watchlist", "frontier"))
+        self.assertLess(f["after_dive"]["certainty"], 2.0)
+        self.assertGreaterEqual(f["after_dive"]["promise"], 2.5)
+        self.assertEqual(f["dive"]["decision"], "n_of_1_candidate")
+        self.assertEqual(f["weak"]["certainty_capped"], 1.0)
+        self.assertIn("quality_weak", f["weak"]["flags"])
+        self.assertIn("weak_methods", f["weak"]["blockers"])
+        self.assertEqual((f["lexicon"]["links"], f["lexicon"]["questions"]), (3, 1))
+        packet = json.loads(next(self.root.glob("reviews/*/packet.json")).read_text(encoding="utf-8"))
+        self.assertEqual(packet["frontier"]["candidates"][0]["belief_id"], f["dive"]["belief_id"])
+        page = (self.root / "site/experiments.html").read_text(encoding="utf-8")
+        self.assertIn("Frontier", page)
+        self.assertIn("Lexikon", page)
+        self.assertIn("N-of-1-Kandidat", page)
+
+    def test_tracker_poll_merges_without_double_counting(self) -> None:
+        t = self.summary["tracker"]
+        self.assertEqual(t["status"], "ok")
+        self.assertEqual(t["first"], t["second"])  # the overlapping repoll replaced, it did not add
+        self.assertGreater(t["repoll_deleted"], 0)
+        self.assertGreater(t["hae_copy_dropped"], 0)
+        self.assertEqual(t["hae_copy_stored"], 0)
+        self.assertEqual(t["garmin_workouts"], 1)
+        self.assertEqual(t["changed_keys"], [])
+
     def test_no_device_names_or_gps_in_ledger(self) -> None:
         tracked = [p for p in self.root.rglob("*.json") if ".private" not in p.parts and "site" not in p.parts]
         for path in tracked:

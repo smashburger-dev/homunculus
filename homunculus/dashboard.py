@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-from homunculus import checkins, metrics, plans
+from homunculus import checkins, deepdive, lexicon, metrics, plans
 from homunculus.guardrails import Alert, render_alert
 from homunculus.metrics import MetricsConfig, Readiness
 from homunculus.plans import PlanError
@@ -108,6 +108,8 @@ SEVERITY_DE: Mapping[str, str] = {"blocker": "Blocker", "major": "wichtig", "min
 DECISION_DE: Mapping[str, str] = {
     "adopt": "übernehmen", "reject": "verwerfen", "inconclusive": "unentschieden", "extend": "verlängern",
 }
+DIVE_DE: Mapping[str, str] = {"n_of_1_candidate": "N-of-1-Kandidat", "watch": "beobachten"}
+VERDICT_DE: Mapping[str, str] = {"supported": "gestützt", "contested": "umstritten", "open": "offen"}
 LEVEL_DE: Mapping[str, str] = {
     "normal": "normal", "reduced": "reduziert (ab 80 %)", "core_only": "nur Kernjobs (100 %)",
 }
@@ -660,12 +662,63 @@ def _experiment_html(exp: Mapping) -> str:
             f"{table}{spark}</article>")
 
 
-def render_experiments(experiments: Sequence[Mapping]) -> str:
-    """experiments: [{'id', 'protocol': protocol.json, 'result': result.json or None}]."""
+def render_experiments(experiments: Sequence[Mapping], extra: str = "") -> str:
+    """experiments: [{'id', 'protocol': protocol.json, 'result': result.json or None}]; extra: pre-rendered sections."""
     if not experiments:
-        return _page("experiments.html", "Experimente", _section("Experimente", _p("Keine Experimente.")))
+        return _page("experiments.html", "Experimente", _section("Experimente", _p("Keine Experimente.")) + extra)
     ordered = sorted(experiments, key=lambda x: str(x.get("id", "")))
-    return _page("experiments.html", "Experimente", "".join(_experiment_html(x) for x in ordered))
+    return _page("experiments.html", "Experimente", "".join(_experiment_html(x) for x in ordered) + extra)
+
+
+# --------------------------------------------------------------------------
+# Frontier lane and lexicon
+
+
+def _dive_row(rec: Mapping) -> tuple[str, ...]:
+    claim, chain = rec.get("claim") or {}, rec.get("chain") or {}
+    coverage = chain.get("coverage")
+    return (_e(claim.get("intervention", "?")), _e(claim.get("outcome", "?")), _e(_label(DIVE_DE, rec.get("decision"))),
+            _e(_num(chain.get("weakest"), 1)), _e(_num(coverage * 100 if _finite(coverage) else None, 0, " %")),
+            _e("; ".join(str(r) for r in rec.get("reasons") or ()) or "–"))
+
+
+def render_frontier(dives: Sequence[Mapping]) -> str:
+    """Deep-dive records (evidence/deepdives/*.json) as one section."""
+    if not dives:
+        return ""
+    head = _p("Neue Arbeiten mit niedriger Sicherheit, aber hohem Potenzial und sauberer Methodik. "
+              "Code prüft die Wirkkette Glied für Glied.")
+    rows = [_dive_row(d) for d in sorted(dives, key=lambda d: str(d.get("belief_id", "")))]
+    headers = ("Intervention", "Zielgröße", "Entscheidung", "Schwächstes Glied", "Am Menschen gezeigt", "Gründe")
+    return _section("Frontier", head + _table(headers, rows, (3, 4)))
+
+
+def _node_label(nodes: Mapping, node: Any) -> str:
+    entry = nodes.get(node)
+    return str(entry.get("label")) if isinstance(entry, Mapping) and entry.get("label") else str(node)
+
+
+def _link_row(nodes: Mapping, link: Mapping) -> tuple[str, ...]:
+    return (_e(_node_label(nodes, link.get("src"))), _e(_node_label(nodes, link.get("dst"))),
+            _e(_label(VERDICT_DE, link.get("verdict"))), _e(_num(link.get("support"), 1)),
+            _e("ja" if link.get("human") else "nein"))
+
+
+def render_lexicon(view: Mapping) -> str:
+    """Link verdicts and open questions of evidence/lexicon/view.json as one section."""
+    links = [x for x in (view.get("links") or {}).values() if isinstance(x, Mapping)]
+    if not links:
+        return ""
+    nodes = view.get("nodes") or {}
+    rows = [_link_row(nodes, x) for x in sorted(links, key=lambda x: str(x.get("src")))]
+    table = _table(("Von", "Nach", "Urteil", "Stützung", "Mensch"), rows, (3,))
+    return _section("Lexikon", table + _questions_html(view))
+
+
+def _questions_html(view: Mapping) -> str:
+    questions = [q for q in view.get("questions") or () if isinstance(q, Mapping)]
+    items = "".join(f"<li>{_e(q.get('text', ''))}</li>" for q in questions)
+    return f"<p>Offene Fragen:</p><ul>{items}</ul>" if items else ""
 
 
 # --------------------------------------------------------------------------
@@ -865,6 +918,13 @@ def _experiments(ledger: Ledger) -> list[dict]:
     return out
 
 
+def _frontier_html(ledger: Ledger) -> str:
+    dives = [d for d in (_read_json_safe(ledger, rel) for rel in ledger.glob(f"{deepdive.DIVES_DIR}/*.json"))
+             if isinstance(d, Mapping)]
+    view = _read_json_safe(ledger, lexicon.VIEW_PATH)
+    return render_frontier(dives) + render_lexicon(view if isinstance(view, Mapping) else {})
+
+
 def _budget_inputs(ledger: Ledger, now: datetime) -> tuple[list[dict], float]:
     week = _iso_week(now)
     rows = [r for r in ledger.read_jsonl("ops/budget.jsonl") if r.get("week") == week]
@@ -897,7 +957,7 @@ def build(store: Store, ledger: Ledger, out_dir: Path, now: datetime, cfg: Metri
         "plan.html": render_plan(*_plan_pair(ledger)),
         "week.html": render_week(review),
         "challenges.html": render_challenges(review, _week_conflicts(ledger, review)),
-        "experiments.html": render_experiments(_experiments(ledger)),
+        "experiments.html": render_experiments(_experiments(ledger), _frontier_html(ledger)),
         "budget.html": render_budget(*_budget_inputs(ledger, now)),
         "checkin.html": _page("checkin.html", "Check-in", f"<section>{checkins.morning_form_html(day)}</section>"),
     }
