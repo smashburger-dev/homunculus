@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
-from homunculus.guardrails import HARD_RPE
+from homunculus.guardrails import HARD_RPE, Rules
 from homunculus.store import Ledger, canonical_json
 
 # --------------------------------------------------------------------------
@@ -213,8 +213,30 @@ def _schema_errors(schema: Mapping, value: Any, path: str) -> list[str]:
     return _range_errors(schema, value, path) + _object_errors(schema, value, path) + _array_errors(schema, value, path)
 
 
-def _semantic_errors(plan: Mapping) -> list[str]:
+def _duplicate_exercises(plan: Mapping) -> list[str]:
+    """One entry per exercise and session: copies would add volume past the per-exercise load check."""
     errors = []
+    for i, session in enumerate(plan.get("sessions", [])):
+        eids = [e.get("exercise_id") for e in session.get("exercises", []) if isinstance(e, dict)]
+        if len(eids) != len(set(eids)):
+            errors.append(f"/sessions/{i}/exercises: duplicate exercise_id")
+    return errors
+
+
+def _valid_until_errors(plan: Mapping) -> list[str]:
+    """valid_until is shown to the owner verbatim, so it must be an ISO date, not free text."""
+    raw = plan.get("valid_until")
+    if raw is None:
+        return []
+    try:
+        datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return ["/valid_until: expected an ISO date"]
+    return []
+
+
+def _semantic_errors(plan: Mapping) -> list[str]:
+    errors = [*_duplicate_exercises(plan), *_valid_until_errors(plan)]
     ids = [s.get("id") for s in plan.get("sessions", []) if isinstance(s, dict)]
     if len(ids) != len(set(ids)):
         errors.append("/sessions: duplicate session id")
@@ -773,17 +795,37 @@ def _low_readiness(plan: Mapping, planned: Mapping) -> dict:
     return _day_result(None, "rest", reasons)
 
 
-def modulate_day(
-    plan: Mapping, weekday: int, readiness_band: str | None, red_flag_active: bool, stale: bool,
-) -> dict:
-    """Deterministic session for the day. Never returns more load than planned."""
-    if not isinstance(weekday, int) or not 0 <= weekday <= 6:
-        raise PlanError(f"weekday must be 0..6, got {weekday!r}")
-    if red_flag_active:
-        return _day_result(None, "rest", ["red_flag"])
-    planned = _session_for(plan, weekday)
-    if planned is None:
-        return _day_result(None, "as_planned", ["no_session"])
+PAUSE_RPE_CAP = HARD_RPE - 1  # highest target RPE while an alert pauses intense training
+
+
+def _eased(day: dict, reason: str) -> dict:
+    if day["action"] == "as_planned":
+        day["action"] = "shorten"
+    day["reason_codes"].append(reason)
+    return day
+
+
+def _cap_intensity(day: dict) -> dict:
+    session = day["session"]
+    if session is None or float(session["target_rpe"]) <= PAUSE_RPE_CAP:
+        return day
+    session["target_rpe"] = PAUSE_RPE_CAP
+    return _eased(day, "pause_intense")
+
+
+def _cap_return(day: dict, planned: Mapping, days_off: int, rules: Rules) -> dict:
+    """After a break the day's load stays at or below return_cap_pct of the planned session."""
+    session = day["session"]
+    if session is None or days_off < rules.return_after_days_off:
+        return day
+    target, load = _session_load(planned) * rules.return_cap_pct / 100, _session_load(session)
+    if load <= target:
+        return day
+    day["session"] = _shorten(session, (1 - target / load) * 100)
+    return _eased(day, "return_after_break")
+
+
+def _readiness_day(plan: Mapping, planned: Mapping, readiness_band: str | None, stale: bool) -> dict:
     if stale:
         return _day_result(planned, "as_planned", ["stale_data"])
     if readiness_band in ("normal", "high"):
@@ -791,6 +833,29 @@ def modulate_day(
     if readiness_band != "low":
         return _day_result(planned, "as_planned", ["readiness_unknown"])
     return _low_readiness(plan, planned)
+
+
+def modulate_day(
+    plan: Mapping, weekday: int, readiness_band: str | None, red_flag_active: bool, stale: bool,
+    *, pause_intense: bool = False, days_off: int = 0, rules: Rules | None = None,
+) -> dict:
+    """Deterministic session for the day. Never returns more load than planned.
+
+    pause_intense (an alert such as rhr_resp_temp holds) caps target_rpe at PAUSE_RPE_CAP.
+    days_off is the length of the training break before the day; from rules.return_after_days_off
+    on, the session is cut to rules.return_cap_pct % of the planned load, also for an unchanged plan.
+    """
+    if not isinstance(weekday, int) or not 0 <= weekday <= 6:
+        raise PlanError(f"weekday must be 0..6, got {weekday!r}")
+    if red_flag_active:
+        return _day_result(None, "rest", ["red_flag"])
+    planned = _session_for(plan, weekday)
+    if planned is None:
+        return _day_result(None, "as_planned", ["no_session"])
+    day = _readiness_day(plan, planned, readiness_band, stale)
+    if pause_intense:
+        day = _cap_intensity(day)
+    return _cap_return(day, planned, days_off, rules or Rules())
 
 
 # --------------------------------------------------------------------------

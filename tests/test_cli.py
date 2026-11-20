@@ -18,7 +18,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
-from homunculus import agents, beliefs, cli, demo, plans
+from homunculus import agents, beliefs, cli, demo, pineal, plans
 from homunculus.store import DailyValue, HealthEvent, Ledger, Store
 
 NOW = datetime(2026, 11, 22, 16, 0, tzinfo=timezone.utc)  # Sunday of 2026-W47
@@ -334,6 +334,57 @@ class PlanCommandsTest(CliCase):
         self.assertEqual(self.run_cli("--ledger", str(self.root), "rollback", "1")[0], 1)  # already current
 
 
+class InitPlanTest(CliCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.ledger = self.init()
+
+    def test_fresh_ledger_gets_a_starter_plan_once(self) -> None:
+        self.assertIn("plan v0001", self.cli_ok("init-plan"))
+        plan = plans.current(self.ledger)
+        self.assertEqual((plan["version"], plan["ratified_by"], plan["sessions"]), (1, "owner", []))
+        self.assertEqual(plan["rationale_refs"], ["config/goals.md"])
+        self.assertEqual(plan["valid_until"], "2026-11-29T16:00:00Z")
+        self.assertTrue((self.root / "plans/v0001.md").is_file())
+        self.assertEqual(self.run_cli("--ledger", str(self.root), "init-plan")[0], 2)  # never overwrites
+
+    def test_from_file_is_validated_and_refuses_a_kcal_target(self) -> None:
+        content = {k: v for k, v in _plan().items() if k not in cli.plans.PROTECTED_KEYS | {"valid_until"}}
+        path = self.tmp / "plan.json"
+        path.write_text(json.dumps({**content, "nutrition": {**content["nutrition"], "kcal_target": 1800}}),
+                        encoding="utf-8")
+        code, _, err = self.run_cli("--ledger", str(self.root), "init-plan", "--from", str(path))
+        self.assertEqual(code, 2)
+        self.assertIn("kcal_target", err)
+        path.write_text(json.dumps({**content, "sessions": [{"id": "x"}]}), encoding="utf-8")
+        self.assertEqual(self.run_cli("--ledger", str(self.root), "init-plan", "--from", str(path))[0], 2)
+        self.assertFalse((self.root / "plans/CURRENT").exists())
+        path.write_text(json.dumps(content), encoding="utf-8")
+        self.cli_ok("init-plan", "--from", str(path))
+        self.assertEqual(plans.current(self.ledger)["sessions"][0]["id"], "s-thu")
+
+
+class CoachingCliTest(CliCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.ledger = self.init()
+        for rule in ("bp_crisis", "chest_pain"):
+            self.ledger.append_jsonl(pineal.ALERTS_LOG, {"level": "urgent", "rule_id": rule, "date": "2026-11-20",
+                                                         "data": {}, "text_de": "synthetisch"}, author="pineal")
+
+    def test_clear_one_rule_then_all(self) -> None:
+        out = self.cli_ok("coaching", "show")
+        self.assertIn("bp_crisis 2026-11-20", out)
+        self.assertIn("chest_pain 2026-11-20", out)
+        self.assertEqual(self.run_cli("--ledger", str(self.root), "coaching", "clear", "nope")[0], 2)
+        self.assertIn("cleared 1", self.cli_ok("coaching", "clear", "bp_crisis"))
+        self.assertEqual([a["rule_id"] for a in pineal.coaching_holds(self.ledger, "2026-11-22")], ["chest_pain"])
+        self.assertIn("cleared 1", self.cli_ok("coaching", "clear"))
+        self.assertEqual(pineal.coaching_holds(self.ledger, "2026-11-22"), [])
+        self.assertIn("no coaching hold", self.cli_ok("coaching", "show"))
+        self.assertEqual(len(self.ledger.read_jsonl(pineal.COACHING_CLEARED_LOG)), 2)
+
+
 # --------------------------------------------------------------------------
 # Experiments and evidence
 
@@ -395,6 +446,11 @@ class ExperimentTest(CliCase):
         result = json.loads((self.root / "experiments/exp-1/result.json").read_text(encoding="utf-8"))
         self.assertEqual(len(result["pair_diffs"]), 6)
         self.assertGreater(result["d_bar"], 0)
+        self.assertEqual(result["decision"], "adopt")
+        events = [e for e in self.ledger.read_jsonl(beliefs.EVENTS_PATH) if e["kind"] == "personal_result"]
+        self.assertEqual([e["experiment"] for e in events], ["exp-1"])
+        view = self.ledger.read_json("beliefs/views/b-sleep.json")
+        self.assertGreater(view["mu"], 0.0)  # moved off the literature prior mu0 = 0
 
     def at(self, day: str) -> None:
         moment = datetime.fromisoformat(day).replace(hour=12, tzinfo=timezone.utc)
@@ -425,6 +481,7 @@ class ExperimentTest(CliCase):
         self.at("2027-01-25")
         self.assertIn("decision=extend", self.analyze()[1])
         self.assertTrue((self.root / "experiments/exp-1/extension.json").is_file())
+        self.assertFalse(any(e["kind"] == "personal_result" for e in self.ledger.read_jsonl(beliefs.EVENTS_PATH)))
         self.at("2027-01-26")  # the two extension pairs have no data yet
         code, out = self.analyze()
         self.assertEqual(code, 1)
@@ -439,11 +496,57 @@ class ExperimentTest(CliCase):
         self.assertIn("decision=inconclusive", self.analyze()[1])
         result = json.loads((self.root / "experiments/exp-1/result.json").read_text(encoding="utf-8"))
         self.assertEqual((result["extended"], len(result["pair_diffs"])), (True, 8))
+        events = [e for e in self.ledger.read_jsonl(beliefs.EVENTS_PATH) if e["kind"] == "personal_result"]
+        self.assertEqual(len(events), 1)
         code, out = self.analyze()
         self.assertEqual(code, 1)
         self.assertIn("final decision 'inconclusive'", out)
         self.assertEqual(json.loads((self.root / "experiments/exp-1/result.json").read_text(encoding="utf-8")),
                          result)
+
+    def test_extension_waits_for_its_data(self) -> None:
+        self.put("2026-08-01", 93)
+        self.ledger.write_json("experiments/exp-1/draft.json", self.draft(), author="pineal")
+        self.cli_ok("experiment", "design", "exp-1")
+        self.cli_ok("experiment", "allocate", "exp-1")
+        self.put(self.START, 6 * 14 - 1, {"A": 0.02}, self.allocation())  # last day not ingested yet
+        self.belief()
+        for name, value in (("ADOPT_BENEFIT", 1.01), ("REJECT_BENEFIT_BELOW", -1.0)):
+            patch = mock.patch.object(cli.experiments, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.at("2027-01-25")
+        code, out = self.analyze()
+        self.assertEqual(code, 1)
+        self.assertIn("no stored data yet for 1 day(s) from 2027-01-24", out)
+        self.put(self.START, 6 * 14, {"A": 0.02}, self.allocation())
+        self.assertIn("decision=extend", self.analyze()[1])
+        self.cli_ok("experiment", "allocate", "exp-1")
+        self.at("2027-02-22")  # extension over, none of its days stored
+        code, out = self.analyze()
+        self.assertEqual(code, 1)
+        self.assertIn("no stored data yet", out)
+        self.assertFalse(any(e["kind"] == "personal_result" for e in self.ledger.read_jsonl(beliefs.EVENTS_PATH)))
+        self.put("2027-01-25", 2 * 14, {"A": 0.02}, self.allocation())
+        self.assertIn("decision=inconclusive", self.analyze()[1])
+        result = json.loads((self.root / "experiments/exp-1/result.json").read_text(encoding="utf-8"))
+        self.assertEqual((result["extended"], len(result["pair_diffs"])), (True, 8))
+
+    def test_extension_without_data_counts_missing_after_lag(self) -> None:
+        self.put("2026-08-01", 93)
+        self.ledger.write_json("experiments/exp-1/draft.json", self.draft(), author="pineal")
+        self.cli_ok("experiment", "design", "exp-1")
+        self.cli_ok("experiment", "allocate", "exp-1")
+        self.put(self.START, 6 * 14, {"A": 0.02}, self.allocation())
+        self.belief()
+        for name, value in (("ADOPT_BENEFIT", 1.01), ("REJECT_BENEFIT_BELOW", -1.0)):
+            patch = mock.patch.object(cli.experiments, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.at("2027-01-25")
+        self.assertIn("decision=extend", self.analyze()[1])
+        self.at((date(2027, 2, 21) + timedelta(days=cli.FINALIZE_LAG_DAYS + 1)).isoformat())
+        self.assertIn("decision=inconclusive", self.analyze()[1])
 
     def test_ineligible_draft_is_not_frozen(self) -> None:
         self.put("2026-08-01", 93)
@@ -469,6 +572,36 @@ class ScorePaperTest(CliCase):
         self.assertEqual(json.loads(out)["gate"], "actionable")
         stored = self.ledger.read_json("evidence/papers/10-5555-demo-0001.json")
         self.assertEqual(stored["score"]["rubric_version"], "thal-2")
+
+    def test_status_follows_the_appraisal_not_the_raw_gate(self) -> None:
+        ext = demo.extraction(demo.PAPERS[0])
+        ext["outcome_switched"] = {"value": True, "quote": "The primary outcome differed from the registered one."}
+        rel = "evidence/papers/10-5555-demo-0001.json"
+        self.ledger.write_json(rel, {"schema": 1, "extraction": ext, "update_to": [], "score": None,
+                                     "blocked": False}, author="pineal")
+        out = json.loads(self.cli_ok("score-paper", rel))
+        self.assertEqual((out["gate"], out["status"]), ("actionable", "n_of_1_only"))  # weak methods cap it
+        self.assertEqual(self.ledger.read_json(rel)["appraisal"]["status"], "n_of_1_only")  # stored without --appraise
+
+    def believe(self, bid: str, direction: int, sources: list[str]) -> None:
+        claim = {"population": "adult", "intervention": "x", "comparator": "usual", "outcome": "sleep",
+                 "unit": "SD", "direction": direction}
+        prior = {"mu0": 0.0, "sd0": 0.1, "sources": sources, "certainty": 1.0, "rubric_version": "thal-2"}
+        self.ledger.append_jsonl(beliefs.EVENTS_PATH, beliefs.make_event(
+            "prior_set", bid, "2026-11-01", claim=claim, swc=0.1, prior=prior), author="pineal")
+
+    def test_promise_benefit_takes_the_linked_belief_direction(self) -> None:
+        rec = {"extraction": demo.extraction(demo.PAPERS[1]), "update_to": []}
+        owner = cli.owner_profile(demo.OWNER, NOW.date())
+        key = "doi:10.5555/demo.0002"
+        self.assertEqual(cli.appraise_record(self.ledger, rec, owner, as_of="2026-11-22")[1].promise, 0.0)
+        self.believe("b-up", 1, [key])
+        self.assertEqual(cli._linked_direction(self.ledger, key, "2026-11-22"), 1)
+        self.assertGreater(cli.appraise_record(self.ledger, rec, owner, as_of="2026-11-22")[1].promise, 0.0)
+        self.believe("b-down", -1, [key])  # linked beliefs disagree: no direction, no benefit
+        self.assertIsNone(cli._linked_direction(self.ledger, key, "2026-11-22"))
+        self.believe(cli.deepdive.belief_id_for(key), 1, [])  # the paper's own frontier belief wins
+        self.assertEqual(cli._linked_direction(self.ledger, key, "2026-11-22"), 1)
 
     def test_retraction_vetoes_and_blocked_is_not_scored(self) -> None:
         retracted = {"extraction": demo.extraction(demo.PAPERS[0]), "update_to": [{"type": "retraction"}]}
@@ -516,12 +649,32 @@ class DoctorTest(CliCase):
         self.assertIn("tailscale serve", out)
 
     def test_passes_with_safe_config(self) -> None:
+        self.cli_ok("init-plan")
         with mock.patch.dict(os.environ, {"HEALTH_TOKEN": TOKEN, "HEALTH_HOST": "127.0.0.1"}):
             code, out, _ = self.run_cli("--ledger", str(self.root), "doctor")
         self.assertEqual(code, 0 if HAS_GIT else 2, msg=out)
         self.assertIn("ok   token", out)
         self.assertIn("ok   roster", out)
+        self.assertIn("ok   plan: v0001", out)
         self.assertIn("budget", out)
+
+    def test_reports_missing_plan_and_push_channel(self) -> None:
+        env = {"HEALTH_TOKEN": TOKEN}
+        with mock.patch.dict(os.environ, env):
+            code, out, _ = self.run_cli("--ledger", str(self.root), "doctor")
+        self.assertEqual(code, 2)
+        self.assertIn("fail plan", out)
+        self.assertIn("init-plan", out)
+        self.assertIn(f"warn push: {cli.PUSH_URL_ENV} not set", out)
+        with mock.patch.dict(os.environ, {**env, cli.PUSH_URL_ENV: "https://push.example.test/topic"}):
+            self.assertIn(f"warn push: {cli.PUSH_TOKEN_ENV} not set", self.run_cli("--ledger", str(self.root), "doctor")[1])
+        with mock.patch.dict(os.environ, {**env, cli.PUSH_URL_ENV: "http://push.example.test/topic"}):
+            self.assertIn("fail push", self.run_cli("--ledger", str(self.root), "doctor")[1])
+        with mock.patch.dict(os.environ, {**env, cli.PUSH_URL_ENV: "https://push.example.test/topic",
+                                          cli.PUSH_TOKEN_ENV: "synthetic-push-token"}):
+            out = self.run_cli("--ledger", str(self.root), "doctor")[1]
+        self.assertIn("ok   push", out)
+        self.assertNotIn("synthetic-push-token", out)
 
     def test_public_bind_fails(self) -> None:
         with mock.patch.dict(os.environ, {"HEALTH_TOKEN": TOKEN, "HEALTH_HOST": "0.0.0.0"}):
@@ -628,6 +781,16 @@ class PinealWiringTest(CliCase):
         self.assertEqual(cfg.db_path, self.root / ".private" / "health.sqlite")
         self.assertEqual(set(serve.call_args.kwargs["post_routes"]), {"/checkin", "/message"})
 
+    def test_serve_warns_without_push_url(self) -> None:
+        env = {"HEALTH_TOKEN": TOKEN}
+        with mock.patch.dict(os.environ, env), mock.patch.object(cli.ingest, "serve"):
+            code, _, err = self.run_cli("--ledger", str(self.root), "serve")
+        self.assertEqual(code, 0)
+        self.assertIn(cli.PUSH_URL_ENV, err)
+        with mock.patch.dict(os.environ, {**env, cli.PUSH_URL_ENV: "https://push.example.test/topic"}), \
+                mock.patch.object(cli.ingest, "serve"):
+            self.assertNotIn(cli.PUSH_URL_ENV, self.run_cli("--ledger", str(self.root), "serve")[2])
+
 
 # --------------------------------------------------------------------------
 # Trackers, Devin layer, frontier lane
@@ -726,6 +889,16 @@ class IngestCliTest(CliCase):
         self.assertNotIn("53.0", json.dumps(out))
         self.assertEqual(self.run_cli("--ledger", str(self.root), "ingest")[0], 2)
 
+    def test_llm_copy_ingest_needs_the_opt_in(self) -> None:
+        code, out, _ = self.run_cli("--ledger", str(self.root), "ingest", "--llm-copy", "--file", str(self.payload))
+        self.assertEqual(code, 1)
+        self.assertIn("ingest-relay", out)
+        self.assertEqual(self.store().daily("rhr", "2026-01-01"), [])  # nothing ingested
+        ledger = Ledger(self.root, {})
+        ledger.write_json("config/devin.json", {"llm_copy_ingest": True}, author="pineal")
+        out = json.loads(self.cli_ok("ingest", "--llm-copy", "--file", str(self.payload)))
+        self.assertEqual(out["counts"]["workouts"], 1)
+
     def test_api_sources_guard_drops_the_vendor_copy(self) -> None:
         env = {"HEALTH_SOURCE_MAP": json.dumps({"Test Watch": "garmin"}), "HEALTH_API_SOURCES": "garmin"}
         with mock.patch.dict(os.environ, env):
@@ -760,8 +933,9 @@ class DevinCliTest(CliCase):
         stub = StubPineal()
         with mock.patch.object(cli, "_pineal", lambda: stub):
             code, out, err = self.run_cli("--ledger", str(self.root), "tick", "--devin-path", "b")
-            self.assertIn("finalize_day p: ok", out)
-            self.assertIn(cli.PUSH_URL_ENV, err)  # file-only delivery on the box is reported, not silent
+            self.assertIn("finalize_day p: ok", out)  # the jobs still ran and wrote the inbox copy
+            self.assertIn(cli.PUSH_URL_ENV, err)
+            self.assertEqual(code, cli.EXIT_RUNTIME)  # file-only delivery on path b fails the run
             with mock.patch.dict(os.environ, {cli.PUSH_URL_ENV: "https://push.example.test/topic"}):
                 code, out, err = self.run_cli("--ledger", str(self.root), "tick", "--devin-path", "b")
             self.assertEqual((code, err), (0, ""))
@@ -828,6 +1002,24 @@ class FrontierCliTest(CliCase):
         frontier = json.loads(self.cli_ok("frontier", WEEK))
         self.assertEqual(frontier["candidates"][0]["decision"], "n_of_1_candidate")
         self.assertIn("lexicon", self.cli_ok("lexicon", "rebuild"))
+
+    def test_ledger_design_overrides_the_cited_design(self) -> None:
+        mislabeled = json.loads(json.dumps(demo.DEEP_DIVE))
+        mislabeled["links"][1]["evidence"][0]["design"] = "rct_parallel"  # the ledger scored 0103 as animal
+        code, out, err = self.dive({"thalamus": mislabeled})
+        self.assertEqual(code, 0, err)
+        record = self.ledger.read_json(self.ledger.glob("evidence/deepdives/*.json")[0])
+        item = record["links"][1]["evidence"][0]
+        self.assertEqual((item["design"], item["human"]), ("animal", False))
+        self.assertAlmostEqual(record["chain"]["coverage"], 2 / 3)
+
+    def test_hard_blocker_aborts_before_any_llm_call(self) -> None:
+        self.ledger.write_json(self.PAPER, {**self.ledger.read_json(self.PAPER), "blocked": True}, author="pineal")
+        with mock.patch.object(cli.weekly, "_caller", side_effect=AssertionError("no LLM call")):
+            code, _, err = self.dive({"thalamus": demo.DEEP_DIVE})
+        self.assertEqual(code, 1)
+        self.assertIn("audit_blocked", err)
+        self.assertEqual(list((self.root / "evidence").glob("deepdives/*.json")), [])
 
     def test_plain_dry_run_stays_on_watch(self) -> None:
         code, out, err = self.dive(None)  # FakeProvider's minimal instance: one link, no evidence

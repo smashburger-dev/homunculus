@@ -732,13 +732,146 @@ class TemplateTests(unittest.TestCase):
             g.render_alert(g.Alert("prompt", "spo2_low", DAY, {}), {})
 
 
+class RoundFiveRegressionTests(unittest.TestCase):
+    """German phrasings, drug names, fasts and exercise edits that used to slip through."""
+
+    SELF_HARM = (
+        "Ich möchte sterben", "ich will tot sein", "wäre lieber tot", "Am liebsten wäre ich tot",
+        "Ich bring mich um", "ich bringe mich um", "Ich will einfach nicht mehr.",
+        "Ich denke daran, mir das Leben zu nehmen", "ich verletze mich selbst", "hab mich selbst verletzt",
+        "Ich will mein Leben beenden", "Todeswunsch", "Ich sehe keinen Sinn mehr im Leben",
+    )
+    NOT_SELF_HARM = (
+        "Hab mich am Knie verletzt", "Ich will heute lieber locker laufen", "Die Beine sind tot",
+        "Das Intervall macht keinen Sinn mehr für mich", "Ich habe mich beim Training verletzt",
+    )
+    URGENT = {
+        "Die Brust tut weh": "chest_pain", "Brust tut mir weh": "chest_pain", "mir tut die Brust weh": "chest_pain",
+        "Herzschmerzen": "chest_pain", "Thoraxschmerz": "chest_pain", "kurz weggetreten": "fainting",
+        "mir wurde schwarz vor Augen": "fainting", "zusammengesackt": "fainting",
+        "konnte nicht atmen": "short_breath", "kann nicht atmen": "short_breath",
+        "bekomme schlecht Luft": "short_breath", "Mir ging die Luft aus": "short_breath",
+    }
+    NOT_URGENT = ("Brustpresse 3x8, Schmerz im Knie", "Brust drücken 3x8", "Kann wieder gut atmen",
+                  "Brust, danach Rudern mit engem Griff")
+    FORBIDDEN = (
+        "Ostarin 10 mg", "Cardarin", "Anabolikum", "Steroide", "Steroidkur", "anabolen Steroiden",
+        "Hochdosistestosteron", "Rinderwachstumshormon", "Entwaesserung", "Hoehenzelt",
+        "Sustanon 250 einmal pro Woche", "Testogel", "Testo-Kur", "Nebido", "Primobolan", "Turinabol",
+        "Somatropin", "HCG", "Insulin", "Tamoxifen", "Clomifen", "Trulicity", "Victoza", "Dulaglutid",
+        "Retatrutid", "GLP-1", "Abnehmspritze", "Fettwegspritze", "Propranolol", "Bisoprolol",
+        "Spironolacton", "L-Thyroxin", "T3-Tabletten", "Ephedra",
+    )
+    LONG_FASTS = (
+        "Sieben Tage nur Wasser fasten", "Zehn Tage Saftfasten", "eineinhalb Tage fasten",
+        "Fastenwoche, nur Wasser", "Von Freitag bis Montag nichts essen", "48h Nulldiät", "Nulldiät für 3 Tage",
+    )
+
+    def test_self_harm_phrasings(self) -> None:
+        for text in self.SELF_HARM:
+            self.assertTrue(g._self_harm(text), text)
+        for text in self.NOT_SELF_HARM:
+            self.assertFalse(g._self_harm(text), text)
+
+    def test_urgent_phrasings(self) -> None:
+        for text, symptom in self.URGENT.items():
+            self.assertEqual(g.urgent_symptoms(text), [symptom], text)
+        for text in self.NOT_URGENT:
+            self.assertEqual(g.urgent_symptoms(text), [], text)
+
+    def test_notes_raise_alerts_end_to_end(self) -> None:
+        for text, rule in (("Die Brust tut weh beim Laufen", "symptom_urgent"), ("Ich möchte sterben", "self_harm"),
+                           ("kurz weggetreten", "symptom_urgent")):
+            alerts = g.red_flags({}, [], [_checkin("note", None, text)], DAY, {})
+            self.assertIn(rule, [a.rule_id for a in alerts], text)
+
+    def test_forbidden_german_forms_and_brands(self) -> None:
+        rules = g.Rules()
+        for text in self.FORBIDDEN:
+            self.assertIsNotNone(g.forbidden_match(text, rules), text)
+        for text in ("Insulinspiegel niedrig halten", "Testobjekt", "Kreatin", "Bauer", "Brustschwimmen"):
+            self.assertIsNone(g.forbidden_match(text, rules), text)
+        plan = _plan()
+        plan["nutrition"]["notes_de"] = "Sustanon 250 einmal pro Woche"
+        self.assertEqual(_check(plan).tier, "reject")
+
+    def test_long_fasts_rejected(self) -> None:
+        plan = _plan()
+        for text in self.LONG_FASTS:
+            plan["nutrition"]["notes_de"] = text
+            self.assertIn("fast_too_long", _check(plan).rule_ids, text)
+        for text in ("Nach 20 Uhr nichts essen", "16 h Intervallfasten an Ruhetagen"):
+            plan["nutrition"]["notes_de"] = text
+            self.assertNotIn("fast_too_long", _check(plan).rule_ids, text)
+
+    def test_valid_until_must_be_iso(self) -> None:
+        from homunculus.plans import validate_plan
+        plan = _plan()
+        plan["valid_until"] = "Fastenwoche ab Montag, nur Wasser"
+        self.assertIn("/valid_until: expected an ISO date", validate_plan(plan))
+        plan["valid_until"] = "2026-03-16T00:00:00Z"
+        self.assertEqual(validate_plan(plan), [])
+
+    def test_swap_carries_replaced_volume(self) -> None:
+        plan = _plan()
+        plan["sessions"][1]["exercises"][0] = {**_ex("ex-squat2", sets=10), "load_kg": 140.0, "rir": 0}
+        v = _check(plan, _ctx(known_exercises=HISTORY))
+        self.assertEqual(v.tier, "reject")
+        self.assertIn("exercise_volume_reject", v.rule_ids)
+        self.assertIn("exercise_rir_down", v.rule_ids)
+        in_plan = _plan()  # ex-squat2 known from another session of the current plan
+        in_plan["sessions"][0]["exercises"].append(_ex("ex-squat2"))
+        swapped = copy.deepcopy(in_plan)
+        swapped["sessions"][1]["exercises"][0] = {**_ex("ex-squat2", sets=10), "load_kg": 140.0, "rir": 0}
+        self.assertEqual(_check(swapped, cur=in_plan).tier, "reject")
+        same = _plan()
+        same["sessions"][1]["exercises"][0] = _ex("ex-squat2")
+        self.assertEqual(_check(same, _ctx(known_exercises=HISTORY)).tier, "notify")
+
+    def test_duplicate_exercise_entries_rejected(self) -> None:
+        from homunculus.plans import validate_plan
+        plan = _plan()
+        plan["sessions"][1]["exercises"] += [_ex("ex-squat"), _ex("ex-squat")]
+        v = _check(plan)
+        self.assertEqual(v.tier, "reject")
+        self.assertIn("duplicate_exercise", v.rule_ids)
+        self.assertIn("/sessions/1/exercises: duplicate exercise_id", validate_plan(plan))
+
+
 class ScanTextTests(unittest.TestCase):
     def test_finds_terms(self) -> None:
         self.assertEqual(g.scan_text("Das klingt nach einer Infektion."), ["infekt"])
         self.assertEqual(g.scan_text("Possible atrial fibrillation; get a diagnosis"),
                          ["diagnos", "atrial fibrillation"])
-        self.assertEqual(g.scan_text("Verdacht auf Übertrainingssyndrom"), ["ubertrainingssyndrom"])
-        self.assertEqual(g.scan_text("Mögliche Stressfraktur"), ["stressfraktur"])
+        self.assertEqual(g.scan_text("Verdacht auf Übertrainingssyndrom"),
+                         ["syndrom", "ubertrainingssyndrom", "ubertraining"])
+        self.assertEqual(g.scan_text("Mögliche Stressfraktur"), ["stressfraktur", "fraktur"])
+
+    def test_finds_german_infix_stems(self) -> None:
+        cases = {
+            "Klingt nach einem Atemwegsinfekt.": ["infekt"],
+            "Eine Atemwegserkrankung ist möglich.": ["erkrankung"],
+            "Vielleicht ein Erschöpfungssyndrom.": ["syndrom"],
+            "Das könnte eine Ermüdungsfraktur sein.": ["fraktur"],
+            "Eine Kniegelenksentzündung?": ["entzundung"],
+            "Eine Kniegelenksentzuendung?": ["entzuendung"],
+            "Du hast eine Schlafstörung.": ["storung"],
+            "Du hast eine Schlafstoerung.": ["stoerung"],
+            "Das ist Übertraining.": ["ubertraining"],
+            "Klingt nach Uebertraining.": ["uebertraining"],
+            "You are overtrained.": ["overtrain"],
+            "Classic overtraining.": ["overtrain"],
+            "Das passt zu RED-S.": ["red s"],
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(g.scan_text(text), expected)
+
+    def test_infix_stems_spare_harmless_compounds(self) -> None:
+        for text in ("Desinfektionsmittel nach dem Training", "Zerstörung", "Muskelzerstoerung",
+                     "Bei Sehstörungen ruf an", "Red Sox", "Ein Red Bull"):
+            with self.subTest(text=text):
+                self.assertEqual(g.scan_text(text), [])
 
     def test_no_false_positives(self) -> None:
         clean = "Heute 30 Minuten Backstroke, fast nichts Neues, Ruhepuls stabil. Sehr gut!"

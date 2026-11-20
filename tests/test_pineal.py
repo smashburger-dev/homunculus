@@ -17,7 +17,7 @@ from homunculus.agents import Budget, FakeProvider
 from homunculus.guardrails import Alert
 from homunculus.metrics import MetricsConfig
 from homunculus.pineal import Context, FileNotifier, Job, JobResult
-from homunculus.store import DailyValue, Ledger, Store
+from homunculus.store import CheckinItem, DailyValue, Ledger, Sample, Store, Workout
 
 ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime(2026, 11, 20, 7, 31, tzinfo=timezone.utc)  # Friday of 2026-W47
@@ -351,6 +351,23 @@ class OwnerMessageTest(PinealCase):
         self.assertIn("0800 111 0 111", body["reply_de"])
         self.assertEqual((body["checkin_stored"], self.fake.calls), (0, []))
 
+    def test_urgent_hold_answers_with_fixed_template(self) -> None:
+        self.use_fixtures({"sartorius": {"reply_de": "Heute Kniebeugen 5x5.", "checkin": {}}})
+        self.ledger.append_jsonl(pineal.ALERTS_LOG, {"level": "urgent", "rule_id": "bp_high", "date": "2026-11-16",
+                                                     "data": {}}, author="pineal")
+        status, body = pineal.handle_owner_message(self.ctx, "sartorius", "Heute Kniebeugen.")
+        self.assertEqual((status, body["reply_de"], body["checkin_stored"]), (200, pineal.HOLD_DE, 1))
+        self.assertIn("112", pineal.HOLD_DE)
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual([(c.item, c.text) for c in self.store.checkins(DAY, "2026-11-21")],
+                         [("note", "Heute Kniebeugen.")])
+        self.assertEqual(pineal.handle_owner_message(self.ctx, "cerebellum", "Neues Ziel?")[1]["reply_de"],
+                         pineal.HOLD_DE)
+        self.ledger.append_jsonl(pineal.COACHING_CLEARED_LOG, {"rule_id": "bp_high", "date": "2026-11-16"},
+                                 author="pineal")
+        self.assertEqual(pineal.handle_owner_message(self.ctx, "sartorius", "Heute Kniebeugen.")[1]["reply_de"],
+                         "Heute Kniebeugen 5x5.")
+
     def test_coach_reply_and_checkin(self) -> None:
         self.use_fixtures({"sartorius": {"reply_de": "Heute 40 Minuten locker.", "checkin": {"energy": 5}}})
         status, body = pineal.handle_owner_message(self.ctx, "sartorius", "Energie heute eine 5.")
@@ -407,6 +424,20 @@ class JobFunctionTest(PinealCase):
             self.assertTrue(self.ledger.exists(rel), rel)
         self.assertEqual(self.ledger.read_json("data/daily/2026/2026-11-19.json")["date"], "2026-11-19")
 
+    def test_finalize_day_refreshes_earlier_snapshot_after_late_rpe(self) -> None:
+        start = datetime(2026, 11, 18, 17, 0, tzinfo=timezone.utc)
+        series = tuple(((start + timedelta(minutes=i)).isoformat(), 150.0) for i in range(31))
+        self.store.upsert_workouts([Workout("w1", "run", start.isoformat(), (start + timedelta(minutes=30)).isoformat(),
+                                            1800.0, 300.0, 150.0, 160.0, series, False, "watch", "{}")])
+        pineal.run_job(self.ctx, self.job("finalize_day"), "2026-11-19")
+        rel = "data/daily/2026/2026-11-18.json"
+        self.assertIsNone(self.ledger.read_json(rel)["rows"]["load_srpe"]["value"])
+        self.store.put_checkins([CheckinItem("2026-11-19", "session_rpe", 6, None, "w1", "2026-11-19T07:00:00+00:00",
+                                             checkins.WORDING_VERSION, "form")])
+        out = pineal.run_job(self.ctx, self.job("finalize_day"), DAY)
+        self.assertEqual(self.ledger.read_json(rel)["rows"]["load_srpe"]["value"], 180.0)
+        self.assertIn(rel, out["written"])
+
     def test_ratify_due_without_pending_is_skipped(self) -> None:
         out = pineal.run_job(self.ctx, self.job("ratify_due"), "2026-11-20T07:30")
         self.assertEqual(out["status"], "skipped")
@@ -431,9 +462,9 @@ class JobFunctionTest(PinealCase):
         out = pineal.run_job(self.ctx, self.job("vagus_evening"), DAY)
         self.assertEqual((out["status"], out["message"]), ("deferred", "budget"))
 
-    def test_weekly_review_without_plan_keeps(self) -> None:
+    def test_weekly_review_without_plan_keeps_and_fails(self) -> None:
         out = pineal.run_job(self.ctx, self.job("weekly_review"), "2026-W47")
-        self.assertEqual((out["status"], out["message"]), ("ok", "ruling keep, aborted no_plan"), out)
+        self.assertEqual((out["status"], out["message"]), ("failed", "ruling keep, aborted no_plan"), out)
         self.assertTrue(self.ledger.exists("reviews/2026-W47/packet.json"))
         self.assertEqual(self.fake.calls, [])
 
@@ -616,6 +647,56 @@ class CoachingHoldTest(PinealCase):
         self.assertEqual(pineal.clear_coaching_hold(self.ctx), 1)
         self.assertEqual(pineal.coaching_holds(self.ledger, DAY), [])
         self.assertEqual(self.action(DAY), "as_planned")
+
+
+class ReturnAfterBreakTest(PinealCase):
+    def test_days_off_counts_trailing_days_without_training(self) -> None:
+        self.assertEqual(pineal._days_off(self.store, DAY, 7), 7)  # no rows: off, stricter
+        self.store.put_daily([DailyValue("2026-11-12", "load_srpe", 200.0, "watch", 1, "ok"),
+                              *(DailyValue(f"2026-11-{d}", "load_srpe", 0.0, "none", 0, "ok") for d in range(13, 20))])
+        self.assertEqual(pineal._days_off(self.store, DAY, 7), 7)
+        self.store.put_daily([DailyValue("2026-11-16", "load_srpe", None, "watch", 1, "sparse")])  # unrated workout
+        self.assertEqual(pineal._days_off(self.store, DAY, 7), 3)
+
+    def test_return_cap_shortens_unchanged_session(self) -> None:
+        now = datetime.fromisoformat(f"{DAY}T07:00:00+00:00")
+        plan = {"sessions": [{"weekday": now.weekday(), "duration_min": 60, "target_rpe": 6, "exercises": []}]}
+        rules = guardrails.Rules()
+        back = pineal._modulation(plan, now, NORMAL, FRESH, [], rules.return_after_days_off, rules)
+        self.assertEqual((back["action"], back["reason_codes"][-1]), ("shorten", "return_after_break"))
+        self.assertEqual(pineal._modulation(plan, now, NORMAL, FRESH, [], 0, rules)["action"], "as_planned")
+
+
+class EdWatchNowTest(PinealCase):
+    def test_two_weigh_ins_today_set_ed_watch_in_coach_context(self) -> None:
+        self.assertFalse(pineal._coach_context(self.ctx, "vagus", "morning", NOW)["ed_watch"])
+        self.store.upsert_samples([Sample("weight_body_mass", "kg", f"{DAY}T0{h}:00:00+00:00", "qty", 70.0, "phone")
+                                   for h in (6, 7)])
+        self.assertTrue(pineal._coach_context(self.ctx, "vagus", "morning", NOW)["ed_watch"])
+
+    def test_restrictive_owner_message_sets_ed_watch(self) -> None:
+        self.assertTrue(pineal._coach_context(self.ctx, "vagus", "reply", NOW, owner_text="Heute kaum gegessen.")
+                        ["ed_watch"])
+        guard = pineal._goal_guard(self.ctx, DAY, "Heute kaum gegessen.")
+        self.assertEqual(guard, {"ed_watch": True})
+        self.assertIsNone(pineal._goal_guard(self.ctx, DAY, "Halbmarathon im Mai."))
+
+
+    def test_low_logged_intake_sets_ed_watch_now(self) -> None:
+        self.ledger.write_json("profile/owner.json", {"ffm_kg": 58.0}, author="pineal")
+        days = [f"2026-11-{d}" for d in range(14, 21)]
+        self.store.put_daily([DailyValue(d, "intake_kcal", 300.0, "phone", 1, "ok") for d in days[:3]]
+                             + [DailyValue(d, "active_kcal", 400.0, "watch", 1, "ok") for d in days])
+        self.assertTrue(pineal._ed_watch_now(self.ctx, DAY))
+        self.assertTrue(pineal._coach_context(self.ctx, "vagus", "morning", NOW)["ed_watch"])
+
+
+class UrgentTermsTest(PinealCase):
+    def test_chat_uses_guardrails_urgent_terms(self) -> None:
+        self.assertIs(pineal.URGENT_TERMS, guardrails.URGENT_TERMS)
+        status, body = pineal.handle_owner_message(self.ctx, "sartorius", "Ich habe Druck in der Brust.")
+        self.assertEqual((status, self.fake.calls), (200, []))
+        self.assertIn("112", body["reply_de"])
 
 
 class LateRedFlagTest(PinealCase):

@@ -10,6 +10,8 @@
   ``contradicts`` and ``mechanism_of`` join two node ids; ``replicates`` and
   ``retracts`` join two paper nodes (``paper:<key>``): src replicates or
   retracts dst.
+  An edge counts as human support only with certainty >= ``HUMAN_MIN``, so
+  edges stored before deepdive tightened its human flag stay harmless.
 * ``question``: an open question about the link ``src`` -> ``dst`` with
   ``text`` and ``keywords``.
 
@@ -45,6 +47,7 @@ VERDICTS = ("supported", "contested", "open")
 SCOUTS = ("retina", "spindle", "papilla")
 PAPER_PREFIX = "paper:"
 MAX_CERTAINTY = 4.0
+HUMAN_MIN = 0.5  # DC: same as deepdive.LINK_MIN; a human flag below it (or unscored) counts as no human support
 
 _NODE_RE = re.compile(r"^(concept|mechanism|intervention|outcome):[a-z0-9]+(?:-[a-z0-9]+)*$")
 
@@ -205,8 +208,14 @@ def _verdict(supports: Sequence[Mapping], contradicts: Sequence[Mapping]) -> tup
     return support, contra, "supported" if supports else "open"
 
 
+def _human(edge: Mapping[str, Any]) -> bool:
+    """The stored human flag, honoured only for a scored edge at or above HUMAN_MIN, as deepdive sets it."""
+    certainty = edge.get("certainty")
+    return bool(edge.get("human")) and certainty is not None and certainty >= HUMAN_MIN
+
+
 def _link(src: str, dst: str, edges: Sequence[Mapping[str, Any]]) -> dict:
-    by_rel = {rel: [{"paper": e["paper"], "certainty": e.get("certainty"), "human": bool(e.get("human"))}
+    by_rel = {rel: [{"paper": e["paper"], "certainty": e.get("certainty"), "human": _human(e)}
                     for e in edges if e["rel"] == rel] for rel in LINK_RELATIONS}
     support, contra, verdict = _verdict(by_rel["supports"], by_rel["contradicts"])
     human = any(e["human"] for e in by_rel["supports"])

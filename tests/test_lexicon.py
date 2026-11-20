@@ -135,6 +135,25 @@ class FoldTest(unittest.TestCase):
         dup = L.make_question(MEL, SLEEP, "wirkt das beim menschen", ["x"], LATER)
         self.assertEqual(len(L.fold([*self.events(), dup])["questions"]), 1)
 
+    def test_inflated_human_flag_below_threshold_is_ignored(self):
+        # Edges stored before deepdive tightened its flag: unscored (0.0 / None) or weak but marked human.
+        weak = [support("doi:u0", 0.0, True), support("doi:w1", 0.4, True),
+                L.make_edge("supports", LIGHT, MEL, "doi:n1", AT, certainty=None, human=True)]
+        question = L.make_question(LIGHT, MEL, "Beim Menschen gezeigt?", ["light"], AT)
+        view = L.fold([*weak, question])
+        link = view["links"][L.link_key(LIGHT, MEL)]
+        self.assertFalse(link["human"])
+        self.assertEqual([e["human"] for e in link["supports"]], [False, False, False])
+        self.assertEqual([q["text"] for q in view["questions"]], ["Beim Menschen gezeigt?"])
+        self.assertFalse(L.lookup(view, LIGHT, MEL).human)
+        strong = L.fold([*weak, support("doi:h1", L.HUMAN_MIN, True), question])
+        self.assertTrue(strong["links"][L.link_key(LIGHT, MEL)]["human"])
+        self.assertEqual(strong["questions"], [])
+
+    def test_human_threshold_matches_deepdive(self):
+        from homunculus import deepdive
+        self.assertEqual(L.HUMAN_MIN, deepdive.LINK_MIN)
+
     def test_invalid_event_raises(self):
         with self.assertRaises(ValueError):
             L.fold([{"schema": 1, "kind": "edge", "at": AT, "rel": "supports"}])

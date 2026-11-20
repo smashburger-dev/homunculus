@@ -1,20 +1,25 @@
 """Tests for homunculus.devin_layer. leak-guard: synthetic
 
-Every value is a tiny synthetic fixture built here. No network, no git, no
-sleeping: LLM calls go to FakeProvider, the scout script gets a fake fetch.
+Every value is a tiny synthetic fixture built here. No network, no sleeping:
+LLM calls go to FakeProvider, the scout script gets a fake fetch. Git runs only
+in LedgerSyncTest, on throwaway repos in a temp dir, and skips without git.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import io
 import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import unittest
-from datetime import datetime, timezone
+import urllib.error
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 from zoneinfo import ZoneInfo
@@ -280,7 +285,8 @@ class AutomationTest(unittest.TestCase):
         self.assertEqual(rules["cerebellum-monthly"], "FREQ=MONTHLY;BYMONTHDAY=1;BYHOUR=8;BYMINUTE=0;BYSECOND=0")
         webhook = specs["ingest-health"]["trigger"]
         self.assertEqual((webhook["type"], webhook["secret_header"]), ("webhook", "X-Webhook-Secret"))
-        self.assertIn("ingest --file", specs["ingest-health"]["prompt"])
+        self.assertIn("ingest --llm-copy --file", specs["ingest-health"]["prompt"])  # refused without the opt-in
+        self.assertTrue(specs["ingest-health"]["prompt"].split("\n\n")[1].startswith("UNRELIABLE, opt-in only"))
 
     def test_path_b_runs_on_the_outpost_without_ingest_or_scouts(self) -> None:
         specs = _by_name(devin_layer.export_automations(path="b"))
@@ -356,6 +362,268 @@ class AutomationTest(unittest.TestCase):
         written = devin_layer.write_automations(tmp / "out", specs)
         self.assertEqual(len(written), len(specs))
         self.assertEqual(json.loads(written[0].read_text(encoding="utf-8")), specs[0])
+
+
+class LedgerSyncTest(unittest.TestCase):
+    """Parallel path-a sessions from one head; every row and summary must reach the remote."""
+
+    cfg = MetricsConfig(tz="UTC", source_priority={})
+
+    def setUp(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git not installed")
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_AUTHOR_NAME": "pineal", "GIT_AUTHOR_EMAIL": "pineal@example.invalid",
+                    "GIT_COMMITTER_NAME": "pineal", "GIT_COMMITTER_EMAIL": "pineal@example.invalid"}
+        self.rules = agents.write_rules(_roster())
+        self.git("init", "-q", "--bare", "-b", "main", str(self.tmp / "origin.git"))
+        seed = self.clone("seed")
+        (seed / "ops").mkdir()
+        (seed / "ops" / "runs.jsonl").write_text('{"run": 0}\n', encoding="utf-8")
+        (seed / ".gitignore").write_text(".private/\n", encoding="utf-8")
+        self.git("-C", str(seed), "add", "-A")
+        self.git("-C", str(seed), "commit", "-qm", "seed")
+        self.git("-C", str(seed), "push", "-q", "origin", "main")
+
+    def git(self, *args: str) -> None:
+        subprocess.run(["git", *args], check=True, capture_output=True, env=self.env)
+
+    def clone(self, name: str) -> Path:
+        self.git("clone", "-q", str(self.tmp / "origin.git"), str(self.tmp / name))
+        return self.tmp / name
+
+    def sh(self, ledger: Path, command: str) -> int:
+        env = {**self.env, "HOMUNCULUS_LEDGER": str(ledger)}
+        return subprocess.run(["sh", "-c", command], env=env, capture_output=True).returncode
+
+    def session(self, name: str) -> tuple[Path, Ledger, Store]:
+        root = self.clone(name)
+        for command in devin_layer.LEDGER_SYNC_START:
+            self.assertEqual(self.sh(root, command), 0, command)
+        (root / ".private").mkdir()
+        store = Store(root / ".private" / "health.sqlite")
+        store.migrate()
+        self.addCleanup(store.close)
+        return root, Ledger(root, self.rules), store
+
+    def push(self, ledger: Ledger, store: Store) -> bool:
+        return devin_layer.push_ledger(store, ledger, self.cfg, lambda: NOW, env=self.env)
+
+    def rows(self, check: Path, rel: str) -> list[dict]:
+        return [json.loads(line) for line in (check / rel).read_text(encoding="utf-8").splitlines()]
+
+    def test_racing_appends_both_land(self) -> None:
+        sessions = [self.session(n) for n in ("a", "b")]
+        for (_, ledger, _), name in zip(sessions, "ab"):
+            ledger.append_jsonl("ops/runs.jsonl", {"run": name}, author="pineal")
+            ledger.commit(author="pineal", message=name, trailers={})
+        self.assertTrue(all(self.push(ledger, store) for _, ledger, store in sessions))
+        self.assertEqual(sorted(str(r["run"]) for r in self.rows(self.clone("check"), "ops/runs.jsonl")),
+                         ["0", "a", "b"])
+
+    def test_parallel_ingests_rebuild_conflicting_snapshots(self) -> None:
+        """Two real ingests for one day plus run_job's writes: heartbeat, freshness, daily and baselines clash."""
+        moments = {"a": NOW, "b": NOW + timedelta(minutes=5)}
+        sessions = {}
+        for name, rhr in (("a", 52.0), ("b", 60.0)):
+            root, ledger, store = self.session(name)
+            payload = {"data": {"metrics": [{"name": "resting_heart_rate", "units": "count/min", "data": [
+                {"date": f"2026-11-19 0{8 if name == 'a' else 9}:00:00 +0000", "qty": rhr, "source": "Watch"}]}]}}
+            devin_layer.ingest_stdin(store, ledger, self.cfg, stream=io.StringIO(json.dumps(payload)),
+                                     now=moments[name])
+            row = {"job": "red_flags", "period": f"2026-11-20T0{name == 'a' and 6 or 7}", "status": "ok",
+                   "ended": moments[name].isoformat(), "run_id": f"r-{name}"}
+            ledger.append_jsonl(pineal.RUNS_LOG, row, author="pineal")
+            ledger.write_json("ops/heartbeats/red_flags.json", {**row, "message": name}, author="pineal")
+            ledger.append_jsonl(pineal.ALERTS_LOG, {"rule_id": f"rule_{name}", "date": "2026-11-19"}, author="pineal")
+            ledger.commit(author="pineal", message=f"session {name}", trailers={})
+            sessions[name] = (ledger, store)
+        self.assertTrue(self.push(*sessions["a"]))
+        self.assertTrue(self.push(*sessions["b"]))
+        check = self.clone("check")
+        self.assertEqual(sorted(r.get("run_id") for r in self.rows(check, pineal.RUNS_LOG) if "run_id" in r),
+                         ["r-a", "r-b"])
+        self.assertEqual(sorted(r["rule_id"] for r in self.rows(check, pineal.ALERTS_LOG)), ["rule_a", "rule_b"])
+        self.assertEqual(len(list((check / "data" / "summaries").rglob("*.json"))), 2)
+        daily = json.loads((check / "data/daily/2026/2026-11-19.json").read_text(encoding="utf-8"))
+        self.assertEqual(daily["values"]["rhr"]["value"], 56.0)  # both sessions' samples
+        beat = json.loads((check / "ops/heartbeats/red_flags.json").read_text(encoding="utf-8"))
+        self.assertEqual(beat["message"], "b")  # the later run
+        self.assertTrue((check / "data/freshness.json").is_file())
+
+    def test_push_reports_failure_when_rebase_cannot_resolve(self) -> None:
+        sessions = [self.session(n) for n in ("a", "b")]
+        for (_, ledger, _), text in zip(sessions, ("one", "two")):
+            ledger.write_text("config/goals.md", text + "\n", author="cerebellum")
+            ledger.commit(author="pineal", message=text, trailers={})
+        self.assertTrue(self.push(sessions[0][1], sessions[0][2]))
+        self.assertFalse(self.push(sessions[1][1], sessions[1][2]))
+        status = subprocess.run(["git", "-C", str(sessions[1][0]), "status", "--porcelain"], env=self.env,
+                                capture_output=True, text=True).stdout
+        self.assertEqual(status, "")  # the rebase was aborted, nothing half-resolved
+
+    def test_main_push_ledger_fails_loudly(self) -> None:
+        with mock.patch.object(devin_layer, "_push_ledger_cmd", side_effect=RuntimeError("ledger push failed")):
+            with redirect_stderr(io.StringIO()) as err, redirect_stdout(io.StringIO()):
+                self.assertEqual(devin_layer.main(["push-ledger"], env={}), 1)
+        self.assertIn("ledger push failed", err.getvalue())
+
+    def test_path_a_prompts_sync_first_and_retry_the_push_last(self) -> None:
+        for spec in devin_layer.export_automations(path="a"):
+            prompt = spec["prompt"]
+            self.assertIn(devin_layer.LEDGER_SYNC_START[0], prompt, spec["name"])
+            self.assertIn(devin_layer.LEDGER_PUSH, prompt, spec["name"])
+            self.assertNotRegex(prompt, r'git -C "\$HOMUNCULUS_LEDGER" push\n', spec["name"])
+
+
+# --------------------------------------------------------------------------
+# Relay route: pointer in the prompt, verified body from the relay
+
+RELAY_URL = "https://relay.invalid"
+RELAY_TOKEN = "synthetic-fetch-token"
+RELAY_KEY = "synthetic_key_0123456789"
+
+
+def _pointer(body: bytes, **over) -> dict:
+    return {"object_key": RELAY_KEY, "sha256": hashlib.sha256(body).hexdigest(), "bytes": len(body), **over}
+
+
+class FakeRelay:
+    """Stands in for the Worker: serves one object, records every request."""
+
+    def __init__(self, body: bytes, fail_delete: bool = False) -> None:
+        self.objects = {RELAY_KEY: body}
+        self.fail_delete = fail_delete
+        self.calls: list[tuple[str, str, str]] = []
+
+    def __call__(self, req) -> bytes:  # noqa: ANN001
+        self.calls.append((req.get_method(), req.full_url, req.get_header("Authorization")))
+        key = req.full_url.rsplit("/", 1)[-1]
+        if req.get_method() == "DELETE":
+            if self.fail_delete:
+                raise urllib.error.URLError("offline")
+            self.objects.pop(key, None)
+            return b""
+        if key not in self.objects:
+            raise urllib.error.HTTPError(req.full_url, 404, "not found", {}, io.BytesIO())
+        return self.objects[key]
+
+
+class RelayTest(Case):
+    cfg = MetricsConfig(tz="UTC", source_priority={})
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.body = json.dumps(_payload()).encode("utf-8")
+
+    def ingest(self, text: str, relay: FakeRelay) -> dict:
+        return devin_layer.ingest_relay(self.store, self.ledger, self.cfg, text, base_url=RELAY_URL,
+                                        token=RELAY_TOKEN, opener=relay, now=NOW)
+
+    def test_body_is_fetched_verified_ingested_and_deleted(self) -> None:
+        relay = FakeRelay(self.body)
+        prompt = "Webhook triggered.\n" + json.dumps({"body": json.dumps(_pointer(self.body))}) + "\nDo the task."
+        out = self.ingest(prompt, relay)
+        self.assertEqual(out["counts"]["samples"], 5)
+        self.assertTrue(out["deleted"])
+        self.assertEqual(relay.objects, {})
+        url = f"{RELAY_URL}/objects/{RELAY_KEY}"
+        self.assertEqual(relay.calls, [("GET", url, f"Bearer {RELAY_TOKEN}"), ("DELETE", url, f"Bearer {RELAY_TOKEN}")])
+
+    def test_size_or_digest_mismatch_is_refused_and_the_object_kept(self) -> None:
+        for over in ({"bytes": len(self.body) - 1}, {"sha256": "0" * 64}):
+            relay = FakeRelay(self.body)
+            with self.assertRaises(devin_layer.RelayError, msg=over):
+                self.ingest(json.dumps(_pointer(self.body, **over)), relay)
+            self.assertIn(RELAY_KEY, relay.objects)
+            self.assertEqual([c[0] for c in relay.calls], ["GET"])
+        self.assertEqual(self.store.samples("step_count", "2026-11-18"), [])
+
+    def test_missing_object_fails_loudly(self) -> None:
+        relay = FakeRelay(self.body)
+        relay.objects.clear()
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.ingest(json.dumps(_pointer(self.body)), relay)
+        caught.exception.close()
+
+    def test_extract_pointer_shapes(self) -> None:
+        good = _pointer(self.body)
+        expected = devin_layer.RelayPointer(RELAY_KEY, good["sha256"], good["bytes"])
+        self.assertEqual(devin_layer.extract_pointer(json.dumps(good)), expected)
+        self.assertEqual(devin_layer.extract_pointer("x {no} " + json.dumps({"payload": good})), expected)
+        bad = ({"object_key": "short"}, {"object_key": "../../etc/passwd_xxxxxxxx"}, {"sha256": "A" * 64},
+               {"bytes": True}, {"bytes": 0}, {"bytes": devin_layer.MAX_INPUT_BYTES + 1})
+        for over in bad:
+            with self.assertRaises(devin_layer.RelayError, msg=over):
+                devin_layer.extract_pointer(json.dumps({**good, **over}))
+        with self.assertRaises(devin_layer.RelayError):
+            devin_layer.extract_pointer(json.dumps(_payload()))
+
+    def test_relay_needs_https_and_a_token(self) -> None:
+        pointer = devin_layer.extract_pointer(json.dumps(_pointer(self.body)))
+        relay = FakeRelay(self.body)
+        for url, token in (("http://relay.invalid", RELAY_TOKEN), (RELAY_URL, "")):
+            with self.assertRaises(devin_layer.RelayError):
+                devin_layer.fetch_relay_object(pointer, url, token, relay)
+        self.assertEqual(relay.calls, [])
+
+    def test_failed_delete_is_reported_not_raised(self) -> None:
+        out = self.ingest(json.dumps(_pointer(self.body)), FakeRelay(self.body, fail_delete=True))
+        self.assertFalse(out["deleted"])
+        self.assertEqual(out["counts"]["samples"], 5)
+
+    def test_module_command_prints_counts_only(self) -> None:
+        from homunculus import cli
+
+        root = self.tmp / "cli-ledger"
+        cli.init_ledger(root, git=False)
+        inbox = self.tmp / "inbox.txt"
+        inbox.write_text("Pointer:\n" + json.dumps(_pointer(self.body)), encoding="utf-8")
+        env = {"HOME": str(self.tmp), "HOMUNCULUS_LEDGER": str(root), devin_layer.RELAY_URL_NAME: RELAY_URL,
+               devin_layer.RELAY_TOKEN_NAME: RELAY_TOKEN}
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(devin_layer, "_relay_open", FakeRelay(self.body)), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = devin_layer.main(["relay-ingest", "--file", str(inbox)], env)
+        self.assertEqual(code, 0, err.getvalue())
+        printed = json.loads(out.getvalue())
+        self.assertEqual((printed["counts"]["samples"], printed["deleted"]), (5, True))
+        self.assertNotIn("6000", out.getvalue())
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = devin_layer.main(["relay-ingest", "--file", str(inbox)], {**env, devin_layer.RELAY_TOKEN_NAME: ""})
+        self.assertEqual(code, 1)
+        self.assertIn("RelayError", err.getvalue())
+
+
+class RelayWorkerTest(unittest.TestCase):
+    """relay/ is an optional Cloudflare Worker: its JS tests run when node is installed; it holds no secrets."""
+
+    def test_worker_tests_pass_under_node(self) -> None:
+        if shutil.which("node") is None:
+            self.skipTest("node not installed")
+        result = subprocess.run(["node", "--test", str(ROOT / "relay" / "relay.test.mjs")],
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout[-2000:] + result.stderr[-2000:])
+
+    def test_no_secret_values_in_the_relay_folder(self) -> None:
+        for path in (ROOT / "relay").iterdir():
+            if path.is_file():
+                text = path.read_text(encoding="utf-8")
+                self.assertNotRegex(text, r"(?i)(sk-ant-|ghp_|AIza)", path.name)
+                self.assertNotRegex(text, r'(?im)^\s*(INGEST_TOKEN|FETCH_TOKEN|DEVIN_WEBHOOK_\w+)\s*=', path.name)
+        self.assertIn("wrangler.toml", (ROOT / "relay" / ".gitignore").read_text(encoding="utf-8"))
+
+    def test_relay_automation_carries_only_the_pointer(self) -> None:
+        spec = _by_name(devin_layer.export_automations(path="a"))["ingest-relay"]
+        self.assertIn("python -m homunculus.devin_layer relay-ingest --file", spec["prompt"])
+        self.assertNotIn("homunculus ingest --file", spec["prompt"])
+        self.assertEqual(spec["trigger"]["max_payload_bytes"], devin_layer.RELAY_POINTER_MAX_BYTES)
+        self.assertEqual(spec["secrets"], sorted([devin_layer.RELAY_TOKEN_NAME, devin_layer.RELAY_URL_NAME]))
+        self.assertIn(devin_layer.RELAY_HOST, spec["network_allowlist"])
+        self.assertNotIn(devin_layer.RELAY_HOST, _by_name(devin_layer.export_automations(path="a"))
+                         ["ingest-health"]["network_allowlist"])
 
 
 # --------------------------------------------------------------------------
@@ -438,6 +706,17 @@ class RunTaskTest(Case):
             notifier=FileNotifier(self.ledger, now=lambda: NOW), tz="UTC", now=lambda: NOW,
         )
 
+    def test_clear_hold_lifts_urgent_holds_and_commits(self) -> None:
+        from homunculus.guardrails import Alert
+
+        pineal.deliver_alerts(self.ctx, [Alert("urgent", "symptom_urgent", "2026-11-18", {"symptoms": ["chest_pain"]})])
+        self.assertEqual(len(pineal.coaching_holds(self.ledger, "2026-11-20")), 1)
+        self.assertEqual(devin_layer.clear_hold(dataclasses.replace(self.ctx, dry_run=True))["cleared"], 0)
+        out = devin_layer.clear_hold(self.ctx)
+        self.assertEqual((out["cleared"], out["commit"]), (1, SHA))
+        self.assertEqual(pineal.coaching_holds(self.ledger, "2026-11-20"), [])
+        self.assertIn("data/coaching_cleared.jsonl", self.ledger.commits[-1]["paths"])
+
     def test_owner_texts_are_captured_and_runs_are_idempotent(self) -> None:
         out = devin_layer.run_task(self.ctx, "homunculus-vagus-morning", path="b")
         self.assertEqual([r["status"] for r in out["runs"]], ["ok"])
@@ -447,6 +726,27 @@ class RunTaskTest(Case):
         again = devin_layer.run_task(self.ctx, "vagus-morning", path="b")
         self.assertEqual((again["runs"][0]["message"], again["owner_texts"]), ("already done", []))
         self.assertEqual(len(self.fake.calls), 1)
+
+    def test_webhook_reruns_red_flags_in_a_done_hour(self) -> None:
+        from datetime import datetime as dt
+        from homunculus.store import DailyValue
+
+        def at(hour: int, minute: int) -> Context:
+            moment = dt(2026, 11, 20, hour, minute, tzinfo=timezone.utc)
+            return dataclasses.replace(self.ctx, now=lambda: moment, notifier=FileNotifier(self.ledger, now=lambda: moment))
+
+        daily = at(6, 30)  # pineal-daily's red_flags marks the hour 2026-11-20T06 done
+        first = devin_layer._run_one(daily, devin_layer._job_index()["red_flags"], devin_layer._local_now(daily))
+        self.assertEqual(first["status"], "ok")
+        self.store.put_daily([DailyValue("2026-11-19", "bp_sys", 190.0, "other", 1, "ok"),
+                              DailyValue("2026-11-19", "bp_dia", 125.0, "other", 1, "ok")])
+        out = devin_layer.run_task(at(6, 50), "ingest-relay", path="a")  # the summary lands in the same hour
+        self.assertEqual(out["runs"][0]["status"], "ok")
+        self.assertIn(("bp_high", "2026-11-19"),
+                      [(r["rule_id"], r["date"]) for r in self.ledger.read_jsonl(pineal.ALERTS_LOG)])
+        again = devin_layer.run_task(at(6, 55), "ingest-relay", path="a")
+        self.assertEqual(len([r for r in self.ledger.read_jsonl(pineal.ALERTS_LOG) if r["rule_id"] == "bp_high"]), 1)
+        self.assertEqual(again["owner_texts"], [])  # delivered once per (rule_id, date)
 
     def test_path_a_restores_and_saves_state(self) -> None:
         item = CheckinItem("2026-11-20", "mood", 5.0, None, None, "2026-11-20T07:00:00+00:00", "v1", "coach")

@@ -5,7 +5,9 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import random
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -335,9 +337,76 @@ class MainTests(TreeCase):
         self.assertEqual(self.run_main(str(self.root / "health.db"))[0], 1)
 
 
+@unittest.skipUnless(shutil.which("git"), "git not installed")
+class HookTests(unittest.TestCase):
+    """The real hooks in throwaway repos; never touches this checkout."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name).resolve()
+        self.repo, self.remote = base / "work", base / "remote.git"
+        self.env = {**os.environ, "HOME": str(base), "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0"}
+        (self.repo / "tools").mkdir(parents=True)
+        shutil.copy2(ROOT / "tools" / "leak_guard.py", self.repo / "tools" / "leak_guard.py")
+        shutil.copytree(ROOT / ".githooks", self.repo / ".githooks")
+        self.git("init", "-q", "-b", "main")
+        self.git("init", "-q", "--bare", str(self.remote))
+        for key, value in (("user.name", "t"), ("user.email", "t@example.invalid"),
+                           ("commit.gpgsign", "false"), ("core.hooksPath", ".githooks")):
+            self.git("config", key, value)
+        self.git("remote", "add", "origin", str(self.remote))
+        self.git("add", "tools", ".githooks")
+        self.git("commit", "-q", "-m", "guard")
+
+    def git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *args], cwd=self.repo, env=self.env, capture_output=True,
+                              text=True, check=check, timeout=60)
+
+    def write(self, rel: str, text: str) -> None:
+        (self.repo / rel).write_text(text, encoding="utf-8")
+
+    def commit_secret(self) -> None:
+        self.write("config.py", f"KEY = '{fake_key('sk-' + 'ant-', 40)}'\n")
+        self.git("add", "config.py")
+
+    def test_pre_commit_scans_the_index_not_the_working_tree(self) -> None:
+        self.commit_secret()
+        self.write("config.py", "KEY = None\n")
+        done = self.git("commit", "-q", "-m", "leak", check=False)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("config.py: api_key", done.stderr)
+
+    def test_pre_commit_allows_clean_index(self) -> None:
+        self.write("a.py", "x = 1\n")
+        self.git("add", "a.py")
+        self.assertEqual(self.git("commit", "-q", "-m", "clean", check=False).returncode, 0)
+
+    def test_pre_push_blocks_secret_removed_in_a_later_commit(self) -> None:
+        self.commit_secret()
+        self.git("commit", "-q", "--no-verify", "-m", "leak")
+        self.write("config.py", "KEY = None\n")
+        self.git("commit", "-q", "-am", "hide")
+        done = self.git("push", "-q", "origin", "main", check=False)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("config.py: api_key", done.stderr)
+        self.assertIn("blocked", done.stderr)
+        self.assertEqual(self.git("ls-remote", "--heads", str(self.remote)).stdout, "")
+
+    def test_pre_push_allows_clean_history_and_branch_deletion(self) -> None:
+        self.assertEqual(self.git("push", "-q", "origin", "main", check=False).returncode, 0)
+        self.write("a.py", "x = 1\n")
+        self.git("add", "a.py")
+        self.git("commit", "-q", "-m", "clean")
+        self.assertEqual(self.git("push", "-q", "origin", "main:side", check=False).returncode, 0)
+        self.assertEqual(self.git("push", "-q", "origin", ":side", check=False).returncode, 0)
+
+
 class SelfScanTests(unittest.TestCase):
     def test_guard_and_its_tests_are_clean(self) -> None:
-        files = ["tools/leak_guard.py", "tests/test_leak_guard.py", ".githooks/pre-commit", ".github/workflows/ci.yml"]
+        files = ["tools/leak_guard.py", "tests/test_leak_guard.py", ".githooks/pre-commit",
+                 ".githooks/pre-push", ".github/workflows/ci.yml"]
         self.assertEqual(leak_guard.scan(ROOT, files), [])
 
 

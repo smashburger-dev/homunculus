@@ -12,6 +12,10 @@ model never grades, scores or plans. See ``devin/README.md``.
 - ``reply``: an owner message from the Bot's chat, routed like ``POST /message``.
 - ``ingest_stdin``: a Health Auto Export payload from stdin, a file or the text
   Devin puts into a webhook session's prompt, stored and aggregated.
+- ``ingest_relay``: the optional relay route of path "a". The webhook carries
+  only {object_key, sha256, bytes}; ``fetch_relay_object`` downloads the body
+  from the relay (``relay/``), checks size and digest, and the object is
+  deleted after ingest. The body never passes through a model prompt.
 - ``export_automations``: Automation specs (RRULE, time zone, webhook, ACU
   limit, network allowlist, secret names, prompt) per path.
 - ``scout_poll_script``: the stdlib script for a scout's Automation script step.
@@ -28,11 +32,16 @@ hand onto the Automations form; Devin's API names for them are UNVERIFIED.
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
+import hashlib
+import io
 import json
+import os
 import re
 import string
 import sys
+import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import date as Date
 from datetime import datetime, timedelta, timezone
@@ -41,7 +50,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, TextIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from homunculus import agents, guardrails, ingest, pineal, scouts, weekly
+from homunculus import agents, guardrails, ingest, ledger_sync, metrics, pineal, scouts, weekly
 from homunculus.store import (
     CheckinItem, DailyValue, HealthEvent, Ledger, PathNotAllowed, Sample, SleepNight, SleepSegment, Store, Workout,
 )
@@ -331,8 +340,8 @@ def _unwrap(obj: Any, depth: int = 0) -> Mapping[str, Any] | None:
     return None
 
 
-def _embedded(text: str) -> Mapping[str, Any] | None:
-    """The first payload inside free text, such as a session prompt around the webhook body."""
+def _first_json(text: str, find: Callable[[Any], Any]) -> Any:
+    """The first find(obj) that is not None over the JSON objects starting inside free text."""
     decoder = json.JSONDecoder()
     starts = [m.start() for m in re.finditer(r"\{", text)][:MAX_JSON_STARTS]
     for start in starts:
@@ -340,10 +349,15 @@ def _embedded(text: str) -> Mapping[str, Any] | None:
             obj, _ = decoder.raw_decode(text, start)
         except ValueError:
             continue
-        found = _unwrap(obj)
+        found = find(obj)
         if found is not None:
             return found
     return None
+
+
+def _embedded(text: str) -> Mapping[str, Any] | None:
+    """The first payload inside free text, such as a session prompt around the webhook body."""
+    return _first_json(text, _unwrap)
 
 
 def extract_payload(text: str) -> Mapping[str, Any]:
@@ -399,6 +413,221 @@ def ingest_stdin(
 
 
 # --------------------------------------------------------------------------
+# Relay route (optional, path a): the webhook carries a pointer, code fetches the body
+
+_RELAY_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+RELAY_TIMEOUT_S = 60
+
+
+class RelayError(ValueError):
+    """The relay object is missing, malformed, or does not match its pointer."""
+
+
+@dataclass(frozen=True)
+class RelayPointer:
+    object_key: str
+    sha256: str
+    bytes: int
+
+
+def _size_ok(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 < value <= MAX_INPUT_BYTES
+
+
+def _as_pointer(obj: Any) -> RelayPointer | None:
+    if not isinstance(obj, Mapping) or not _size_ok(obj.get("bytes")):
+        return None
+    key, digest = obj.get("object_key"), obj.get("sha256")
+    if not isinstance(key, str) or not isinstance(digest, str):
+        return None
+    if not _RELAY_KEY_RE.match(key) or not _SHA256_RE.match(digest):
+        return None
+    return RelayPointer(key, digest, obj["bytes"])
+
+
+def _find_pointer(obj: Any, depth: int = 0) -> RelayPointer | None:
+    """The pointer itself, or one nested under 'payload' or 'body' (object or JSON string)."""
+    found = _as_pointer(obj)
+    if found is not None or not isinstance(obj, Mapping) or depth >= 2:
+        return found
+    for key in WRAPPER_KEYS:
+        inner = obj.get(key)
+        found = _find_pointer(_loads(inner) if isinstance(inner, str) else inner, depth + 1)
+        if found is not None:
+            return found
+    return None
+
+
+def extract_pointer(text: str) -> RelayPointer:
+    """The relay pointer {object_key, sha256, bytes} from bare JSON, a wrapper or surrounding prompt text."""
+    found = _find_pointer(_loads(text.strip())) or _first_json(text, _find_pointer)
+    if found is None:
+        raise RelayError("no relay pointer (object_key, sha256, bytes) found in the input")
+    return found
+
+
+def _relay_request(base_url: str, token: str, key: str, method: str) -> urllib.request.Request:
+    if not base_url.startswith("https://"):
+        raise RelayError(f"{RELAY_URL_NAME} must be an https URL")
+    if not token:
+        raise RelayError(f"{RELAY_TOKEN_NAME} is not set")
+    url = f"{base_url.rstrip('/')}/objects/{key}"
+    return urllib.request.Request(url, method=method, headers={"Authorization": f"Bearer {token}"})
+
+
+def _relay_open(req: urllib.request.Request) -> bytes:
+    with urllib.request.urlopen(req, timeout=RELAY_TIMEOUT_S) as resp:  # noqa: S310 (https checked)
+        return resp.read(MAX_INPUT_BYTES + 1)
+
+
+def fetch_relay_object(pointer: RelayPointer, base_url: str, token: str,
+                       opener: Callable[[urllib.request.Request], bytes] | None = None) -> bytes:
+    """GET <base_url>/objects/<key> with the bearer token; the body must match the pointer's size and sha256."""
+    body = (opener or _relay_open)(_relay_request(base_url, token, pointer.object_key, "GET"))
+    if len(body) != pointer.bytes:
+        raise RelayError(f"relay object has {len(body)} bytes, the pointer says {pointer.bytes}")
+    if hashlib.sha256(body).hexdigest() != pointer.sha256:
+        raise RelayError("relay object does not match the pointer's sha256")
+    return body
+
+
+def delete_relay_object(pointer: RelayPointer, base_url: str, token: str,
+                        opener: Callable[[urllib.request.Request], bytes] | None = None) -> bool:
+    """DELETE the object; False when the relay cannot be reached (its TTL removes the object anyway)."""
+    try:
+        (opener or _relay_open)(_relay_request(base_url, token, pointer.object_key, "DELETE"))
+    except OSError:
+        return False
+    return True
+
+
+def ingest_relay(
+    store: Store,
+    ledger: Ledger,
+    cfg: Any,
+    text: str,
+    *,
+    base_url: str,
+    token: str,
+    opener: Callable[[urllib.request.Request], bytes] | None = None,
+    source_map: Mapping[str, str] | None = None,
+    now: datetime | None = None,
+    api_sources: frozenset[str] = frozenset(),
+) -> dict:
+    """Pointer from text, verified body from the relay, ingest_stdin on it, then delete the object.
+
+    A failed download, size or digest check or ingest raises and leaves the
+    object for a retry; the Worker's TTL removes it in any case.
+    """
+    pointer = extract_pointer(text)
+    body = fetch_relay_object(pointer, base_url, token, opener)
+    out = ingest_stdin(store, ledger, cfg, stream=io.StringIO(body.decode("utf-8")), source_map=source_map,
+                       now=now, api_sources=api_sources)
+    return {**out, "deleted": delete_relay_object(pointer, base_url, token, opener)}
+
+
+# --------------------------------------------------------------------------
+# push-ledger (path a): parallel sessions, derived snapshots rebuilt after a rebase
+
+
+def _stem_days(paths: Sequence[str], prefix: str) -> list[str]:
+    return sorted({d for d in (_stem_day(p) for p in paths if p.startswith(prefix + "/")) if d})
+
+
+def _rebuild_baselines(store: Store, ledger: Ledger, cfg: Any, rel: str) -> None:
+    """data/baselines/<week>.json for the week's latest day with a daily file."""
+    from homunculus import cli
+
+    week = Path(rel).stem
+    days = [d for d in _stem_days(ledger.glob(f"{DAILY_DIR}/*/*.json"), DAILY_DIR) if cli._iso_week(d) == week]
+    if days:
+        ledger.write_json(rel, metrics.baselines(store, days[-1], cfg), author=WRITER)
+
+
+def rebuild_derived(store: Store, ledger: Ledger, cfg: Any, paths: Sequence[str], now: datetime) -> str | None:
+    """After a rebase kept upstream's snapshots: replay the merged ledger into the session store, rewrite
+    the daily rows, baselines, freshness and check-in files the conflict touched, and commit."""
+    from homunculus import cli
+
+    restore_store(store, ledger, now)
+    days = _stem_days(paths, DAILY_DIR)
+    if days:
+        cli.finalize_days(store, ledger, cfg, days, now)
+    for rel in (p for p in paths if p.startswith("data/baselines/")):
+        _rebuild_baselines(store, ledger, cfg, rel)
+    if pineal.FRESHNESS_PATH in paths:
+        ledger.write_json(pineal.FRESHNESS_PATH, metrics.freshness(store.latest_ts(), now, weekly.FRESHNESS_H),
+                          author=WRITER)
+    save_checkins(store, ledger, _stem_days(paths, CHECKIN_DIR))
+    return _code_commit(ledger, "devin-ledger-merge", "Rebuild snapshots after a parallel session", now)
+
+
+def push_ledger(store: Store, ledger: Ledger, cfg: Any, now: Callable[[], datetime],
+                env: Mapping[str, str] | None = None) -> bool:
+    """ledger_sync.push with rebuild_derived; False when the push failed."""
+    git = ledger_sync.git_runner(ledger.root, env)
+    return ledger_sync.push(git, lambda paths: rebuild_derived(store, ledger, cfg, paths, now()))
+
+
+def _push_ledger_cmd(env: Mapping[str, str]) -> dict:
+    from homunculus import cli  # lazy, as in ingest_stdin
+
+    app = cli.App(cli.build_parser().parse_args(["pending"]), env)
+    try:
+        if not push_ledger(app.store, app.ledger, app.cfg, app.now):
+            raise RuntimeError("ledger push failed: a conflict outside the derived snapshots, or no try succeeded")
+    finally:
+        app.close()
+    return {"pushed": True}
+
+
+def _clear_hold_cmd(env: Mapping[str, str]) -> dict:
+    from homunculus import cli  # lazy, as in ingest_stdin
+
+    app = cli.App(cli.build_parser().parse_args(["pending"]), env)
+    try:
+        return clear_hold(cli._pineal_context(app, pineal))
+    finally:
+        app.close()
+
+
+def _relay_ingest_cmd(file: str, env: Mapping[str, str]) -> dict:
+    from homunculus import cli  # lazy, as in ingest_stdin
+
+    app = cli.App(cli.build_parser().parse_args(["ingest", "--file", file]), env)
+    try:
+        out = ingest_relay(app.store, app.ledger, app.cfg, read_input(path=file),
+                           base_url=env.get(RELAY_URL_NAME, ""), token=env.get(RELAY_TOKEN_NAME, ""),
+                           source_map=cli._source_map(env), now=app.now(), api_sources=cli._api_sources(env))
+    finally:
+        app.close()
+    return {"counts": out["counts"], "days": len(out["days"]), "skipped": out["skipped"],
+            "restored": out["restored"], "commit": out["commit"], "deleted": out["deleted"]}
+
+
+def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None) -> int:
+    """``python -m homunculus.devin_layer relay-ingest --file F``, ``clear-hold`` or ``push-ledger``;
+    prints counts only."""
+    parser = argparse.ArgumentParser(prog="python -m homunculus.devin_layer")
+    parser.add_argument("command", choices=("relay-ingest", "clear-hold", "push-ledger"))
+    parser.add_argument("--file", default=None)
+    args = parser.parse_args(argv)
+    env = os.environ if env is None else env
+    if args.command == "relay-ingest" and not args.file:
+        parser.error("relay-ingest needs --file")
+    commands = {"relay-ingest": lambda: _relay_ingest_cmd(args.file, env), "clear-hold": lambda: _clear_hold_cmd(env),
+                "push-ledger": lambda: _push_ledger_cmd(env)}
+    try:
+        out = commands[args.command]()
+    except Exception as exc:  # noqa: BLE001 - map every failure to an exit code, as the CLI does
+        print(f"homunculus: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        return 1
+    print(json.dumps(out, sort_keys=True, ensure_ascii=False, default=str), flush=True)
+    return 0
+
+
+# --------------------------------------------------------------------------
 # Automations
 
 
@@ -420,6 +649,18 @@ class AutomationDef:
     scout: str | None = None
     note: str = ""
     extra: tuple[str, ...] = ()  # commands after devin-task
+    relay: bool = False  # webhook body is a relay pointer, not the payload
+
+
+# The ingest-health webhook relies on the model copying the payload verbatim; nothing can check that copy.
+LLM_COPY_CONFIG = "config/devin.json"
+LLM_COPY_OPT_IN = "llm_copy_ingest"
+
+
+def llm_copy_allowed(ledger: Ledger) -> bool:
+    """True only when the owner opted in to the unreliable model-copy ingest in LLM_COPY_CONFIG."""
+    cfg = ledger.read_json(LLM_COPY_CONFIG, default=None)
+    return isinstance(cfg, Mapping) and cfg.get(LLM_COPY_OPT_IN) is True
 
 
 _PENDING_NOTE = (
@@ -429,15 +670,38 @@ _PENDING_NOTE = (
     "When the owner answers, run `python -m homunculus approve <id>` or `python -m homunculus veto <id>`."
 )
 _INGEST_NOTE = (
-    "This session's prompt carries the webhook body, a Health Auto Export daily summary. Do not read, quote or "
-    "summarize it. Write this whole prompt unchanged to $HOMUNCULUS_LEDGER/.private/inbox.txt; the ingest "
-    "command finds the JSON inside it."
+    "UNRELIABLE, opt-in only: ingest-relay is the supported webhook path. This session's prompt carries the "
+    "webhook body, a Health Auto Export daily summary. Do not read, quote or summarize it. Write this whole "
+    "prompt unchanged to $HOMUNCULUS_LEDGER/.private/inbox.txt; the ingest command finds the JSON inside it. "
+    "A changed digit in that copy would pass unnoticed, so ingest refuses unless the ledger opts in with "
+    f"{LLM_COPY_OPT_IN} set to true in {LLM_COPY_CONFIG}."
 )
 _INGEST_COMMANDS = (
     'mkdir -p "$HOMUNCULUS_LEDGER/.private"',
-    'python -m homunculus ingest --file "$HOMUNCULUS_LEDGER/.private/inbox.txt"',
+    'python -m homunculus ingest --llm-copy --file "$HOMUNCULUS_LEDGER/.private/inbox.txt"',
     'rm "$HOMUNCULUS_LEDGER/.private/inbox.txt"',
 )
+_RELAY_NOTE = (
+    "This session's prompt carries a relay pointer: object_key, sha256 and bytes. It holds no health data. "
+    "Write this whole prompt unchanged to $HOMUNCULUS_LEDGER/.private/inbox.txt; relay-ingest finds the "
+    "pointer inside it, downloads the body, checks size and digest, ingests it and deletes the object."
+)
+_RELAY_COMMANDS = (
+    'mkdir -p "$HOMUNCULUS_LEDGER/.private"',
+    'python -m homunculus.devin_layer relay-ingest --file "$HOMUNCULUS_LEDGER/.private/inbox.txt"',
+    'rm "$HOMUNCULUS_LEDGER/.private/inbox.txt"',
+)
+# Path a sessions run in parallel on fresh clones of one ledger. Append-only logs (ops/runs.jsonl,
+# ops/budget.jsonl, alerts) get git's union merge in this clone, so a rebase keeps both sides' rows.
+# push-ledger (ledger_sync.push) retries on top of whatever another session pushed first and
+# rebuilds the derived snapshots (heartbeats, freshness, daily rows, baselines, check-ins) both rewrote.
+LEDGER_SYNC_START = (
+    'd="$(git -C "$HOMUNCULUS_LEDGER" rev-parse --absolute-git-dir)/info" && mkdir -p "$d" '
+    '&& echo "*.jsonl merge=union" >> "$d/attributes"',
+    'git -C "$HOMUNCULUS_LEDGER" pull --ff-only',
+)
+PUSH_ATTEMPTS = ledger_sync.PUSH_ATTEMPTS
+LEDGER_PUSH = "python -m homunculus.devin_layer push-ledger"
 _SCOUT_NOTE = (
     "The script step found new candidate ids. They only signal that the scout has work; do not open them. "
     "The command fetches, deduplicates and triages through code."
@@ -446,6 +710,8 @@ _SCOUT_NOTE = (
 AUTOMATIONS: tuple[AutomationDef, ...] = (
     AutomationDef("ingest-health", "hippocampus", "webhook", ("a",), ("red_flags", "freshness"), 1,
                   note=_INGEST_NOTE),
+    AutomationDef("ingest-relay", "hippocampus", "webhook", ("a",), ("red_flags", "freshness"), 1,
+                  note=_RELAY_NOTE, relay=True),
     AutomationDef("pineal-daily", "hippocampus", "schedule", ("a",),
                   ("finalize_day", "red_flags", "freshness", "budget", "heartbeat", "ratify_due"), 1),
     *(AutomationDef(f"{s}-scout", "hippocampus", "script", ("a",), (s,), 1, scout=s, note=_SCOUT_NOTE)
@@ -469,6 +735,10 @@ PROVIDER_HOSTS: Mapping[str, str] = {"anthropic": "api.anthropic.com", "gemini":
 PROVIDER_SECRETS: Mapping[str, str] = {"anthropic": "ANTHROPIC_API_KEY", "gemini": "GEMINI_API_KEY"}
 WEBHOOK_HEADER = "X-Webhook-Secret"
 WEBHOOK_SECRET_NAME = "HOMUNCULUS_WEBHOOK_SECRET"
+RELAY_URL_NAME = "HOMUNCULUS_RELAY_URL"  # https://<worker host>, no trailing path
+RELAY_TOKEN_NAME = "HOMUNCULUS_RELAY_TOKEN"  # the Worker's FETCH_TOKEN
+RELAY_HOST = "<your-relay>.workers.dev"  # placeholder: replace with the Worker's host in the Automations form
+RELAY_POINTER_MAX_BYTES = 1024
 DEFAULT_MAX_ITEMS = 10  # Devin's documented default per script run
 MAX_ITEMS_LIMIT = 50  # Devin's documented maximum
 RRULE_DAYS = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")
@@ -572,6 +842,7 @@ def _providers(defn: AutomationDef, x: _Export) -> set[str]:
 
 def _hosts(defn: AutomationDef, x: _Export) -> list[str]:
     hosts = set(BASE_HOSTS) | {PROVIDER_HOSTS[p] for p in _providers(defn, x)}
+    hosts |= {RELAY_HOST} if defn.relay else set()
     if EVIDENCE_JOBS.intersection(defn.jobs):
         hosts |= scouts.ALLOWED_HOSTS
     return sorted(hosts)
@@ -580,7 +851,7 @@ def _hosts(defn: AutomationDef, x: _Export) -> list[str]:
 def _trigger(defn: AutomationDef, x: _Export) -> dict:
     if defn.trigger == "webhook":
         return {"type": "webhook", "secret_header": WEBHOOK_HEADER, "secret_name": WEBHOOK_SECRET_NAME,
-                "max_payload_bytes": WEBHOOK_MAX_BYTES}
+                "max_payload_bytes": RELAY_POINTER_MAX_BYTES if defn.relay else WEBHOOK_MAX_BYTES}
     cadence, at, days = _when(defn, x.jobs, x.overrides)
     return {"type": "schedule", "rrule": rrule(cadence, at, days), "timezone": x.tz}
 
@@ -594,12 +865,13 @@ def _relay_lines(defn: AutomationDef) -> list[str]:
 
 
 def _command_lines(defn: AutomationDef, path: str) -> list[str]:
-    lines = ['git -C "$HOMUNCULUS_LEDGER" pull --ff-only'] if path == "a" else []
-    lines += list(_INGEST_COMMANDS) if defn.trigger == "webhook" else []
+    lines = list(LEDGER_SYNC_START) if path == "a" else []
+    if defn.trigger == "webhook":
+        lines += list(_RELAY_COMMANDS if defn.relay else _INGEST_COMMANDS)
     if defn.jobs:
         lines.append(f"python -m homunculus devin-task {defn.name} --path {path}")
     lines += list(defn.extra)
-    return lines + (['git -C "$HOMUNCULUS_LEDGER" push'] if path == "a" else [])
+    return lines + ([LEDGER_PUSH] if path == "a" else [])
 
 
 def automation_prompt(defn: AutomationDef, path: str) -> str:
@@ -624,7 +896,8 @@ def _script(defn: AutomationDef, x: _Export) -> dict:
 
 
 def _secrets(defn: AutomationDef, x: _Export) -> list[str]:
-    return sorted(PROVIDER_SECRETS[p] for p in _providers(defn, x))
+    relay = [RELAY_TOKEN_NAME, RELAY_URL_NAME] if defn.relay else []
+    return sorted([PROVIDER_SECRETS[p] for p in _providers(defn, x)] + relay)
 
 
 def _spec(defn: AutomationDef, x: _Export) -> dict:
@@ -835,9 +1108,14 @@ def _admitted(ctx: pineal.Context, job: pineal.Job) -> bool:
     return ctx.budget.level() != "core_only" or job.essential or job.bot is None
 
 
-def _run_one(ctx: pineal.Context, job: pineal.Job, local: datetime) -> dict:
+# Jobs a webhook session reruns even when their period is done: the batch it just ingested may carry
+# days an earlier run this hour could not see. deliver_alerts dedupes by (rule_id, date).
+WEBHOOK_RERUN = frozenset({"red_flags"})
+
+
+def _run_one(ctx: pineal.Context, job: pineal.Job, local: datetime, rerun: bool = False) -> dict:
     period = pineal.period_key(job, local)
-    if _done(ctx.ledger, job.name, period):
+    if not rerun and _done(ctx.ledger, job.name, period):
         return {"job": job.name, "period": period, "status": "skipped", "message": "already done"}
     if not _admitted(ctx, job):
         return {"job": job.name, "period": period, "status": "skipped", "message": "halted or budget"}
@@ -857,7 +1135,8 @@ def run_task(ctx: pineal.Context, name: str, *, path: str = "a") -> dict:
     """Run one Automation's Pineal jobs once per period; owner texts come back for the Bot to post.
 
     A job already ok or skipped in its period is not rerun, so an Automation
-    retry or a box tick that got there first does no double work.
+    retry or a box tick that got there first does no double work. Webhook
+    sessions always rerun WEBHOOK_RERUN, since their batch is new data.
     """
     _check_path(path)
     defn = automation(name, path)
@@ -867,10 +1146,18 @@ def run_task(ctx: pineal.Context, name: str, *, path: str = "a") -> dict:
     if path == "a":
         restore_store(ctx.store, ctx.ledger, local)
     index = _job_index()
-    runs = [_run_one(run_ctx, index[job], local) for job in defn.jobs]
+    webhook = defn.trigger == "webhook"
+    runs = [_run_one(run_ctx, index[job], local, webhook and job in WEBHOOK_RERUN) for job in defn.jobs]
     state = _persist(ctx, local, f"devin-task-{defn.name}") if path == "a" else None
     return {"automation": defn.name, "bot": defn.bot, "path": path, "runs": runs, "state_commit": state,
             "owner_texts": [m["text"] for m in capture.sent if m["to"] == "owner"]}
+
+
+def clear_hold(ctx: pineal.Context) -> dict:
+    """Lift every urgent coaching hold (pineal.clear_coaching_hold) and commit; the owner's Decision only."""
+    cleared = 0 if ctx.dry_run else pineal.clear_coaching_hold(ctx)
+    sha = _code_commit(ctx.ledger, "devin-clear-hold", f"Coaching hold cleared: {cleared}", ctx.now())
+    return {"cleared": cleared, "commit": sha}
 
 
 def reply(ctx: pineal.Context, bot: str, text: str, *, path: str = "a") -> tuple[int, dict]:
@@ -885,3 +1172,7 @@ def reply(ctx: pineal.Context, bot: str, text: str, *, path: str = "a") -> tuple
     if path == "a":
         _persist(ctx, local, f"devin-reply-{bot}")
     return status, body
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -285,7 +285,10 @@ def _capped(z: float | None) -> float | None:
 
 
 def _hrv_z(store: Store, day: str) -> float | None:
-    st = metrics.hrv_state(store.daily("hrv_sdnn_ln", _shift(day, -67), _shift(day, 1)), day)
+    """HRV m7 z with illness days left out of the baseline, as in metrics.baselines."""
+    since = _shift(day, -67)
+    ill = metrics.illness_days(store, since, day)
+    st = metrics.hrv_state(store.daily("hrv_sdnn_ln", since, _shift(day, 1)), day, exclude=ill)
     return stats.zscore(st.m7, st.mu60, st.sd60, cap=_Z_CAP)
 
 
@@ -452,14 +455,18 @@ def _output_schema() -> dict:
 INSULA_OUTPUT_SCHEMA: dict = _output_schema()
 
 
+def _id_errors(ids: Sequence[object], expected: set[str]) -> list[str]:
+    errors = [f"unknown conflict_id {i!r}" for i in ids if i not in expected]
+    errors += [f"missing conflict_id {i!r}" for i in sorted(expected - set(ids))]
+    duplicates = {i for i in ids if ids.count(i) > 1}
+    return errors + [f"duplicate conflict_id {i!r}" for i in sorted(duplicates, key=str)]
+
+
 def output_errors(output: Mapping, reconciliation: Mapping) -> list[str]:
     """Rules JSON Schema cannot express: exactly one item per conflict id, <= 3 questions."""
     items = output.get("items") or []
-    ids = [it.get("conflict_id") for it in items]
     expected = {c["id"] for c in reconciliation.get("conflicts", [])}
-    errors = [f"unknown conflict_id {i!r}" for i in ids if i not in expected]
-    errors += [f"missing conflict_id {i!r}" for i in sorted(expected - set(ids))]
-    errors += [f"duplicate conflict_id {i!r}" for i in sorted({i for i in ids if ids.count(i) > 1}, key=str)]
+    errors = _id_errors([it.get("conflict_id") for it in items], expected)
     asked = sum(1 for it in items if it.get("question_for_owner_de"))
     if asked > MAX_OWNER_QUESTIONS:
         errors.append(f"{asked} owner questions, at most {MAX_OWNER_QUESTIONS}")

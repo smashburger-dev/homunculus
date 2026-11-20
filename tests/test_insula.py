@@ -11,7 +11,7 @@ import unittest
 from datetime import date, timedelta
 from pathlib import Path
 
-from homunculus import agents, checkins
+from homunculus import agents, checkins, insula, metrics, stats
 from homunculus.insula import (
     INSULA_OUTPUT_SCHEMA,
     MAX_OWNER_QUESTIONS,
@@ -384,6 +384,48 @@ class OutputContractTest(unittest.TestCase):
         recon = {"conflicts": [{"id": f"{k:010d}"} for k in range(4)]}
         asked = {"items": [self._item(f"{k:010d}", "Frage?") for k in range(4)]}
         self.assertEqual(output_errors(asked, recon), [f"4 owner questions, at most {MAX_OWNER_QUESTIONS}"])
+
+    def test_output_errors_order_and_non_string_ids(self) -> None:
+        recon = {"conflicts": [{"id": "a" * 10}, {"id": "b" * 10}]}
+        items = [self._item("c" * 10), {**self._item("a" * 10), "conflict_id": None}, self._item("c" * 10)]
+        self.assertEqual(output_errors({"items": items}, recon), [
+            f"unknown conflict_id {'c' * 10!r}", "unknown conflict_id None", f"unknown conflict_id {'c' * 10!r}",
+            f"missing conflict_id {'a' * 10!r}", f"missing conflict_id {'b' * 10!r}",
+            f"duplicate conflict_id {'c' * 10!r}",
+        ])
+
+
+class IllnessBaselineTest(unittest.TestCase):
+    """Insula's HRV z leaves illness days out of the baseline, like metrics.baselines."""
+
+    DAY = "2026-04-30"
+
+    def test_symptom_days_stay_out_of_hrv_baseline(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        store = Store(tmp / "t.sqlite")
+        try:
+            store.migrate()
+            sick = [_d(k, self.DAY) for k in range(-30, -23)]
+            base = 3.9
+            rows = [DailyValue(_d(k, self.DAY), "hrv_sdnn_ln", base + (0.06 if k % 2 else -0.06), "watch", 4, "ok")
+                    for k in range(-67, -6)]
+            rows += [DailyValue(_d(k, self.DAY), "hrv_sdnn_ln", base - 0.07, "watch", 4, "ok") for k in range(-6, 1)]
+            rows = [DailyValue(r.date, r.key, r.value - 0.35, r.source, r.n, r.quality) if r.date in sick else r
+                    for r in rows]
+            store.put_daily(rows)
+            before = insula._hrv_z(store, self.DAY)
+            store.put_checkins([_checkin(d, checkins.SYMPTOM_PREFIX + "sore_throat", 1.0) for d in sick])
+            after = insula._hrv_z(store, self.DAY)
+            ill = metrics.illness_days(store, _d(-67, self.DAY), self.DAY)
+            state = metrics.hrv_state(store.daily("hrv_sdnn_ln", _d(-67, self.DAY), _d(1, self.DAY)), self.DAY,
+                                      exclude=ill)
+        finally:
+            store.close()
+            shutil.rmtree(tmp)
+        self.assertTrue(set(sick) <= ill)
+        self.assertAlmostEqual(after, stats.zscore(state.m7, state.mu60, state.sd60, cap=3.0))
+        self.assertLess(after, before)  # the cold no longer inflates sd60
+        self.assertLess(after, -1.0)
 
 
 if __name__ == "__main__":

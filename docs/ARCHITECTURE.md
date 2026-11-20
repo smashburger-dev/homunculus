@@ -53,8 +53,9 @@ Everything lands in `daily(date, key, value, source, n, quality)`, keyed on the 
 
 - HRV: `x_d = mean(ln sdnn)` inside the sleep window (≥ 2 samples). `m7` needs 5 of 7 days. `μ60, σ60` cover days −67…−8, so the current week stays out of its own baseline. `SWC = 0.5·σ60`, states suppressed / normal / elevated.
 - Resting HR: median and MAD over days −35…−8, `z = Δ / (1.4826·MAD)`, floor 1 bpm.
-- Sleep: TST, 14-day debt against the owner's target, midpoint SD, social jetlag, Sleep Regularity Index from stage segments (Phillips 2017, UNVERIFIED; needs ≥ 80% wear). Deep and REM minutes drive no decision, because wrist staging agrees poorly with polysomnography.
-- Load: sRPE (`CR-10 × minutes`) is primary, Edwards TRIMP secondary. Acute (λ = 0.25) and chronic (λ ≈ 0.069) EWMA are shown separately, plus monotony, strain and the week-over-week change. ACWR drives nothing (Impellizzeri et al., Sports Med 2021).
+- Illness days: `illness_days` returns every date with a ticked `symptom:` check-in item plus the 3 days after it. The HRV baseline (in `baselines` and in Insula) and the 28-day baselines of the TST, midpoint-SD and wellness z-scores leave these dates out, so a cold does not widen σ for the following weeks. The days still count in `m7` and as "today". The resting-HR baseline does not exclude them.
+- Sleep: TST, 14-day debt against the owner's target, midpoint SD, social jetlag, Sleep Regularity Index from stage segments (Phillips 2017, UNVERIFIED; needs ≥ 80% wear). Deep and REM minutes drive no decision, because wrist staging agrees poorly with polysomnography. `sleep_mid_min` is the midpoint as clock minutes after local midnight; its SD and social jetlag use circular means, so 23:50 and 00:10 sit 20 minutes apart. `sleep_start_min` is the bedtime as signed minutes from local midnight: 23:30 is −30, 00:30 is 30, and every clock time from 18:00 on counts as before midnight. On that scale plain means, SDs and thresholds work across midnight.
+- Load: sRPE (`CR-10 × minutes`) is primary, Edwards TRIMP secondary. Acute (λ = 0.25) and chronic (λ ≈ 0.069) EWMA are shown separately, plus monotony, strain and the week-over-week change. ACWR drives nothing (Impellizzeri et al., Sports Med 2021). A session RPE counts up to 2 days after the workout, so `finalize_day` also rebuilds the load rows of the 2 stored days before, and Pineal rewrites those days' `data/daily/` snapshots.
 - Weight trend `T_t = T_{t−1} + 0.1·(w_t − T_{t−1})`, rate as 14-day slope in %BW/week. VO2max as a 90-day slope only; the watch underestimates by about 6 mL/kg/min (Lambe 2025).
 - Readiness: capped z-scores of HRV, −RHR, TST, −midpoint SD and wellness, weights from `config/readiness.json`. The output lists each contribution and each missing input, and with fewer than 3 inputs it is `None`.
 
@@ -71,6 +72,8 @@ Thalamus fills `paper.json`: design, n, population, outcome, effect with CI, reg
 Certainty `c` runs 0–4. RCTs and meta-analyses of RCTs start at 4, cohorts at 2, cross-sectional and acute mechanistic studies at 1, animal at 0.5, in vitro at 0.25. A retraction sets 0, an expression of concern caps at 1. Downgrades cover bias, imprecision against the owner's SWC, inconsistency, population mismatch and trust (preprint, product-linked funding, implausible SMD > 1, GRIM failure). Non-randomized studies can gain for large effects or dose-response, and replications add up to +1.
 
 A paper becomes `actionable` at c ≥ 2 when a systematic review or two independent RCTs in a matching population stand behind it. A single RCT, or 1 ≤ c < 2, can only seed an N-of-1 experiment. Below 1 it goes to the watchlist. Amygdala re-extracts 10% of papers, and any field disagreement blocks scoring.
+
+`evidence.appraise` adds a second axis, promise, and a methods gate. Weak methods cap certainty at 1, and the status follows the capped value, so a weak RCT cannot stay `actionable`. A paper with c < 2, promise ≥ 2.5 and clean methods gets status `frontier`. The frontier lane, its deep dive and its quota are described in [NOVELTY_LANE.md](NOVELTY_LANE.md).
 
 ### Belief ledger (`beliefs.py`)
 
@@ -98,7 +101,7 @@ These caps are conservative, not optimal. GRONORUN (Buist 2008) found the same i
 
 A novel exercise enters at RPE ≤ 6 and ≤ 2 sets, with no eccentric overload, and progresses after 2 pain-free sessions. The solver admits it only when its feature record (pattern, contraction, energy system, joint load) satisfies the injury constraints, keeps pull:push between 1:1 and 2:1, and stays at most 1 novel exercise per session and 2 per week.
 
-Nutrition has floors. Energy availability stays ≥ 30 kcal/kg FFM/day as a 7-day mean, and changes below 35 need approval. The kcal target moves at most 10% or 250 kcal a week, loss is capped at 1% BW/week, and no fast longer than 24 h is recommended. `ed_watch` fires on intake under the floor on 3 days a week, restrictive language, or more than one weigh-in a day. It pauses all deficit goals and points to professional help.
+Nutrition has floors. Energy availability stays ≥ 30 kcal/kg FFM/day as a 7-day mean, and changes below 35 need approval. The kcal target moves at most 10% or 250 kcal a week, loss is capped at 1% BW/week, and no fast longer than 24 h is recommended. `ed_watch` fires on intake under the floor on 3 days a week, restrictive language, or more than one weigh-in a day. It pauses all deficit goals and points to professional help. Intake is the daily `intake_kcal` row, the sum of logged `dietary_energy` samples; energy availability per day is `(intake_kcal - active_kcal) / ffm_kg`. A day without a log stays empty, never 0, so untracked days do not count as fasts, and without `ffm_kg` in the profile only a logged 0 kcal day counts. `intake_kcal` feeds code checks only and stays out of LLM packets. The weekly review and Pineal's check-in and goal-talk contexts both compute it.
 
 `config/forbidden.json` blocks prescription drugs, the WADA Prohibited List, dehydration cuts above 2–3% of body mass and medical altitude protocols. Supplements come from an allowlist of Kölner Liste or Informed Sport tested products and are checked against `profile/meds.json`. Geyer 2004 found undeclared steroids in 14.8% of 634 supplements.
 
@@ -106,6 +109,8 @@ Red flags are computed by code and sent as fixed German templates, with no LLM i
 
 - Urgent, sent at once, coaching stops: chest pain, fainting or severe breathlessness ("Ruf den Notruf 112 an"); any watch heart-rate notification; blood pressure ≥ 180/120; self-harm language (Telefonseelsorge 0800 111 0 111).
 - Same day: RHR Δ ≥ 10 bpm for 3 days; RHR Δ ≥ 5 with respiratory rate +2/min or wrist temperature +0.5 °C (intense training pauses); SpO₂ < 92% on 3 resting readings; new AF burden; unintended loss ≥ 5% in 30 days; dark urine after training; focal bone pain; 3 missed periods.
+
+Delivery: Pineal always writes the text to `mail/owner/inbox/`. On the box, `HOMUNCULUS_PUSH_URL` (an ntfy-style HTTPS topic, optional `HOMUNCULUS_PUSH_TOKEN` as Bearer) also sends every owner text to the phone, urgent ones at ntfy priority `urgent` and same-day ones at `high`. A failed push raises, so the alert is not logged as delivered and the next tick retries it. On path (a) the Devin Bot posts the texts in its chat instead.
 
 `scan_text` rejects bot output with diagnostic vocabulary in English or German.
 

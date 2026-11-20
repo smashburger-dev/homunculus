@@ -27,8 +27,10 @@ from homunculus.store import CheckinItem, DailyValue, Sample, SleepNight, SleepS
 DAILY_KEYS = (
     "hrv_sdnn_ln", "hrv_rmssd_ln", "rhr", "tst_h", "sleep_mid_min", "sleep_start_min", "weight_kg",
     "vo2max", "load_srpe", "load_edwards", "resp_rate", "wrist_temp_c", "spo2_min", "steps",
-    "active_kcal", "bp_sys", "bp_dia", "af_burden",
+    "active_kcal", "bp_sys", "bp_dia", "af_burden", "intake_kcal",
 )
+# Daily keys that feed code checks only (ed_watch) and never an LLM packet.
+CODE_ONLY_KEYS = frozenset({"intake_kcal"})
 
 DEFAULT_PRIORITY: tuple[str, ...] = ("watch", "garmin", "phone")
 # Garmin reports RMSSD, never SDNN, so it is not a default SDNN source.
@@ -198,6 +200,8 @@ _SAMPLE_SPECS: Mapping[str, _Spec] = {
     "spo2_min": _Spec(("blood_oxygen_saturation",), "qty", "min", "local"),
     "steps": _Spec(("step_count",), "qty", "sum", "local"),
     "active_kcal": _Spec(("active_energy",), "qty", "sum", "local"),
+    # Logged food energy; a day without any log stays None, never 0, so it is not read as a fast.
+    "intake_kcal": _Spec(("dietary_energy",), "qty", "sum", "local"),
     "bp_sys": _Spec(("blood_pressure",), "systolic", "max", "local"),
     "bp_dia": _Spec(("blood_pressure",), "diastolic", "max", "local"),
     "af_burden": _Spec(("atrial_fibrillation_burden",), "qty", "max", "local"),

@@ -92,6 +92,7 @@ NO_PLAN_DE = (
 )
 PACKET_TEXTS_SOURCE = "packet_texts"  # data block with the free text behind packet refs
 # Paper blockers that keep a deep dive out of the frontier candidates (evidence.frontier_blockers names)
+_DEFERRED_ABORTS = frozenset({"budget", "provider"})
 _DIVE_BLOCKERS = frozenset({"vetoed", "concern", "discarded", "weak_methods", "audit_blocked"})
 _CONCERN_FLAGS = frozenset({"expression_of_concern", "cap:includes_retracted"})
 REASK_DE = (
@@ -332,7 +333,7 @@ def _ledger_or(ledger: Ledger, rel: str, compute: Callable[[], Any]) -> Any:
 
 def _daily(store: Store, days: Sequence[str]) -> dict:
     out: dict[str, dict] = {}
-    for key in metrics.DAILY_KEYS:
+    for key in (k for k in metrics.DAILY_KEYS if k not in metrics.CODE_ONLY_KEYS):
         rows = store.daily(key, days[0], _shift(days[-1], 1))
         out[key] = {r.date: {"value": r.value, "quality": r.quality, "source": r.source} for r in rows}
     return out
@@ -342,9 +343,25 @@ def _paper_files(ledger: Ledger) -> list[str]:
     return [p for p in ledger.glob("evidence/papers/*.json") if not p.endswith(".audit.json")]
 
 
+def _appraised_status(rec: Mapping) -> str | None:
+    """Appraisal.status recomputed from the stored score and extraction; None when either is unusable.
+
+    Score.gate alone ignores the weak-methods cap, so a weak paper would read 'actionable'.
+    """
+    score, extraction = rec.get("score"), rec.get("extraction")
+    if not isinstance(score, Mapping) or not isinstance(extraction, Mapping):
+        return None
+    try:
+        s = evidence.Score(**{**score, "flags": tuple(score.get("flags") or ())})
+    except TypeError:
+        return None  # a stored score from another schema: fail closed
+    return evidence.appraise(extraction, s).status
+
+
 def _actionable(rec: Mapping) -> bool:
-    score = rec.get("score") or {}
-    return score.get("gate") == "actionable" and not rec.get("blocked") and rec.get("resolved") is True
+    if rec.get("blocked") or rec.get("resolved") is not True:
+        return False
+    return _appraised_status(rec) == "actionable"
 
 
 _PAPER_TEXT_FIELDS = (("population", "condition"), ("outcome", "name"), ("outcome", "unit"))
@@ -624,7 +641,8 @@ def _critic_same_family(ledger: Ledger) -> bool:
 
 
 def _guard_context(store: Store, ledger: Ledger, days: Sequence[str], rules: Rules, now: datetime) -> GuardContext:
-    """Intake data is not tracked yet, so ea_7d and kcal_current stay None and deficits reject."""
+    """ea_7d and kcal_current stay None (logged intake is too patchy to plan a deficit on), so deficits
+    reject; the logged intake feeds ed_watch only."""
     profile = _profile(ledger)
     first = _shift(days[-1], 1 - GUARD_HORIZON_DAYS)
     loads = {r.date: r.value for r in store.daily("load_srpe", first, _shift(days[-1], 1))}
@@ -638,7 +656,7 @@ def _guard_context(store: Store, ledger: Ledger, days: Sequence[str], rules: Rul
         ffm_kg=_positive(profile.get("ffm_kg")),
         auto_changes_3wk_pct=_auto_changes_pct(ledger, now),
         red_flag_active=_red_flag_active(ledger, days[-1]),
-        ed_watch=_ed_watch(store, days, rules),
+        ed_watch=_ed_watch(store, days, rules, _positive(profile.get("ffm_kg"))),
         injury_constraints=_injury_constraints(ledger, profile),
     )
 
@@ -729,9 +747,26 @@ def _weigh_ins(store: Store, days: Sequence[str]) -> list[int]:
     return [len(stamps.get(d, ())) for d in days]
 
 
-def _ed_watch(store: Store, days: Sequence[str], rules: Rules) -> bool:
+def _ea(intake: float | None, active: float | None, ffm_kg: float | None) -> float | None:
+    if intake is None or active is None or ffm_kg is None:
+        return None
+    return guardrails.energy_availability(intake, active, ffm_kg)
+
+
+def intake_series(store: Store, days: Sequence[str], ffm_kg: float | None) -> tuple[list, list]:
+    """Daily logged intake and energy availability (intake - active_kcal) / ffm_kg for days.
+
+    A day without logged intake, active energy or a known FFM stays None, so it never counts as a fast.
+    """
+    until = _shift(days[-1], 1)
+    intake = {r.date: r.value for r in store.daily("intake_kcal", days[0], until)}
+    active = {r.date: r.value for r in store.daily("active_kcal", days[0], until)}
+    return [intake.get(d) for d in days], [_ea(intake.get(d), active.get(d), ffm_kg) for d in days]
+
+
+def _ed_watch(store: Store, days: Sequence[str], rules: Rules, ffm_kg: float | None = None) -> bool:
     notes = [c.text for c in store.checkins(days[0], _shift(days[-1], 1), item=NOTE_ITEM) if c.text]
-    return guardrails.ed_watch([], [], _weigh_ins(store, days), notes, rules)
+    return guardrails.ed_watch(*intake_series(store, days, ffm_kg), _weigh_ins(store, days), notes, rules)
 
 
 def _injury_constraints(ledger: Ledger, profile: Mapping[str, Any]) -> dict:
@@ -897,6 +932,16 @@ class ReviewOutcome:
     asks_owner: tuple[str, ...]
     messages: tuple[str, ...]
     aborted: str | None
+
+    @property
+    def job_status(self) -> str:
+        """Pineal job status: 'deferred' on budget or provider aborts (retry later), 'failed' without a plan, else 'ok'.
+
+        A missing plan is a setup error that every week repeats, so it must not read as a healthy run.
+        """
+        if self.aborted in _DEFERRED_ABORTS:
+            return "deferred"
+        return "failed" if self.aborted == "no_plan" else "ok"
 
 
 @dataclass(frozen=True)
@@ -1511,8 +1556,8 @@ def _meta(cand: Mapping[str, Any], work: Mapping[str, Any] | None) -> dict:
 
 
 def _swc(paper: Mapping[str, Any], owner: OwnerProfile) -> float | None:
-    name = _plain((paper.get("outcome") or {}).get("name"))
-    return owner.swc.get(name) if isinstance(name, str) else None
+    """The owner's SWC in the paper's effect units (evidence.swc_paper_units)."""
+    return evidence.swc_paper_units(paper, owner)
 
 
 def _audit(th: _Thalamus, cand: Mapping[str, Any], abstract: str, paper: Mapping[str, Any], rel: str) -> dict:

@@ -223,7 +223,7 @@ class ReviewTest(TempLedger):
             "cerebellum": Script(_ruling("ratify", revised)),
         })
         self.assertIsNone(out.aborted)
-        self.assertEqual(out.ruling, "ratify")
+        self.assertEqual((out.ruling, out.job_status), ("ratify", "ok"))
         self.assertEqual(out.verdict.tier, "auto")
         self.assertEqual(out.open_blockers, ())
         self.assertEqual(len([m for m in out.messages if m.startswith("reviews/")]), weekly.MAX_MESSAGES)
@@ -420,7 +420,7 @@ class ReviewTest(TempLedger):
         self.ledger.append_jsonl("ops/budget.jsonl", {"date": "2026-11-22", "week": WEEK, "bot": "hippocampus",
                                                       "usd": 99.0}, author="pineal")
         out = self.review({})
-        self.assertEqual(out.aborted, "budget")
+        self.assertEqual((out.aborted, out.job_status), ("budget", "deferred"))
         self.assertEqual(self.provider.calls, [])
 
     def test_schema_violation_aborts_as_provider(self) -> None:
@@ -431,6 +431,7 @@ class ReviewTest(TempLedger):
         self.ledger.write_text("plans/CURRENT", "v0099\n", author="pineal")
         out = self.review({})
         self.assertEqual((out.ruling, out.aborted), ("keep", "no_plan"))
+        self.assertEqual(out.job_status, "failed")  # a fresh ledger must not report a healthy weekly run
         self.assertEqual(self.provider.calls, [])
         alert = self.ledger.read_json(out.messages[-1])
         self.assertEqual(alert["kind"], "alert")
@@ -516,8 +517,9 @@ class PacketTest(TempLedger):
         self.assertNotIn("x" * 281, json.dumps(packet))
 
     def test_actionable_papers_only(self) -> None:
-        good = {"score": {"gate": "actionable", "certainty": 2.5, "flags": []}, "resolved": True, "blocked": False,
-                "doi": DOI, "meta": {"title": "T"}, "extraction": {"design": {"value": "meta_rct", "quote": "q"}}}
+        extraction = {**_paper(), "design": {"value": "meta_rct", "quote": "q"}}
+        good = {"score": _score_dict(), "resolved": True, "blocked": False, "doi": DOI, "meta": {"title": "T"},
+                "extraction": extraction}
         self.ledger.write_json("evidence/papers/a.json", good, author="pineal")
         self.ledger.write_json("evidence/papers/b.json", {**good, "blocked": True}, author="pineal")
         self.ledger.write_json("evidence/papers/c.json", {**good, "resolved": False}, author="pineal")
@@ -525,6 +527,15 @@ class PacketTest(TempLedger):
         papers = self.build()["papers_actionable"]
         self.assertEqual([p["ref"] for p in papers], ["evidence/papers/a.json"])
         self.assertEqual(papers[0]["design"], "meta_rct")
+
+    def test_weak_methods_paper_is_not_actionable_despite_its_gate(self) -> None:
+        weak = {**_paper(n_total=10), "design": {"value": "meta_rct", "quote": "q"}}  # sample_size fails -> weak
+        self.assertTrue(evidence.quality(weak).weak)
+        rec = {"score": _score_dict(), "resolved": True, "blocked": False, "doi": DOI, "meta": {"title": "T"},
+               "extraction": weak}
+        self.ledger.write_json("evidence/papers/w.json", rec, author="pineal")
+        self.ledger.write_json("evidence/papers/x.json", {**rec, "score": {"gate": "actionable"}}, author="pineal")
+        self.assertEqual(self.build()["papers_actionable"], [])  # x: a partial stored score fails closed
 
     def test_frontier_section(self) -> None:
         empty = self.build()["frontier"]
@@ -572,7 +583,7 @@ class PacketTest(TempLedger):
         self.ledger.write_json(DIVE_X, dive, author="pineal")
         paper = _paper()
         paper["outcome"]["name"] = {"value": marker, "quote": "q"}
-        rec = {"score": {"gate": "actionable", "certainty": 2.5, "flags": []}, "resolved": True, "blocked": False,
+        rec = {"score": _score_dict(), "resolved": True, "blocked": False,
                "doi": DOI, "meta": {"title": marker}, "extraction": paper}
         self.ledger.write_json("evidence/papers/a.json", rec, author="pineal")
         packet = self.build()
@@ -628,6 +639,42 @@ def _proto(belief_id: str) -> dict:
 def _frontier_packet(running: int = 0) -> dict:
     return {**_packet(), "frontier": {"quota": weekly.frontier_quota(running, 0, 1), "candidates": [],
                                       "running": [], "beliefs": {"fr-x": DIVE_X, "fr-y": DIVE_Y}}}
+
+
+class IntakeEdWatchTest(unittest.TestCase):
+    DAYS = [f"2026-11-{d}" for d in range(13, 20)]
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.store = Store(self.tmp / "health.db")
+        self.store.migrate()
+        self.addCleanup(self.store.close)
+        self.cfg = MetricsConfig(tz="Europe/Berlin", source_priority={})
+
+    def log(self, days: list[str], kcal: float) -> None:
+        from homunculus import metrics
+        from homunculus.store import Sample
+        self.store.upsert_samples([Sample("dietary_energy", "kcal", f"{d}T12:00:00+01:00", "qty", kcal, "phone")
+                                   for d in days])
+        self.store.upsert_samples([Sample("active_energy", "kcal", f"{d}T12:00:00+01:00", "qty", 300.0, "watch")
+                                   for d in self.DAYS])
+        for d in self.DAYS:
+            metrics.finalize_day(self.store, d, self.cfg)
+
+    def test_low_logged_intake_sets_ed_watch(self) -> None:
+        self.log(self.DAYS[:4], 300.0)  # EA (300 - 300) / 58 = 0 kcal/kg FFM on 4 of 7 days
+        intake, ea = weekly.intake_series(self.store, self.DAYS, 58.0)
+        self.assertEqual(intake, [300.0] * 4 + [None] * 3)  # unlogged days stay None, never 0
+        self.assertEqual(ea, [0.0] * 4 + [None] * 3)
+        self.assertTrue(weekly._ed_watch(self.store, self.DAYS, Rules(), 58.0))
+        self.assertFalse(weekly._ed_watch(self.store, self.DAYS, Rules(), None))  # no FFM, no EA
+
+    def test_unlogged_and_normal_intake_stay_clear(self) -> None:
+        self.log([], 0.0)
+        self.assertFalse(weekly._ed_watch(self.store, self.DAYS, Rules(), 58.0))
+        self.log(self.DAYS, 2600.0)
+        self.assertFalse(weekly._ed_watch(self.store, self.DAYS, Rules(), 58.0))
 
 
 class FrontierPureTest(unittest.TestCase):
@@ -839,6 +886,11 @@ class MotorCortexTest(TempLedger):
 # Thursday: Thalamus
 
 
+def _score_dict(gate: str = "actionable", certainty: float = 2.5) -> dict:
+    """A stored Score record as Thalamus writes it (dataclasses.asdict)."""
+    return dataclasses.asdict(evidence.Score(certainty, certainty, (), False, (), gate, evidence.RUBRIC_VERSION))
+
+
 def _nulled(node):
     """Every {value, quote} field set to null: the abstract states nothing."""
     if isinstance(node, dict):
@@ -974,6 +1026,22 @@ class ThalamusTest(TempLedger):
         self.ledger.write_text("config/HALT", "stop\n", author="pineal")
         with self.assertRaises(agents.BudgetExceeded):
             self.run_it(FakeProvider({"thalamus": _paper()}))
+
+
+class SwcTest(unittest.TestCase):
+    def test_thalamus_swc_is_in_the_papers_effect_units(self) -> None:
+        owner = dataclasses.replace(OWNER, swc={"sleep_min": 20.0})
+        paper = _paper()
+        paper["outcome"]["name"] = {"value": "sleep_min", "quote": "q"}
+
+        def with_effect(kind, sd_pop=None):
+            return {**paper, "effect": {**paper["effect"], "type": {"value": kind, "quote": "q"},
+                                        "sd_pop": {"value": sd_pop, "quote": "q"}}}
+
+        self.assertEqual(weekly._swc(with_effect("MD"), owner), 20.0)
+        self.assertEqual(weekly._swc(with_effect("SMD", 40.0), owner), 0.5)  # raw minutes would be 20 SD
+        self.assertIsNone(weekly._swc(with_effect("SMD"), owner))
+        self.assertIsNone(weekly._swc(with_effect("RR"), owner))
 
 
 CITED = "doi:10.1000/cited.2"

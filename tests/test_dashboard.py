@@ -318,6 +318,28 @@ class BuildTests(unittest.TestCase):
         self.assertIn('action="/checkin"', pages["checkin.html"])
         self.assertIn(TODAY, pages["checkin.html"])
 
+    def _today_page(self) -> str:
+        paths = dashboard.build(self.store, self.ledger, self.tmp / "site", NOW, self.cfg)
+        return paths[0].read_text(encoding="utf-8")
+
+    def test_today_follows_pineal_coaching_holds(self) -> None:
+        w = self.ledger
+        w.write_json("plans/v0001.json", _plan(1, None), author="pineal")
+        w.write_text("plans/CURRENT", "v0001\n", author="pineal")
+        self.assertNotIn("Ruhetag", self._today_page())
+        # Urgent from four days ago, never cleared: coaching stays paused and the alert stays listed.
+        w.append_jsonl("data/alerts.jsonl", {"level": "urgent", "rule_id": "bp_high", "date": "2026-02-28",
+                                             "data": {"sys": 190, "dia": 125}}, author="pineal")
+        page = self._today_page()
+        self.assertIn("Ruhetag", page)
+        self.assertIn("Warnsignal aktiv", page)
+        w.append_jsonl("data/coaching_cleared.jsonl", {"rule_id": "bp_high", "date": "2026-02-28"}, author="pineal")
+        self.assertNotIn("Ruhetag", self._today_page())
+        # A focal bone pain prompt from yesterday holds for seven days.
+        w.append_jsonl("data/alerts.jsonl", {"level": "prompt", "rule_id": "focal_bone_pain", "date": "2026-03-03",
+                                             "data": {}}, author="pineal")
+        self.assertIn("Ruhetag", self._today_page())
+
     def test_build_on_empty_ledger(self) -> None:
         paths = dashboard.build(self.store, self.ledger, self.tmp / "site", NOW, self.cfg)
         self.assertEqual(len(paths), 7)

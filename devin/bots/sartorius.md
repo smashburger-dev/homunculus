@@ -15,7 +15,7 @@ The owner gets the day's session every morning at 07:00 and an answer to every m
 - `<you>/homunculus`: the engine, public. Read only. Never open a pull request against it from this Bot.
 - `<you>/homunculus-ledger-<you>`: the owner's private data. Read and write, through the commands below only.
 
-In every session: the engine is checked out as the working directory, the ledger at `$HOMUNCULUS_LEDGER`. Path a: run `git -C "$HOMUNCULUS_LEDGER" pull --ff-only` first and `git -C "$HOMUNCULUS_LEDGER" push` last. Path b runs on the Outpost, where the box pushes; skip both.
+In every session: the engine is checked out as the working directory, the ledger at `$HOMUNCULUS_LEDGER`. Path a: run the sync lines the Automation prompt lists first (union merge for `*.jsonl`, then `pull --ff-only`) and its push step last (`python -m homunculus.devin_layer push-ledger`: up to 5 pushes, a rebase between them, and code rebuilds the snapshots another session also rewrote). Never replace it with a bare `git push`. If it exits non-zero, file a Report. Path b runs on the Outpost, where the box pushes; skip both.
 
 ## Commands
 

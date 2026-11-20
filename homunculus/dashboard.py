@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-from homunculus import checkins, deepdive, lexicon, metrics, plans
+from homunculus import checkins, deepdive, holds, lexicon, metrics, plans
 from homunculus.guardrails import Alert, render_alert
 from homunculus.metrics import MetricsConfig, Readiness
 from homunculus.plans import PlanError
@@ -62,7 +62,6 @@ TODAY_KEYS: tuple[tuple[str, str, int, str], ...] = (
     ("resp_rate", "Atemfrequenz", 1, " /min"),
 )
 SERIES_DAYS = 28
-ALERT_DAYS = 2  # today and yesterday
 
 # ARCHITECTURE.md: HRV or sleep older than 36 h, workouts older than 72 h are stale.
 FRESHNESS_THRESHOLDS_H: Mapping[str, float] = {
@@ -811,22 +810,26 @@ def _alert_from_row(row: Any) -> Alert | None:
         return None
 
 
-def _recent_alerts(ledger: Ledger, day: str) -> list[Alert]:
-    days = {_shift(day, -k) for k in range(ALERT_DAYS)}
+def _recent_alerts(ledger: Ledger, day: str) -> tuple[list[Alert], bool]:
+    """Alerts of the last ALERT_DAYS days plus every alert still holding coaching, and whether one holds.
+
+    Same hold rules as Pineal (homunculus.holds): urgent until cleared, prompt for PROMPT_HOLD_DAYS.
+    """
     seen: dict[tuple[str, str], Alert] = {}
-    for row in ledger.read_jsonl("data/alerts.jsonl"):
+    held = False
+    for row in holds.recent_alerts(ledger, day):
         alert = _alert_from_row(row)
-        if alert is not None and alert.date in days:
+        if alert is not None:
             seen.setdefault((alert.rule_id, alert.date), alert)
-    return list(seen.values())
+            held = held or bool(row["hold"])
+    return list(seen.values()), held
 
 
-def _day_plan(ledger: Ledger, day: str, rd: Readiness, fresh: Mapping, alerts: Sequence[Alert]) -> dict:
+def _day_plan(ledger: Ledger, day: str, rd: Readiness, fresh: Mapping, red: bool) -> dict:
     try:
         plan = plans.current(ledger)
     except PlanError:
         return {}
-    red = any(a.level == "urgent" or a.date == day for a in alerts)
     stale = any(fresh.get(k, {}).get("stale", True) for k in _STALE_BLOCKING)
     return plans.modulate_day(plan, Date.fromisoformat(day).weekday(), rd.band, red, stale)
 
@@ -835,8 +838,8 @@ def _today_html(store: Store, ledger: Ledger, now: datetime, cfg: MetricsConfig,
     daily = {key: _series(store, key, day) for key, *_ in TODAY_KEYS}
     rd = _readiness(store, day, cfg)
     fresh = metrics.freshness(store.latest_ts(), now, FRESHNESS_THRESHOLDS_H)
-    alerts = _recent_alerts(ledger, day)
-    return render_today(daily, rd, _day_plan(ledger, day, rd, fresh, alerts), fresh, alerts)
+    alerts, red = _recent_alerts(ledger, day)
+    return render_today(daily, rd, _day_plan(ledger, day, rd, fresh, red), fresh, alerts)
 
 
 

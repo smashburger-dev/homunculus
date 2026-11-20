@@ -745,7 +745,8 @@ def _appraisal_line(rec: Mapping[str, Any]) -> dict:
 
 def _appraise_paper(run: Run, rel: str) -> dict:
     rec = dict(run.ledger.read_json(rel))
-    score, appraisal = cli.appraise_record(run.ledger, rec, cli.owner_profile(OWNER, run.cal.now.date()))
+    score, appraisal = cli.appraise_record(run.ledger, rec, cli.owner_profile(OWNER, run.cal.now.date()),
+                                           as_of=run.cal.now.date().isoformat())
     rec.update(score=dataclasses_asdict(score), appraisal=dataclasses_asdict(appraisal))
     run.ledger.write_json(rel, rec, author=cli.CODE_AUTHOR)
     return _appraisal_line(rec)

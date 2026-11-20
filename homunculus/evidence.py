@@ -456,6 +456,23 @@ def _smd_scale(paper: Mapping) -> float | None:
     return sd_pop if sd_pop is not None and sd_pop > 0 else None
 
 
+def swc_paper_units(paper: Mapping, owner: OwnerProfile) -> float | None:
+    """owner.swc (raw outcome units) in the paper's effect units, the ``swc_paper_units`` of score and promise.
+
+    MD: the SWC as is. SMD: SWC / sd_pop, or None without a positive sd_pop.
+    RR or an unknown type: None, since a raw-unit SWC has no log-risk-ratio equivalent.
+    """
+    name = _get(paper, "outcome/name")
+    swc = _number(owner.swc.get(name)) if isinstance(name, str) else None
+    kind = _get(paper, "effect/type")
+    if swc is None or kind not in ("MD", "SMD"):
+        return None
+    if kind == "MD":
+        return swc
+    sd_pop = _smd_scale(paper)
+    return swc / sd_pop if sd_pop is not None else None
+
+
 def _to_scale(paper: Mapping, values: Sequence[float | None]) -> list[float] | None:
     """Values on the comparison scale (log for RR), or None when any is missing or invalid."""
     if None in values:

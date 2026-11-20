@@ -131,6 +131,16 @@ class LinkTest(unittest.TestCase):
         self.assertEqual((a["certainty"], a["human"]), (1.0, False))
         self.assertEqual([e["human"] for e in a["evidence"]], [False, False])
 
+    def test_ledger_design_overrides_extracted_design(self):
+        l3 = dive()["links"][2]  # Thalamus labels doi:10.0/c rct_parallel
+        a = D.assess_link(l3, KNOWN, designs={"doi:10.0/c": "animal"})
+        self.assertEqual((a["certainty"], a["human"], a["evidence"][0]["design"]), (3.0, False, "animal"))
+        self.assertTrue(D.assess_link(l3, KNOWN, designs={"doi:10.0/other": "animal"})["human"])
+        rec = decide(dive(), designs={"doi:10.0/c": "animal"})
+        self.assertEqual(rec["chain"]["coverage"], round(1 / 3, 10))
+        self.assertEqual(rec["decision"], "watch")
+        self.assertIn("coverage_low", rec["reasons"])
+
     def test_contradiction_contests(self):
         l3 = dive()["links"][2]
         l3["evidence"].append(ev("doi:10.0/d", "rct_parallel", "x", "contradicts"))
@@ -276,6 +286,14 @@ class DecideTest(unittest.TestCase):
         owner = E.OwnerProfile("female", 30, "trained", (), {})
         s = E.score(paper, owner, update_to=[], swc_paper_units=None)
         self.assertEqual(E.appraise(paper, s, inputs).status, "frontier")
+
+    def test_promise_direction_from_base_or_tracker_key(self):
+        rec = decide(dive())  # sleep_start_min has no listed direction
+        self.assertIsNone(D.promise_inputs(rec).direction)
+        self.assertEqual(D.promise_inputs(rec, E.PromiseInput(direction=1)).direction, 1)
+        rhr = {**rec, "claim": {**rec["claim"], "tracker_key": "rhr"}}
+        self.assertEqual(D.promise_inputs(rhr).direction, -1)
+        self.assertEqual(D.promise_inputs(rhr, E.PromiseInput(direction=1)).direction, 1)
 
 
 class LedgerTest(unittest.TestCase):

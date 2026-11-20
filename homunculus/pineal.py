@@ -30,7 +30,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 from zoneinfo import ZoneInfo
 
-from homunculus import agents, beliefs, checkins, dashboard, guardrails, ingest, insula, metrics, plans, scouts, weekly
+from homunculus import agents, beliefs, checkins, dashboard, guardrails, holds, ingest, insula, metrics, plans, scouts, weekly
 from homunculus.agents import BotSpec, Budget, Provider
 from homunculus.evidence import OwnerProfile
 from homunculus.guardrails import Alert
@@ -44,8 +44,8 @@ MAX_ATTEMPTS = 2  # first run plus at most one retry per period
 
 WRITER = "pineal"
 RUNS_LOG = "ops/runs.jsonl"
-ALERTS_LOG = "data/alerts.jsonl"
-COACHING_CLEARED_LOG = "data/coaching_cleared.jsonl"  # owner-confirmed doctor clearance per urgent alert
+ALERTS_LOG = holds.ALERTS_LOG
+COACHING_CLEARED_LOG = holds.COACHING_CLEARED_LOG  # owner-confirmed doctor clearance per urgent alert
 NOTICES_LOG = "ops/notices.jsonl"
 HEARTBEAT_DIR = "ops/heartbeats"
 INCIDENT_DIR = "ops/incidents"
@@ -65,18 +65,23 @@ OWNER_TARGETS = ("sartorius", "vagus", "cerebellum")
 GOAL_RECIPIENTS = ("hippocampus", "motor_cortex", "sartorius", "vagus")
 MESSAGE_MAX = 4000
 STALE_BLOCKING = ("heart_rate_variability", "sleep_segments")
-ALERT_DAYS = 2  # today and yesterday count as active
-# Days a prompt alert keeps the session at rest, counting its own day; other prompt rules get ALERT_DAYS
-# (the alert day and the next morning). Urgent alerts hold until cleared in COACHING_CLEARED_LOG.
-PROMPT_HOLD_DAYS: Mapping[str, int] = MappingProxyType({"dark_urine": 3, "focal_bone_pain": 7})
+ALERT_DAYS = holds.ALERT_DAYS  # today and yesterday count as active
+PROMPT_HOLD_DAYS = holds.PROMPT_HOLD_DAYS  # see homunculus.holds
 PROFILE_RULES = frozenset({"missed_periods"})  # date-free rules: evaluated for today only
 INBOX_MAX = 5
 NOTES_MAX = 2000
 THALAMUS_WEEKDAY = 3  # Thursday: submit; other days only collect a running batch
 RED_FLAG_KEYS = ("rhr", "bp_sys", "bp_dia", "spo2_min", "af_burden", "weight_kg", "resp_rate", "wrist_temp_c")
 RED_FLAG_LOOKBACK_DAYS = 91
+ED_WATCH_DAYS = 7  # guardrails.ed_watch looks at the last 7 days
+SNAPSHOT_REFRESH_DAYS = 2  # metrics.finalize_day also rebuilds the load rows of the 2 days before
 
 FALLBACK_DE = "Ich kann gerade nicht antworten. Versuch es bitte später noch einmal."
+HOLD_DE = (
+    "Das Coaching pausiert, bis dich eine Ärztin oder ein Arzt gesehen hat. Bei Brustschmerz, Atemnot, "
+    "Ohnmacht oder wenn es dir schlechter geht, ruf sofort den Notruf 112 an. Deine Nachricht ist als "
+    "Notiz gespeichert. Hat dich jemand untersucht, hebst du die Pause mit coaching clear auf."
+)
 PLAN_RATIFIED_DE = Template("Neuer Plan $version gilt ab jetzt. Die Änderungen stehen im Dashboard unter Plan.")
 JOB_FAILED_DE = Template("Der Job $job ist im Zeitraum $period fehlgeschlagen. Details stehen unter ops/incidents.")
 FRONTIER_DE = Template("Frontier-Rückblick $month: kein neuer Kandidat geprüft. Nächster Kandidat: $claim.")
@@ -92,25 +97,7 @@ BUDGET_DE: Mapping[str, Template] = MappingProxyType({
     ),
 })
 
-# Normalized (guardrails.normalize_name) word prefixes per urgent symptom.
-URGENT_TERMS: Mapping[str, tuple[str, ...]] = MappingProxyType({
-    "chest_pain": (
-        "brustschmerz", "schmerzen in der brust", "schmerz in der brust", "druck auf der brust",
-        "brustdruck", "engegefuhl in der brust", "chest pain", "chest pressure", "chest tightness",
-    ),
-    "fainting": (
-        "ohnmacht", "bewusstlos", "umgekippt", "kollabiert", "fainted", "fainting", "passed out",
-        "blacked out",
-    ),
-    "short_breath": (
-        "atemnot", "luftnot", "keine luft", "kurzatmig", "kann nicht atmen", "short of breath",
-        "shortness of breath", "can t breathe", "cannot breathe", "breathless",
-    ),
-})
-_URGENT_RES = {
-    symptom: tuple(re.compile(r"(?<![0-9a-z])" + re.escape(t)) for t in terms)
-    for symptom, terms in URGENT_TERMS.items()
-}
+URGENT_TERMS = guardrails.URGENT_TERMS  # alias; guardrails owns the urgent-symptom list
 
 # Coach replies: amounts with a dose unit, and normalized phrases that add load, fast, skip meals or
 # name calories, matched at word starts. "faste" covers fasten/fastest/fastet, not German "fast".
@@ -633,47 +620,53 @@ def _ed_watch(ledger: Ledger) -> bool:
     return bool(guard.get("ed_watch")) if isinstance(guard, Mapping) else False
 
 
+def _weigh_ins(store: Store, days: Sequence[str]) -> list[int]:
+    """Distinct weight sample timestamps per day."""
+    stamps: dict[str, set[str]] = {d: set() for d in days}
+    for metric in weekly.WEIGHT_METRICS:
+        for s in store.samples(metric, days[0], _shift(days[-1], 1)):
+            stamps.setdefault(s.ts[:10], set()).add(s.ts)
+    return [len(stamps[d]) for d in days]
+
+
+def _ed_watch_now(ctx: Context, day: str, extra_texts: Sequence[str] = ()) -> bool:
+    """guardrails.ed_watch over the last ED_WATCH_DAYS days, at check-in time instead of weekly.
+
+    Logged intake and energy availability, weigh-ins and check-in texts (plus extra_texts, e.g. the
+    owner's current message) can trigger it.
+    """
+    days = [_shift(day, -k) for k in range(ED_WATCH_DAYS - 1, -1, -1)]
+    texts = [c.text for c in ctx.store.checkins(days[0], _shift(day, 1)) if c.text]
+    series = weekly.intake_series(ctx.store, days, weekly._positive(_profile(ctx.ledger).get("ffm_kg")))
+    return guardrails.ed_watch(*series, _weigh_ins(ctx.store, days), [*texts, *extra_texts], _rules(ctx.ledger))
+
+
+def _ed_watch_active(ctx: Context, day: str, extra_texts: Sequence[str] = ()) -> bool:
+    return _ed_watch(ctx.ledger) or _ed_watch_now(ctx, day, extra_texts)
+
+
+def _days_off(store: Store, day: str, limit: int) -> int:
+    """Trailing days before day without training, capped at limit; a missing load row counts as off."""
+    rows = {r.date: r for r in store.daily("load_srpe", _shift(day, -limit), day)}
+    n = 0
+    while n < limit:
+        row = rows.get(_shift(day, -1 - n))
+        if row is not None and (row.n > 0 or row.value):
+            break
+        n += 1
+    return n
+
+
 def _today_snapshot(ctx: Context, day: str) -> dict:
     """Provisional rows for today (finalize at 06:30 overwrites them), then the baselines."""
     metrics.finalize_day(ctx.store, day, ctx.metrics_cfg)
     return metrics.baselines(ctx.store, day, ctx.metrics_cfg)
 
 
-def _alert_key(row: Mapping) -> tuple[str, str]:
-    return str(row.get("rule_id")), str(row.get("date"))
-
-
-def _age_days(row: Mapping, day: str) -> int | None:
-    try:
-        return (Date.fromisoformat(day) - Date.fromisoformat(str(row.get("date"))[:10])).days
-    except ValueError:
-        return None
-
-
-def _holds(row: Mapping, day: str, cleared: set[tuple[str, str]]) -> bool:
-    """An urgent alert holds until cleared; a prompt alert for its rule's PROMPT_HOLD_DAYS."""
-    age = _age_days(row, day)
-    if age is None or age < 0:
-        return False
-    if row.get("level") == "urgent":
-        return _alert_key(row) not in cleared
-    return age < PROMPT_HOLD_DAYS.get(str(row.get("rule_id")), ALERT_DAYS)
-
-
-def _cleared(ledger: Ledger) -> set[tuple[str, str]]:
-    return {_alert_key(r) for r in ledger.read_jsonl(COACHING_CLEARED_LOG)}
-
-
 def _recent_alerts(ledger: Ledger, day: str) -> list[dict]:
     """Alerts of the last ALERT_DAYS days plus every alert still holding; 'hold' marks the latter."""
-    days = {_shift(day, -k) for k in range(ALERT_DAYS)}
-    cleared = _cleared(ledger)
-    out = []
-    for r in ledger.read_jsonl(ALERTS_LOG):
-        hold = _holds(r, day, cleared)
-        if hold or str(r.get("date")) in days:
-            out.append({"level": r.get("level"), "rule_id": r.get("rule_id"), "date": r.get("date"), "hold": hold})
-    return out
+    return [{"level": r.get("level"), "rule_id": r.get("rule_id"), "date": r.get("date"), "hold": r["hold"]}
+            for r in holds.recent_alerts(ledger, day)]
 
 
 def coaching_holds(ledger: Ledger, day: str) -> list[dict]:
@@ -691,13 +684,15 @@ def clear_coaching_hold(ctx: Context) -> int:
     return len(held)
 
 
-def _modulation(plan: Mapping | None, now: datetime, snap: Mapping, fresh: Mapping, alerts: Sequence[Mapping]) -> dict | None:
+def _modulation(plan: Mapping | None, now: datetime, snap: Mapping, fresh: Mapping, alerts: Sequence[Mapping],
+                days_off: int = 0, rules: guardrails.Rules | None = None) -> dict | None:
+    """plans.modulate_day for today; days_off >= rules.return_after_days_off caps the return session."""
     if plan is None:
         return None
     band = (snap.get("readiness") or {}).get("band")
     red = any(a.get("hold") for a in alerts)
     stale = any(fresh.get(k, {}).get("stale", True) for k in STALE_BLOCKING)
-    return plans.modulate_day(plan, now.weekday(), band, red, stale)
+    return plans.modulate_day(plan, now.weekday(), band, red, stale, days_off=days_off, rules=rules)
 
 
 def _inbox(ledger: Ledger, bot: str) -> list[dict]:
@@ -722,17 +717,20 @@ def _today_de(now: datetime) -> str:
     return f"{now.date().isoformat()}, {plans.WEEKDAYS_DE[now.weekday()]}, {now:%H:%M}"
 
 
-def _coach_context(ctx: Context, bot: str, task: str, now: datetime) -> dict:
+def _coach_context(ctx: Context, bot: str, task: str, now: datetime, owner_text: str | None = None) -> dict:
     day = now.date().isoformat()
     snap = _today_snapshot(ctx, day)
     fresh = metrics.freshness(ctx.store.latest_ts(), now, weekly.FRESHNESS_H)
     alerts = _recent_alerts(ctx.ledger, day)
     plan = _plan_or_none(ctx.ledger)
+    rules = _rules(ctx.ledger)
+    days_off = _days_off(ctx.store, day, rules.return_after_days_off)
     return {
         "task": task, "today": _today_de(now), "plan_current": plan,
-        "modulation": _modulation(plan, now, snap, fresh, alerts), "daily": snap, "freshness": fresh,
-        "alerts": alerts, "inbox": _inbox(ctx.ledger, bot), "checkins_7d": _checkins_7d(ctx.store, day),
-        "ed_watch": _ed_watch(ctx.ledger),
+        "modulation": _modulation(plan, now, snap, fresh, alerts, days_off, rules), "daily": snap,
+        "freshness": fresh, "alerts": alerts, "inbox": _inbox(ctx.ledger, bot),
+        "checkins_7d": _checkins_7d(ctx.store, day),
+        "ed_watch": _ed_watch_active(ctx, day, (owner_text,) if owner_text else ()),
     }
 
 
@@ -791,8 +789,7 @@ def _checkin_alerts_now(ctx: Context, day: str) -> int:
 
 
 def _urgent_symptoms(text: str) -> list[str]:
-    norm = guardrails.normalize_name(text)
-    return [s for s, patterns in _URGENT_RES.items() if any(rx.search(norm) for rx in patterns)]
+    return guardrails.urgent_symptoms(text)
 
 
 def _self_harm_alert(text: str, day: str, ts: str) -> Alert | None:
@@ -827,12 +824,22 @@ def _short_circuit(ctx: Context, text: str, now: datetime) -> dict | None:
     return _code_reply(ctx, harm, (), now) if harm else None
 
 
+def _held_reply(ctx: Context, text: str, now: datetime) -> dict | None:
+    """During an urgent coaching hold: no LLM call, the fixed HOLD_DE reply, the message kept as a note."""
+    if not coaching_holds(ctx.ledger, now.date().isoformat()):
+        return None
+    stored = _store_chat_checkin(ctx, {checkins.NOTE_ITEM: text[:checkins.NOTE_MAX]}, now)
+    if stored:
+        _checkin_alerts_now(ctx, now.date().isoformat())
+    return {"reply_de": HOLD_DE, "checkin_stored": stored}
+
+
 def _message_run_id(to: str, now: datetime) -> str:
     return f"r-msg-{now:%Y%m%dT%H%M%S}-{to}"
 
 
 def _coach_reply(ctx: Context, bot: str, text: str, now: datetime) -> tuple[str, int]:
-    context = _coach_context(ctx, bot, "reply", now)
+    context = _coach_context(ctx, bot, "reply", now, owner_text=text)
     untrusted = {"owner_message": text}
     if bot == "vagus":
         untrusted["checkin_notes"] = _recent_notes(ctx.store, now.date().isoformat())
@@ -859,12 +866,20 @@ def _apply_goal_talk(ctx: Context, out: Mapping[str, Any], resp: agents.LLMRespo
         _goal_update(ctx, update.strip(), resp, now)
 
 
+def _goal_guard(ctx: Context, day: str, text: str) -> Mapping | None:
+    """The latest packet's guard context, with ed_watch also set by today's check-in data and message."""
+    guard = _latest_packet(ctx.ledger)[1].get("guard_context")
+    if not _ed_watch_now(ctx, day, (text,)):
+        return guard
+    return {**(guard if isinstance(guard, Mapping) else {}), "ed_watch": True}
+
+
 def _cerebellum_reply(ctx: Context, _bot: str, text: str, now: datetime) -> tuple[str, int]:
     goals = ctx.ledger.read_text("config/goals.md") if ctx.ledger.exists("config/goals.md") else ""
     context = {
         "task": "goal_talk", "week": _iso_week(now.date()), "goals_md": goals,
         "plan_current": _plan_or_none(ctx.ledger),
-        "review": {"guard_context": _latest_packet(ctx.ledger)[1].get("guard_context")}, "known_refs": [],
+        "review": {"guard_context": _goal_guard(ctx, now.date().isoformat(), text)}, "known_refs": [],
     }
     out, resp = _ask(ctx, "cerebellum", context, GOAL_TALK_SCHEMA, _message_run_id("cerebellum", now),
                      {"owner_message": text})
@@ -902,13 +917,14 @@ def handle_owner_message(ctx: Context, to: str, text: str) -> tuple[int, dict]:
     """POST /message: to in OWNER_TARGETS; reply {'reply_de', 'checkin_stored'}.
 
     Urgent symptom keywords and self-harm language short-circuit to the fixed
-    template (112, Telefonseelsorge) without an LLM call.
+    template (112, Telefonseelsorge) without an LLM call. While an urgent alert
+    holds coaching, every message gets HOLD_DE, also without an LLM call.
     """
     problem = _message_problem(to, text)
     if problem:
         return 400, {"error": problem}
     now = _local_now(ctx)
-    fixed = _short_circuit(ctx, text, now)
+    fixed = _short_circuit(ctx, text, now) or _held_reply(ctx, text, now)
     status, body = (200, fixed) if fixed else _routed(ctx, to, text, now)
     _commit_pending(ctx, to, _message_run_id(to, now))
     return status, body
@@ -1003,18 +1019,45 @@ def _scout_job(scout: str) -> Callable[[Context, str], JobResult]:
     return run
 
 
+def _daily_rel(day: str) -> str:
+    return f"data/daily/{day[:4]}/{day}.json"
+
+
+def _snapshot_rows(rows: Sequence[Any]) -> dict:
+    return {r.key: {k: v for k, v in asdict(r).items() if k not in ("date", "key")} for r in rows}
+
+
+def _refresh_snapshots(ctx: Context, day: str) -> list[str]:
+    """Rewrite the existing snapshots of the SNAPSHOT_REFRESH_DAYS days before day whose stored rows
+    changed since, such as load rows a late session RPE rebuilt."""
+    written = []
+    for d in (_shift(day, -k) for k in range(SNAPSHOT_REFRESH_DAYS, 0, -1)):
+        old = ctx.ledger.read_json(_daily_rel(d))
+        if not isinstance(old, Mapping) or not isinstance(old.get("rows"), Mapping):
+            continue
+        stored = [r for key in metrics.DAILY_KEYS for r in ctx.store.daily(key, d, _shift(d, 1))]
+        rows = {**old["rows"], **_snapshot_rows(stored)}
+        if rows != old["rows"]:
+            ctx.ledger.write_json(_daily_rel(d), {"date": d, "rows": rows}, author=WRITER)
+            written.append(_daily_rel(d))
+    return written
+
+
 def _job_finalize_day(ctx: Context, period: str) -> JobResult:
-    """At 06:30: yesterday's daily rows, the week's baselines (with readiness) and conflicts, belief views."""
+    """At 06:30: yesterday's daily rows, the week's baselines (with readiness) and conflicts, belief views.
+
+    Snapshots of the days before are refreshed too, since finalize_day rebuilds their load rows.
+    """
     day = _shift(period, -1)
     week = _iso_week(Date.fromisoformat(day))
     rows = metrics.finalize_day(ctx.store, day, ctx.metrics_cfg)
-    paths = (f"data/daily/{day[:4]}/{day}.json", f"data/baselines/{week}.json", f"data/conflicts/{week}.json")
-    daily = {r.key: {k: v for k, v in asdict(r).items() if k not in ("date", "key")} for r in rows}
-    ctx.ledger.write_json(paths[0], {"date": day, "rows": daily}, author=WRITER)
+    paths = (_daily_rel(day), f"data/baselines/{week}.json", f"data/conflicts/{week}.json")
+    ctx.ledger.write_json(paths[0], {"date": day, "rows": _snapshot_rows(rows)}, author=WRITER)
     ctx.ledger.write_json(paths[1], metrics.baselines(ctx.store, day, ctx.metrics_cfg), author=WRITER)
     ctx.ledger.write_json(paths[2], insula.weekly_reconciliation(ctx.store, week, ctx.metrics_cfg), author=WRITER)
+    refreshed = _refresh_snapshots(ctx, day)
     views = beliefs.rebuild_views(ctx.ledger, day)
-    return JobResult("ok", (*paths, *views), f"finalized {day}")
+    return JobResult("ok", (*paths, *refreshed, *views), f"finalized {day}")
 
 
 def _coach_job(name: str, bot: str, task: str) -> Callable[[Context, str], JobResult]:
@@ -1083,7 +1126,7 @@ def _job_weekly_review(ctx: Context, period: str) -> JobResult:
         period, packet, **_llm_args(ctx), ledger=ctx.ledger, guard_ctx=weekly.guard_context_from_packet(packet),
         rules=guardrails.load_rules(ctx.ledger), now=now,
     )
-    status = "deferred" if outcome.aborted in ("budget", "provider") else "ok"
+    status = outcome.job_status  # 'failed' without a plan: a setup error must not read as a healthy run
     message = f"ruling {outcome.ruling}" + (f", aborted {outcome.aborted}" if outcome.aborted else "")
     return JobResult(status, (f"reviews/{period}/packet.json", *outcome.messages), message, {"Kind": "ruling"})
 

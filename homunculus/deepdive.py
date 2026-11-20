@@ -14,7 +14,8 @@ source text. Code does the rest:
   lexicon's prior verdict. A link whose strongest contradiction is at least
   as strong is contested (certainty 0). A supporting item is human support
   only when it is scored, reaches ``LINK_MIN`` and has a human primary
-  design (not animal, in vitro or review).
+  design (not animal, in vitro or review; the ledger design when ``designs``
+  gives one).
 * ``decide`` ignores the paper under review as evidence for its own chain.
 * ``chain_support`` is the weakest link plus coverage, the share of links
   with human support. The chain holds at weakest >= ``LINK_MIN``, coverage
@@ -168,21 +169,24 @@ def void_unquoted(dive: Mapping[str, Any], source_text: str) -> tuple[dict, list
 # --- link and chain support ---------------------------------------------------
 
 
-def _item_certainty(item: Mapping[str, Any], known: Mapping[str, float]) -> float:
-    if item["paper"] in known:
-        return float(known[item["paper"]])
-    return min(evidence.BASE_CERTAINTY[item["design"]], UNSCORED_MAX)
+def _item_certainty(paper: str, design: str, known: Mapping[str, float]) -> float:
+    if paper in known:
+        return float(known[paper])
+    return min(evidence.BASE_CERTAINTY[design], UNSCORED_MAX)
 
 
-def _scored_item(item: Mapping[str, Any], known: Mapping[str, float]) -> dict:
-    certainty = _item_certainty(item, known)
-    human = item["paper"] in known and certainty >= LINK_MIN and item["design"] not in NOT_HUMAN_PRIMARY
-    return {"paper": item["paper"], "design": item["design"], "relation": item["relation"],
+def _scored_item(item: Mapping[str, Any], known: Mapping[str, float], designs: Mapping[str, str]) -> dict:
+    """The ledger design of a scored paper, when given, overrides the design Thalamus extracted."""
+    design = designs.get(item["paper"]) or item["design"]
+    certainty = _item_certainty(item["paper"], design, known)
+    human = item["paper"] in known and certainty >= LINK_MIN and design not in NOT_HUMAN_PRIMARY
+    return {"paper": item["paper"], "design": design, "relation": item["relation"],
             "certainty": certainty, "human": human}
 
 
-def _scored(items: Sequence[Mapping[str, Any]], known: Mapping[str, float], retracted: Collection[str]) -> list[dict]:
-    return [_scored_item(e, known) for e in items if e["paper"] not in retracted]
+def _scored(items: Sequence[Mapping[str, Any]], known: Mapping[str, float], retracted: Collection[str],
+            designs: Mapping[str, str]) -> list[dict]:
+    return [_scored_item(e, known, designs) for e in items if e["paper"] not in retracted]
 
 
 def _strongest(items: Sequence[Mapping[str, Any]], relation: str, prior: float) -> float:
@@ -190,9 +194,15 @@ def _strongest(items: Sequence[Mapping[str, Any]], relation: str, prior: float) 
 
 
 def assess_link(link: Mapping[str, Any], known: Mapping[str, float] | None = None,
-                prior: lexicon.LinkVerdict | None = None, retracted: Collection[str] = ()) -> dict:
-    """Certainty, human support and contest state of one link, merged with the lexicon prior."""
-    items = _scored(link["evidence"], known or {}, retracted)
+                prior: lexicon.LinkVerdict | None = None, retracted: Collection[str] = (), *,
+                designs: Mapping[str, str] | None = None) -> dict:
+    """Certainty, human support and contest state of one link, merged with the lexicon prior.
+
+    designs maps dedupe keys of scored ledger papers to their ledger design; it
+    decides human support where given, so a scored animal paper that Thalamus
+    labels rct does not count as human.
+    """
+    items = _scored(link["evidence"], known or {}, retracted, designs or {})
     base = prior or lexicon.LinkVerdict(0.0, 0.0, False, "open", ())
     support = _strongest(items, "supports", base.support)
     contra = _strongest(items, "contradicts", base.contra)
@@ -291,19 +301,22 @@ def decide(
     known: Mapping[str, float] | None = None,
     view: Mapping[str, Any] | None = None,
     tracker_keys: Collection[str] = metrics.DAILY_KEYS,
+    designs: Mapping[str, str] | None = None,
 ) -> dict:
     """The deep-dive record: per-link certainty, chain support, decision and open questions.
 
-    known maps dedupe keys of scored ledger papers to their certainty; view
-    is the lexicon view (prior verdicts, retracted papers). Raises DiveError
-    for an invalid dive, so the caller can re-ask Thalamus once.
+    known maps dedupe keys of scored ledger papers to their certainty and
+    designs (optional) to their ledger design; view is the lexicon view
+    (prior verdicts, retracted papers). Raises DiveError for an invalid dive,
+    so the caller can re-ask Thalamus once.
     """
     problems = validate(dive)
     if problems:
         raise DiveError(problems)
     clean, dropped = void_unquoted(dive, source_text)
     ignored = {*((view or {}).get("retracted") or ()), paper_key}  # retracted papers and the paper itself
-    assessed = [assess_link(link, known, lexicon.lookup(view, *_ends(link)), ignored) for link in clean["links"]]
+    assessed = [assess_link(link, known, lexicon.lookup(view, *_ends(link)), ignored, designs=designs)
+                for link in clean["links"]]
     chain = chain_support(assessed)
     risk = risk_problems(clean["claim"], rules)
     reasons = _reasons(assessed, chain, risk, measurable(clean["claim"], tracker_keys))

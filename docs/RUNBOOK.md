@@ -20,6 +20,14 @@ git clone git@github.com:<you>/homunculus-ledger-<you>.git ~/homunculus-ledger
 
 Give the box a deploy key with write access to the ledger repo only. The box is the only machine that pushes the ledger on this path.
 
+Turn on the leak-guard hooks in the engine clone, once per clone:
+
+```sh
+git -C ~/homunculus config core.hooksPath .githooks
+```
+
+`pre-commit` scans the staged blobs and `pre-push` scans every commit the remote does not have yet (`tools/leak_guard.py`), so health data or a secret cannot reach the public engine repo from this machine. Do the same in every other clone of the engine you commit from.
+
 Secrets go into one env file outside every git tree, readable by `homunculus` only:
 
 ```sh
@@ -34,10 +42,17 @@ HOMUNCULUS_LEDGER=/Users/homunculus/homunculus-ledger
 HEALTH_TOKEN=
 ANTHROPIC_API_KEY=
 HOMUNCULUS_OWNER_LOGIN=
+HEALTH_OWNER_HOST=
 HOMUNCULUS_MAILTO=
+HOMUNCULUS_PUSH_URL=
+HOMUNCULUS_PUSH_TOKEN=
 ```
 
-`HOMUNCULUS_OWNER_LOGIN` is your Tailscale login; the dashboard compares it with the header `tailscale serve` adds. Tracker tokens (Garmin, WHOOP and the rest) go to the Keychain or `$HOMUNCULUS_SECRETS`, never into this file's directory tree in git ([TRACKER_CONTRACT.md](TRACKER_CONTRACT.md)).
+`HOMUNCULUS_OWNER_LOGIN` is your Tailscale login; the dashboard compares it with the header `tailscale serve` adds. `HEALTH_OWNER_HOST` is the box's tailnet name (`<box>.<tailnet>.ts.net`); left empty, any `*.ts.net` host counts.
+
+`HOMUNCULUS_PUSH_URL` and `HOMUNCULUS_PUSH_TOKEN` are the phone channel, and path (b) requires both. Pineal POSTs every owner text it sends (red flags, budget and failed-job notices, plan ratifications, and the coach messages when the box runs them) to the URL with the token as `Authorization: Bearer`, then keeps the copy in `mail/owner/inbox/`. Without the URL the texts land in that folder only and nothing rings on the phone; `tick --devin-path b` runs its jobs but exits 1, and `serve` and `doctor` warn about it. The URL must be `https://`. An ntfy topic works: create a topic with a long random name on a self-hosted ntfy server or on ntfy.sh, protect it with an access token (on ntfy.sh that needs an account; which plan allows it is UNVERIFIED), subscribe to it in the ntfy app, and put the token into `HOMUNCULUS_PUSH_TOKEN`. Without a token anyone who knows the topic name can read the alerts, and `doctor` warns. Urgent alerts go out at ntfy priority `urgent`, same-day alerts at `high`. When a push fails, Pineal does not mark the alert as delivered and retries on the next tick. The texts leave the box for the push server, so prefer a server you run.
+
+Tracker tokens (Garmin, WHOOP and the rest) go to the Keychain or `$HOMUNCULUS_SECRETS`, never into this file's directory tree in git ([TRACKER_CONTRACT.md](TRACKER_CONTRACT.md)). Both stores encrypt at rest: the Keychain itself, the 0600 files through FileVault or LUKS. Neither isolates the tokens from other processes of the same user, so the separate `homunculus` user is the only boundary.
 
 One wrapper loads the env file for every service, `~/.local/bin/homunculus-run`, mode 700:
 
@@ -55,7 +70,7 @@ Check the setup:
 ~/.local/bin/homunculus-run doctor
 ```
 
-`doctor` fails on a short token, a non-loopback bind host, a missing git repo or a bad roster, and warns on stale data and budget.
+`doctor` fails on a short token, a non-loopback bind host, a missing git repo, a bad roster, a missing first plan or a push URL that is not `https://`, and warns on stale data, budget and a missing push URL or push token.
 
 ## 3. Services
 
@@ -155,7 +170,9 @@ tailscale serve --bg 8787
 tailscale serve status
 ```
 
-The flag syntax changed between Tailscale releases; check `tailscale serve --help` on your version (UNVERIFIED for older ones). Open `https://<box>.<tailnet>.ts.net/site/` on the phone. Never run `tailscale funnel`: it puts the page and the ingest route on the public internet.
+The flag syntax changed between Tailscale releases; check `tailscale serve --help` on your version (UNVERIFIED for older ones).
+
+The login check keeps out other tailnet devices, not local processes. `tailscale serve` also connects from 127.0.0.1, so any process on the box can send `Tailscale-User-Login` and a `*.ts.net` Host to port 8787 and pass as you. Run nothing on the box that you would not let post check-ins and owner messages, and keep every service under the `homunculus` user. Open `https://<box>.<tailnet>.ts.net/site/` on the phone. Never run `tailscale funnel`: it puts the page and the ingest route on the public internet.
 
 The Devin App option for the dashboard is in [devin/app/README.md](../devin/app/README.md).
 
@@ -185,7 +202,7 @@ With an Outpost, the Bots' sessions run their commands on the box: the same chec
 3. In each Automation from `devin/automations/b/`, choose the Outpost as the machine (`runs_on: outpost`).
 4. Start Pineal with `tick --devin-path b`.
 
-Each session can read what the `homunculus` user can read, and whatever a session reads reaches Devin's cloud model. The Bot instructions keep sessions on the commands; data-control opt-out must be on. On this path the Devin GitHub app needs no write access to the ledger, because the box pushes.
+Each session can read what the `homunculus` user can read, and whatever a session reads reaches Devin's cloud model. That includes the env file and the tracker tokens, because neither the Keychain nor the 0600 files separate processes of one user. The Bot instructions keep sessions on the commands; data-control opt-out must be on. On this path the Devin GitHub app needs no write access to the ledger, because the box pushes.
 
 ## 7. Backups
 
@@ -208,5 +225,7 @@ Restore: clone the ledger, copy the newest SQLite backup to `.private/health.sql
 - `homunculus-run doctor`: one-line status per check.
 - `homunculus-run pending`, `approve <id>`, `veto <id>`, `rollback <version>`: plan changes.
 - `homunculus-run halt` stops everything except ingest and red flags; `resume` undoes it.
+- An urgent red flag pauses coaching until you clear it. `homunculus-run coaching show` lists the holds; after a doctor has seen you, `coaching clear` lifts all of them, `coaching clear <rule_id>` one rule's.
+- A fresh ledger needs a first plan before anything coaches or reviews: `homunculus-run init-plan` (starter plan, or `--from FILE`). `doctor` fails on `plan` until it exists.
 - A failed job leaves `ops/incidents/<id>.json` (frames only, no locals). With `HOMUNCULUS_REPAIR_URL` and `HOMUNCULUS_REPAIR_SECRET` set, Pineal posts the scrubbed incident to a Devin repair Automation on the engine repo.
 - Stale data (HRV or sleep older than 36 h, workouts older than 72 h) shows on the dashboard and in the coaches' messages. Check the phone's Health Auto Export log first.

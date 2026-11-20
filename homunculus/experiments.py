@@ -417,6 +417,18 @@ def _pair_days(p: Protocol, allocation: Sequence[tuple[str, str]], data: Mapping
     return [g for g in complete if {lab for _, lab, _ in g} == {"A", "B"}]
 
 
+def pending_days(p: Protocol, allocation: Sequence[tuple[str, str]], stored: set[str], extended: bool) -> list[str]:
+    """Arm days of the pairs a new analysis adds that have no stored daily row yet.
+
+    Extended: every day of the extension pairs. Otherwise: the days of the last pair,
+    so a run on the morning after the allocation does not miss a day still being ingested.
+    """
+    period = _period_days(p)
+    first_pair = p.pairs if extended else p.pairs - 1
+    return [day for idx, (day, label) in enumerate(allocation)
+            if idx // period >= first_pair and label != "washout" and day not in stored]
+
+
 def _arm_means(days: Sequence[_Day]) -> dict[str, float]:
     return {arm: stats.mean([v for _, lab, v in days if lab == arm]) for arm in ("A", "B")}
 

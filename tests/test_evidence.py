@@ -607,6 +607,26 @@ class RubricCasesTest(unittest.TestCase):
         self.check(doc_run(p), (), 4.0, "actionable")
 
 
+class SwcPaperUnitsTest(unittest.TestCase):
+    OWNER = E.OwnerProfile(sex=None, age=None, training_status=None, conditions=(), swc={"y": 1.5})
+
+    def test_md_keeps_the_raw_swc(self) -> None:
+        self.assertEqual(E.swc_paper_units(doc_paper("rct_parallel", ("MD", 2.0, 1.0, 3.0)), self.OWNER), 1.5)
+
+    def test_smd_divides_by_sd_pop(self) -> None:
+        p = doc_paper("rct_parallel", effect__sd_pop=3.0)
+        self.assertEqual(E.swc_paper_units(p, self.OWNER), 0.5)
+
+    def test_smd_without_positive_sd_pop_is_unknown(self) -> None:
+        self.assertIsNone(E.swc_paper_units(doc_paper("rct_parallel"), self.OWNER))
+        self.assertIsNone(E.swc_paper_units(doc_paper("rct_parallel", effect__sd_pop=0.0), self.OWNER))
+
+    def test_rr_unknown_type_and_unknown_outcome_are_none(self) -> None:
+        self.assertIsNone(E.swc_paper_units(doc_paper("rct_parallel", ("RR", 0.8, 0.7, 0.9)), self.OWNER))
+        self.assertIsNone(E.swc_paper_units(doc_paper("rct_parallel", (None, 0.5, 0.3, 0.7)), self.OWNER))
+        self.assertIsNone(E.swc_paper_units(doc_paper("rct_parallel", ("MD", 2.0, 1.0, 3.0)), DOC_OWNER))
+
+
 class ToPriorTest(unittest.TestCase):
     SE = 2.0 / 3.92  # MD 2.0 [1, 3]; z = 3.92 -> 0.75
 

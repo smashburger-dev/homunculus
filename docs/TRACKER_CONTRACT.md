@@ -176,12 +176,16 @@ class FileTokenStore:
 
 class KeychainTokenStore:
     def __init__(self, service: str = 'homunculus.trackers', runner: Callable = subprocess.run) -> None
-    # macOS 'security add-generic-password -U -s <service> -a <name> -w <json>' / find-generic-password -w
+    # save: 'add-generic-password -U -s <service> -a <name> -w <json>' sent to 'security -i' on stdin, so the
+    #   token never appears in argv; a line above 4096 bytes raises TrackerError (use FileTokenStore)
+    # load: 'security find-generic-password -s <service> -a <name> -w'; exit 44 means no item
 
 def default_token_store() -> TokenStore   # Keychain on darwin when 'security' exists, else FileTokenStore
 ```
 
 Google and WHOOP require encryption at rest. Keychain covers tokens; FileVault covers SQLite. `tracker status` prints a warning when `fdesetup status` does not say FileVault is on (darwin only; skipped elsewhere).
+
+Both stores give encryption at rest, not isolation. The Keychain item is created through `security`, so any process running as the same user can read it with the same `security find-generic-password -w` call while the keychain is unlocked. The 0600 files are readable by the same user. The boundary is the dedicated `homunculus` user ([RUNBOOK.md](RUNBOOK.md#1-prepare-the-machine)): run nothing else under it.
 
 ### OAuth2 helpers
 
@@ -385,6 +389,10 @@ No command prints a token, key or code. `--json` output is stable and documented
 | `spo2_min` | watch, garmin, google, withings, polar | no | readings and spot tests only, never nightly means |
 | `load_srpe`, `load_edwards` | watch, garmin, polar, google, whoop, withings | no | one source per day; WHOOP and Withings lack HR series, so Edwards TRIMP is `None` on their days |
 | `bp_sys`, `bp_dia` | withings, watch, phone | no | cuff readings |
+
+Adapters write nights and segments, never the sleep keys themselves; `metrics.py` derives them from the canonical night. `sleep_mid_min` is clock minutes after local midnight and is averaged circularly. `sleep_start_min` is signed minutes from local midnight (23:30 is −30, 00:30 is 30, clock times from 18:00 on count as before midnight), so plain means and SDs work across midnight.
+
+Two rules in `metrics.py` change which stored rows a baseline uses. `illness_days` marks every date with a ticked `symptom:` check-in plus the 3 days after it, and the HRV baseline and the TST, midpoint-SD and wellness z-score baselines leave those dates out. `finalize_day` also rebuilds the `load_srpe` and `load_edwards` rows of the 2 stored days before, because a session RPE may arrive up to 2 days after the workout.
 
 ## Vendor scores
 

@@ -53,6 +53,9 @@ DEFAULT_FORBIDDEN: Mapping[str, tuple[str, ...]] = MappingProxyType({
         "prescription drug", "verschreibungspflichtig", "rezeptpflichtig", "metformin",
         "semaglutide", "semaglutid", "tirzepatide", "tirzepatid", "beta blocker", "betablocker",
         "ozempic", "wegovy", "rybelsus", "mounjaro", "zepbound", "saxenda", "liraglutid",
+        "trulicity", "victoza", "dulaglutid", "retatrutid", "glp 1", "abnehmspritze", "fettwegspritze",
+        "insulin", "propranolol", "bisoprolol", "metoprolol", "levothyroxin", "l thyroxin", "thyroxin",
+        "liothyronin", "euthyrox", "cytomel", "t3 tabletten", "schilddrusenhormon",
     ),
     "wada_prohibited": (
         "anabolic steroid", "anabole steroide", "anabolika", "testosterone", "testosteron",
@@ -61,11 +64,14 @@ DEFAULT_FORBIDDEN: Mapping[str, tuple[str, ...]] = MappingProxyType({
         "growth hormone", "wachstumshormon", "hgh", "dmaa", "ephedrine", "ephedrin",
         "meldonium", "higenamine", "higenamin", "dnp",
         "clen", "anavar", "oxandrolon", "winstrol", "dianabol", "deca durabolin",
+        "ostarin", "cardarin", "anabolikum", "steroid", "sustanon", "testogel", "testo gel", "testokur",
+        "testo kur", "nebido", "primobolan", "turinabol", "somatropin", "hcg", "tamoxifen", "clomifen",
+        "ephedra",
     ),
     "dehydration_cut": (
         "water cut", "dehydration cut", "wasserentzug", "entwassern", "entwasserung",
         "diuretic", "diuretika", "diuretikum", "furosemid", "lasix", "torasemid", "hydrochlorothiazid",
-        "wassertablette", "saunaanzug", "sauna suit", "schwitzanzug",
+        "wassertablette", "saunaanzug", "sauna suit", "schwitzanzug", "spironolacton",
     ),
     "altitude_protocol": (
         "altitude tent", "hypoxic tent", "hypoxiezelt", "hohenzelt", "intermittent hypoxia",
@@ -196,17 +202,28 @@ def _starts_word(haystack: str, needle: str) -> bool:
 
 
 PREFIX_MIN_LEN = 5  # shorter terms ('epo', 'hgh') match whole words only, so 'Epoche' stays clean
+INFIX_MIN_LEN = 8  # long drug names also match inside compounds: Hochdosistestosteron
+_WHOLE_WORD_TERMS = frozenset({"insulin"})  # 'Insulinspiegel' is diet talk, 'Insulin' the drug
+_UMLAUT_PAIRS_RE = re.compile(r"(?<=[aou])e")
+
+
+def _fold_umlauts(text: str) -> str:
+    """'entwaesserung' and 'entwässerung' compare equal after normalize_name."""
+    return _UMLAUT_PAIRS_RE.sub("", text)
 
 
 def _term_hit(text: str, term: str) -> bool:
-    return _starts_word(text, term) if len(term) >= PREFIX_MIN_LEN else _has_phrase(text, term)
+    if len(term) < PREFIX_MIN_LEN or term in _WHOLE_WORD_TERMS:
+        return _has_phrase(text, term)
+    return term in text if len(term) >= INFIX_MIN_LEN else _starts_word(text, term)
 
 
 def forbidden_match(name: str, rules: Rules) -> str | None:
-    """Category of the first forbidden term in name: a word start for long terms, a whole word for short ones."""
-    text = normalize_name(name)
+    """Category of the first forbidden term in name: inside compounds for long terms, a word start for
+    mid-length ones, a whole word for short ones. ae/oe/ue fold to a/o/u on both sides."""
+    text = _fold_umlauts(normalize_name(name))
     for category, terms in rules.forbidden.items():
-        if any(_term_hit(text, normalize_name(t)) for t in terms):
+        if any(_term_hit(text, _fold_umlauts(normalize_name(t))) for t in terms):
             return category
     return None
 
@@ -512,15 +529,18 @@ def _no_riskier(feats: Mapping, old: Mapping) -> bool:
     return _contraction_risk(feats, unknown=99) <= _contraction_risk(old, unknown=-1)
 
 
-def _is_swap(session: Mapping, feats: Mapping, removed: set[tuple[str, str]], ctx: GuardContext) -> bool:
+def _swap_source(
+    session: Mapping, feats: Mapping, removed: Mapping[tuple[str, str], Mapping], ctx: GuardContext,
+) -> Mapping | None:
+    """The removed entry of the same session and pattern that the added exercise replaces, if no riskier."""
     pattern = normalize_name(str(feats.get("pattern", "")))
-    for sid, eid in removed:
+    for (sid, eid), old_ex in removed.items():
         old = _features(ctx, eid)
         if sid != str(session["id"]) or not old or normalize_name(str(old.get("pattern", ""))) != pattern:
             continue
         if _no_riskier(feats, old):
-            return True
-    return False
+            return old_ex
+    return None
 
 
 def _known(plan: Mapping, ctx: GuardContext) -> set[str]:
@@ -529,7 +549,8 @@ def _known(plan: Mapping, ctx: GuardContext) -> set[str]:
 
 
 def _added_exercise(
-    session: Mapping, ex: Mapping, removed: set[tuple[str, str]], ctx: GuardContext, known: set[str],
+    session: Mapping, ex: Mapping, removed: Mapping[tuple[str, str], Mapping], ctx: GuardContext, known: set[str],
+    rules: Rules,
 ) -> list[Finding]:
     eid = str(ex["exercise_id"])
     feats = _features(ctx, eid)
@@ -540,8 +561,10 @@ def _added_exercise(
         return [("reject", f"injury:{v}", f"{eid} verletzt {v}") for v in violations]
     if ex.get("novel") or eid not in known:  # code decides novelty; the LLM's flag can only add it
         return _novel_entry(session, ex, feats)
-    if _is_swap(session, feats, removed, ctx):
-        return [("notify", "swap_same_pattern", f"Tausch innerhalb des Musters: {eid}")]
+    old_ex = _swap_source(session, feats, removed, ctx)
+    if old_ex is not None:  # the swap carries the replaced entry's volume and reserve as its baseline
+        return [("notify", "swap_same_pattern", f"Tausch innerhalb des Musters: {eid}"),
+                *_progression_findings(old_ex, ex, rules)]
     return [("approve", "exercise_added", f"Übung {eid} hinzugefügt")]
 
 
@@ -635,16 +658,25 @@ def _pull_push_findings(cur: Mapping, new: Mapping, ctx: GuardContext, rules: Ru
     return [("reject", "pull_push", "Zug-zu-Druck-Verhältnis außerhalb 1:1 bis 2:1")]
 
 
+def _duplicate_findings(plan: Mapping) -> list[Finding]:
+    """Copies of one exercise in a session would multiply its volume past the per-entry checks."""
+    keys = [(str(s["id"]), str(ex["exercise_id"])) for s, ex in _exercises(plan)]
+    dupes = sorted({k for k in keys if keys.count(k) > 1})
+    return [("reject", "duplicate_exercise", f"{eid} doppelt in Einheit {sid}") for sid, eid in dupes]
+
+
 def _exercise_findings(cur: Mapping, new: Mapping, ctx: GuardContext, rules: Rules) -> list[Finding]:
     before, after = _keys(cur), _keys(new)
-    removed, known = before - after, _known(cur, ctx)
+    old_entries = {(str(s["id"]), str(ex["exercise_id"])): ex for s, ex in _exercises(cur)}
+    removed = {k: old_entries[k] for k in sorted(before - after)}
+    known = _known(cur, ctx)
     out: list[Finding] = []
     for session, ex in _exercises(new):
         if (str(session["id"]), str(ex["exercise_id"])) not in before:
-            out.extend(_added_exercise(session, ex, removed, ctx, known))
+            out.extend(_added_exercise(session, ex, removed, ctx, known, rules))
     return [
-        *out, *_kept_findings(cur, new, ctx, rules), *_novel_cap_findings(cur, new, rules, known),
-        *_pull_push_findings(cur, new, ctx, rules),
+        *out, *_duplicate_findings(new), *_kept_findings(cur, new, ctx, rules),
+        *_novel_cap_findings(cur, new, rules, known), *_pull_push_findings(cur, new, ctx, rules),
     ]
 
 
@@ -748,10 +780,19 @@ def _strings(value: Any) -> Iterator[str]:
             yield from _strings(v)
 
 
-_FAST_WORD_RE = re.compile(r"fasten|fasting|\bfast\b")
+_FAST_WORD_RE = re.compile(
+    r"fasten|fasting|\bfast\b|nulldiat|nulldiaet|nichts (?:zu )?essen|nichts gegessen|nur wasser|saftkur|water only"
+)
+# Fasts that span days by name, without a number: Fastenwoche, Heilfasten, tagelang
+_MULTIDAY_FAST_RE = re.compile(r"fastenwoche|fastenkur|fastentage|heilfasten|mehrtagig|mehrere tage|tagelang|wochenlang")
+_WEEKDAYS = ("montag", "dienstag", "mittwoch", "donnerstag", "freitag", "samstag", "sonntag")
+_WEEKDAY_SPAN_RE = re.compile(r"\b(" + "|".join(_WEEKDAYS) + r")\w* bis (?:\w+ )?(" + "|".join(_WEEKDAYS) + r")")
 _NUMBER_WORDS: Mapping[str, float] = MappingProxyType({
-    "ein": 1, "eine": 1, "einen": 1, "einer": 1, "zwei": 2, "drei": 3, "vier": 4, "funf": 5,
-    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "ein": 1, "eine": 1, "einen": 1, "einer": 1, "zwei": 2, "drei": 3, "vier": 4, "funf": 5, "fuenf": 5,
+    "sechs": 6, "sieben": 7, "acht": 8, "neun": 9, "zehn": 10, "elf": 11, "zwolf": 12, "zwoelf": 12,
+    "eineinhalb": 1.5, "anderthalb": 1.5,
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+    "ten": 10,
 })
 _DURATION_RE = re.compile(
     r"(?<![0-9a-z])(\d+(?:[.,]\d+)?|" + "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True)) + r")[\s-]*"
@@ -767,14 +808,25 @@ def _fold(text: str) -> str:
     return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
+def _span_hours(low: str) -> list[float]:
+    """'von Freitag bis Montag' -> 72 h; the same weekday twice is a full week."""
+    out = []
+    for a, b in _WEEKDAY_SPAN_RE.findall(low):
+        days = (_WEEKDAYS.index(b) - _WEEKDAYS.index(a)) % 7 or 7
+        out.append(days * 24.0)
+    return out
+
+
 def _fast_hours(text: str) -> list[float]:
     low = _fold(text)
     if not _FAST_WORD_RE.search(low):
         return []
-    hours = []
+    hours = _span_hours(low)
     for num, unit in _DURATION_RE.findall(low):
         value = _NUMBER_WORDS.get(num) or float(num.replace(",", "."))
         hours.append(value * next((h for prefix, h in _UNIT_HOURS if unit.startswith(prefix)), 1.0))
+    if not hours and _MULTIDAY_FAST_RE.search(low):
+        hours.append(float("inf"))
     return hours
 
 
@@ -914,20 +966,34 @@ _SELF_HARM_EXTRA_TERMS: tuple[str, ...] = (
     "end it all", "never wake up", "don t want to live",
 )
 # Word stems that also cover compounds and inflections: Suizidgedanken, suizidal, lebensmüde, ...
-_SELF_HARM_STEM_RE = re.compile(r"(?<![0-9a-z])(?:suizid|selbstmord|lebensmud|selbstverletz|suicid|self harm)")
-# Phrases that signal self-harm only when they close a clause: "Ich will nicht mehr."
-_CLAUSE_END_TERMS: tuple[str, ...] = ("will nicht mehr",)
+_SELF_HARM_STEM_RE = re.compile(
+    r"(?<![0-9a-z])(?:suizid|selbstmord|lebensmud|selbstverletz|suicid|self harm|todeswunsch|todessehnsucht)"
+)
+_GAP = r"(?: \S+){0,4} "  # up to four words in between
+_MODAL = r"(?:will|wollte|mochte|moechte|wurde gern|wuerde gern|ware lieber|waere lieber|lieber|am liebsten)"
+_DEATH = r"(?:sterben|tot|umbringen|nicht mehr leben|(?:mein )?leben beenden)"
+# Patterns on one normalized clause; they tolerate filler words and the infinitive 'zu'.
+_SELF_HARM_CLAUSE_RES: tuple[re.Pattern[str], ...] = tuple(re.compile(p) for p in (
+    rf"\b{_MODAL}{_GAP}(?:zu )?{_DEATH}\b",
+    r"\b(?:mir|sich|mein|dein) (?:das |mein )?leben (?:zu )?(?:nehmen|beenden)\b",
+    r"\bbringe? mich(?: \S+){0,2} um\b",
+    r"\bmich (?:selbst|selber|absichtlich) (?:zu )?verletz",
+    r"\bverletze mich (?:selbst|selber|absichtlich)\b",
+    r"\bselbst (?:zu )?verletz",
+    r"\bwill(?: \S+){0,2} nicht mehr$",  # "Ich will (einfach) nicht mehr." closes the clause
+    r"\bkein\w* sinn mehr(?: (?:im|in meinem|zu) leben\b|$)",
+))
 _CLAUSE_SPLIT_RE = re.compile(r"[.,;:!?\n]+")
 
 
-def _clause_end_hit(text: str) -> bool:
-    clauses = (f" {normalize_name(c)}" for c in _CLAUSE_SPLIT_RE.split(text))
-    return any(c.endswith(f" {t}") for c in clauses for t in _CLAUSE_END_TERMS)
+def _clause_hit(text: str) -> bool:
+    clauses = (normalize_name(c) for c in _CLAUSE_SPLIT_RE.split(text))
+    return any(rx.search(c) for c in clauses for rx in _SELF_HARM_CLAUSE_RES)
 
 
 def _self_harm(text: str) -> bool:
     norm = normalize_name(text)
-    if _SELF_HARM_STEM_RE.search(norm) or _clause_end_hit(text):
+    if _SELF_HARM_STEM_RE.search(norm) or _clause_hit(text):
         return True
     return any(_has_phrase(norm, normalize_name(t)) for t in (*_SELF_HARM_TERMS, *_SELF_HARM_EXTRA_TERMS))
 
@@ -940,27 +1006,40 @@ URGENT_TERMS: Mapping[str, tuple[str, ...]] = MappingProxyType({
         "stechen in der brust", "sticht in der brust", "stiche in der brust", "ziehen in der brust",
         "brennen in der brust", "chest pain", "chest pressure", "chest tightness", "chest hurts",
         "chest is hurting", "pain in my chest", "pain in the chest", "tight chest",
+        "herzschmerz", "herzstech", "thoraxschmerz",
     ),
     "fainting": (
         "ohnmacht", "bewusstlos", "umgekippt", "umgefallen", "kollabiert", "kollaps", "zusammengebrochen",
-        "zusammengeklappt", "fainted", "fainting", "passed out", "blacked out", "collapsed",
+        "zusammengeklappt", "zusammengesackt", "zusammengesunken", "weggetreten", "schwarz vor augen",
+        "fainted", "fainting", "passed out", "blacked out", "collapsed",
     ),
     "short_breath": (
-        "atemnot", "luftnot", "keine luft", "kaum luft", "schwer luft", "kurzatmig", "kann nicht atmen",
-        "short of breath", "shortness of breath", "can t breathe", "cannot breathe", "breathless",
-        "can t catch my breath",
+        "atemnot", "luftnot", "keine luft", "kaum luft", "schwer luft", "schlecht luft", "kurzatmig",
+        "luft aus", "luft weg", "short of breath", "shortness of breath", "can t breathe", "cannot breathe",
+        "breathless", "can t catch my breath",
     ),
 })
+# Word-window patterns on normalized text: "die Brust tut weh", "mir tut die Brust weh", "konnte nicht richtig atmen"
+_URGENT_PATTERNS: Mapping[str, tuple[str, ...]] = MappingProxyType({
+    "chest_pain": (
+        r"brust\b(?: \S+){0,3} (?:weh\b|schmerz|druck\b|druckt\b|drueckt\b|enge?\b|stech|sticht\b|brennt\b)",
+        r"(?:tut|tat)(?: \S+){0,3} brust weh\b",
+    ),
+    "fainting": (),
+    "short_breath": (r"(?:kann|konnte|konnt)(?: \S+)? (?:nicht|kaum|schlecht)(?: \S+)? atmen\b", r"kaum atmen\b"),
+})
 _URGENT_RES: Mapping[str, re.Pattern[str]] = MappingProxyType({
-    symptom: re.compile(r"(?<![0-9a-z])(?:" + "|".join(re.escape(t) for t in terms) + ")")
+    symptom: re.compile(
+        r"(?<![0-9a-z])(?:" + "|".join([*(re.escape(t) for t in terms), *_URGENT_PATTERNS[symptom]]) + ")"
+    )
     for symptom, terms in URGENT_TERMS.items()
 })
 
 
 def urgent_symptoms(text: str) -> list[str]:
     """Urgent symptoms named in free text, in URGENT_TERMS order."""
-    norm = normalize_name(text or "")
-    return [s for s, rx in _URGENT_RES.items() if rx.search(norm)]
+    clauses = [normalize_name(c) for c in _CLAUSE_SPLIT_RE.split(text or "")]
+    return [s for s, rx in _URGENT_RES.items() if any(rx.search(c) for c in clauses)]
 
 
 def _shift(day: str, n: int) -> str:
@@ -1192,14 +1271,35 @@ BANNED_TERMS: tuple[str, ...] = (
     "angststorung", "magersucht", "essstorung", "ubertrainingssyndrom", "ermudungsbruch",
     "stressfraktur", "fraktur", "knochenbruch", "sehnenentzundung", "gehirnerschutterung",
     "amenorrho", "krebs",
+    "storung", "stoerung", "entzundung", "entzuendung", "ubertraining", "uebertraining", "overtrain", "red s",
 )
 
-_BANNED_RES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
-    (t, re.compile(r"(?<![a-z0-9])" + re.escape(t))) for t in BANNED_TERMS
-)
+# German stems that also match inside compounds (Atemwegsinfekt, Schlafstörung), with
+# word starts that make a compound harmless (Desinfektion, Zerstörung, the symptom Sehstörung).
+_INFIX_STEMS: Mapping[str, tuple[str, ...]] = MappingProxyType({
+    "infekt": ("des",), "erkrankung": (), "syndrom": (), "fraktur": (),
+    "entzundung": (), "entzuendung": (), "storung": ("zer", "seh"), "stoerung": ("zer", "seh"),
+    "ubertraining": (), "uebertraining": (),
+})
+_WHOLE_WORDS: frozenset[str] = frozenset({"red s"})  # RED-S; "red sox" is not
+
+
+def _banned_re(term: str) -> re.Pattern[str]:
+    if term in _INFIX_STEMS:
+        left = "".join(f"(?<!{re.escape(p)})" for p in _INFIX_STEMS[term])
+    else:
+        left = r"(?<![a-z0-9])"
+    right = r"(?![a-z0-9])" if term in _WHOLE_WORDS else ""
+    return re.compile(left + re.escape(term) + right)
+
+
+_BANNED_RES: tuple[tuple[str, re.Pattern[str]], ...] = tuple((t, _banned_re(t)) for t in BANNED_TERMS)
 
 
 def scan_text(text: str) -> list[str]:
-    """BANNED_TERMS entries that start a word in text (case, diacritics and punctuation ignored)."""
+    """BANNED_TERMS entries found in text (case, diacritics and punctuation ignored).
+
+    Most terms must start a word; _INFIX_STEMS also match inside German compounds.
+    """
     norm = normalize_name(text or "")
     return [term for term, rx in _BANNED_RES if rx.search(norm)]

@@ -7,7 +7,7 @@
     "github.com"
   ],
   "path": "a",
-  "prompt": "homunculus automation vagus-evening, path a. You are the Vagus Bot.\n\nRun in order, in the engine checkout:\n    git -C \"$HOMUNCULUS_LEDGER\" pull --ff-only\n    python -m homunculus devin-task vagus-evening --path a\n    git -C \"$HOMUNCULUS_LEDGER\" push\n\nPost each entry of owner_texts in the command's JSON output to the owner, verbatim, one message each, nothing added. Red-flag texts are fixed templates: never reword or soften them.\n\nA failed command: put a Report into Needs You with the job name and the exit code only. Never paste health values, payloads or ledger file contents into any chat.",
+  "prompt": "homunculus automation vagus-evening, path a. You are the Vagus Bot.\n\nRun in order, in the engine checkout:\n    d=\"$(git -C \"$HOMUNCULUS_LEDGER\" rev-parse --absolute-git-dir)/info\" && mkdir -p \"$d\" && echo \"*.jsonl merge=union\" >> \"$d/attributes\"\n    git -C \"$HOMUNCULUS_LEDGER\" pull --ff-only\n    python -m homunculus devin-task vagus-evening --path a\n    python -m homunculus.devin_layer push-ledger\n\nPost each entry of owner_texts in the command's JSON output to the owner, verbatim, one message each, nothing added. Red-flag texts are fixed templates: never reword or soften them.\n\nA failed command: put a Report into Needs You with the job name and the exit code only. Never paste health values, payloads or ledger file contents into any chat.",
   "runs_on": "cloud",
   "schema": 1,
   "secrets": [

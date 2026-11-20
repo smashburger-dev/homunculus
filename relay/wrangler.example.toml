@@ -1,0 +1,15 @@
+# Copy to wrangler.toml (gitignored) and fill in the KV namespace id from
+# `wrangler kv namespace create RELAY_KV`. No secret goes into this file; set
+# INGEST_TOKEN, FETCH_TOKEN, DEVIN_WEBHOOK_URL and DEVIN_WEBHOOK_SECRET with
+# `wrangler secret put <NAME>`.
+name = "homunculus-relay"
+main = "worker.mjs"
+compatibility_date = "2026-11-01"
+workers_dev = true
+
+[[kv_namespaces]]
+binding = "RELAY_KV"
+id = "<kv-namespace-id>"
+
+[observability]
+enabled = false  # request logs would hold object keys and sizes; keep them off

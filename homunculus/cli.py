@@ -14,6 +14,7 @@ temporary ledger and never reads the configured one.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -51,6 +52,7 @@ BASELINE_DAYS = 28
 MEAN90_DAYS = 90
 EXTENSION_PAIRS = 2
 FINAL_DECISIONS = frozenset({"adopt", "reject", "inconclusive"})
+FINALIZE_LAG_DAYS = 7  # after the allocation ends, days still without a stored row count as missing
 PUSH_URL_ENV = "HOMUNCULUS_PUSH_URL"
 PUSH_TOKEN_ENV = "HOMUNCULUS_PUSH_TOKEN"
 PUSH_TIMEOUT_S = 10.0
@@ -227,18 +229,58 @@ def owner_profile(owner: Mapping[str, Any], today: date) -> OwnerProfile:
                         conditions=tuple(str(c) for c in owner.get("conditions") or ()), swc=swc)
 
 
+def _scored_paper(rec: Any) -> tuple[str, float, str | None] | None:
+    """(dedupe key, certainty, extracted design) of a scored paper record; None when unscored or unkeyed."""
+    certainty = ((rec or {}).get("score") or {}).get("certainty") if isinstance(rec, Mapping) else None
+    if not isinstance(certainty, (int, float)):
+        return None
+    try:
+        key = evidence.dedupe_key(rec["extraction"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    design = _field_value(rec["extraction"], "design")
+    return key, float(certainty), design if design in evidence.DESIGNS else None
+
+
+def known_papers(ledger: Ledger) -> dict[str, tuple[float, str | None]]:
+    """dedupe key -> (thal-2 certainty, ledger design) of every scored paper in the ledger."""
+    out: dict[str, tuple[float, str | None]] = {}
+    for rel in ledger.glob("evidence/papers/*.json"):
+        found = None if rel.endswith(".audit.json") else _scored_paper(ledger.read_json(rel))
+        if found:
+            out[found[0]] = found[1:]
+    return out
+
+
 def known_certainties(ledger: Ledger) -> dict[str, float]:
     """dedupe key -> thal-2 certainty of every scored paper in the ledger, for deepdive.decide."""
-    out: dict[str, float] = {}
-    for rel in ledger.glob("evidence/papers/*.json"):
-        rec = ledger.read_json(rel) if not rel.endswith(".audit.json") else None
-        certainty = ((rec or {}).get("score") or {}).get("certainty") if isinstance(rec, Mapping) else None
-        if isinstance(certainty, (int, float)):
-            try:
-                out[evidence.dedupe_key(rec["extraction"])] = float(certainty)
-            except (KeyError, TypeError, ValueError):
-                continue
+    return {key: certainty for key, (certainty, _) in known_papers(ledger).items()}
+
+
+def with_ledger_designs(dive: Mapping[str, Any], designs: Mapping[str, str | None]) -> dict:
+    """A copy of dive whose evidence items carry the ledger design of each scored paper, not Thalamus's label."""
+    out = copy.deepcopy(dict(dive))
+    for link in out.get("links") or ():
+        for item in link.get("evidence") or ():
+            design = designs.get(item.get("paper"))
+            if design:
+                item["design"] = design
     return out
+
+
+def _linked_direction(ledger: Ledger, key: str, as_of: str) -> int | None:
+    """Claim direction of the belief a paper feeds: its frontier belief, else the beliefs whose prior cites it.
+
+    None when no belief links the paper or the linked beliefs disagree.
+    """
+    try:
+        folded = beliefs.fold(ledger.read_jsonl(beliefs.EVENTS_PATH), as_of)
+    except (KeyError, TypeError, ValueError):
+        return None
+    own = folded.get(deepdive.belief_id_for(key))
+    linked = [own] if own else [b for b in folded.values() if b.prior is not None and key in b.prior.sources]
+    directions = {b.claim.direction for b in linked}
+    return directions.pop() if len(directions) == 1 else None
 
 
 def _paper_key(extraction: Mapping[str, Any]) -> str | None:
@@ -248,8 +290,10 @@ def _paper_key(extraction: Mapping[str, Any]) -> str | None:
         return None
 
 
-def appraise_record(ledger: Ledger, record: Mapping[str, Any], owner: OwnerProfile) -> tuple[Any, Any]:
-    """(Score, Appraisal) of a paper record: lexicon replications, and deep-dive promise inputs when a dive exists."""
+def appraise_record(ledger: Ledger, record: Mapping[str, Any], owner: OwnerProfile, *,
+                    as_of: str | None = None) -> tuple[Any, Any]:
+    """(Score, Appraisal) of a paper record: lexicon replications, the linked belief's direction, and
+    deep-dive promise inputs when a dive exists. as_of (ISO date, default today UTC) folds the beliefs."""
     extraction = record["extraction"]
     key = _paper_key(extraction)
     swc = _paper_swc(extraction, owner)
@@ -257,7 +301,8 @@ def appraise_record(ledger: Ledger, record: Mapping[str, Any], owner: OwnerProfi
     score = evidence.score(extraction, owner, update_to=record.get("update_to") or [], swc_paper_units=swc,
                            replications=replications)
     dive = ledger.read_json(deepdive.record_rel(key), default=None) if key else None
-    base = evidence.PromiseInput(swc_paper_units=swc)
+    direction = _linked_direction(ledger, key, as_of or _utcnow().date().isoformat()) if key else None
+    base = evidence.PromiseInput(swc_paper_units=swc, direction=direction)
     inputs = deepdive.promise_inputs(dive, base) if isinstance(dive, Mapping) else base
     return score, evidence.appraise(extraction, score, inputs)
 
@@ -270,11 +315,16 @@ def run_deep_dive(ledger: Ledger, llm: Mapping[str, Any], paper_rel: str, source
                   now: datetime) -> dict:
     """Thalamus deep dive of the paper at paper_rel over source_text; code decides and stores the record.
 
-    The Thalamus answer is re-asked once when it fails the schema or chain checks.
+    The Thalamus answer is re-asked once when it fails the schema or chain checks. A paper with a hard
+    frontier blocker (audit block, veto, concern, discard, weak methods) is refused before any LLM call.
+    Cited papers scored in the ledger count with their ledger design, not the design Thalamus names.
     """
     record = ledger.read_json(paper_rel)
     if not isinstance(record, Mapping) or not isinstance(record.get("extraction"), Mapping):
         raise UsageError(f"{paper_rel} holds no paper extraction")
+    blockers = weekly._paper_blockers(record)
+    if blockers:
+        raise RuntimeError(f"{paper_rel} has hard frontier blockers ({', '.join(sorted(blockers))}); no deep dive")
     key = evidence.dedupe_key(record["extraction"])
     view = lexicon.load_view(ledger)
     meta = {"key": key, "doi": record.get("doi"), "title": (record.get("meta") or {}).get("title")}
@@ -285,9 +335,12 @@ def run_deep_dive(ledger: Ledger, llm: Mapping[str, Any], paper_rel: str, source
                                           {"abstract": source_text})
     except weekly._Rejected as exc:
         raise RuntimeError(f"deep dive rejected after one re-ask: {exc}") from None
-    decided = deepdive.decide(dive, source_text=source_text, rules=guardrails.load_rules(ledger), paper_key=key,
-                              paper_ref=paper_rel, at=now.isoformat(timespec="seconds"),
-                              known=known_certainties(ledger), view=view)
+    known = known_papers(ledger)
+    designs = {k: design for k, (_, design) in known.items()}
+    decided = deepdive.decide(with_ledger_designs(dive, designs), source_text=source_text,
+                              rules=guardrails.load_rules(ledger), paper_key=key, paper_ref=paper_rel,
+                              at=now.isoformat(timespec="seconds"),
+                              known={k: certainty for k, (certainty, _) in known.items()}, view=view)
     deepdive.store(ledger, decided)
     return decided
 
@@ -580,9 +633,15 @@ def _api_sources(env: Mapping[str, str]) -> frozenset[str]:
 # Commands: server and scheduler
 
 
+_NO_PUSH_WARNING = (f"warning: {PUSH_URL_ENV} is not set; red flags and owner notices reach only "
+                    "mail/owner/inbox, not the owner's phone")
+
+
 def cmd_serve(app: App) -> int:
     cfg = _ingest_config(app)
     pineal = _pineal()
+    if not _push_url(app.env):  # serve's live red flags (on_events) would land in the inbox only
+        print(_NO_PUSH_WARNING, file=sys.stderr)
     ctx = _pineal_context(app, pineal)
     ingest.serve(cfg, app.store, **serve_kwargs(app, pineal, ctx))
     return EXIT_OK
@@ -601,10 +660,12 @@ def cmd_tick(app: App) -> int:
         from homunculus import devin_layer
 
         jobs = devin_layer.box_jobs(jobs, app.args.devin_path)
-    if app.args.devin_path == "b" and not _push_url(app.env):
-        print(f"warning: {PUSH_URL_ENV} is not set; red flags and owner notices on path b reach only "
-              "mail/owner/inbox, not the owner's phone", file=sys.stderr)
-    code = _report_runs(pineal.tick(_pineal_context(app, pineal), jobs))
+    no_push = app.args.devin_path == "b" and not _push_url(app.env)
+    if no_push:
+        print(_NO_PUSH_WARNING + "; path b requires it, so tick exits 1", file=sys.stderr)
+    code = _report_runs(pineal.tick(_pineal_context(app, pineal), jobs))  # jobs still run: the inbox copy lands
+    if code == EXIT_OK and no_push:
+        return EXIT_RUNTIME
     return EXIT_HALTED if code == EXIT_OK and app.ledger.halted() else code
 
 
@@ -751,6 +812,99 @@ def cmd_resume(app: App) -> int:
     return EXIT_OK
 
 
+GOALS_REF = "config/goals.md"
+STARTER_NOTES_DE = (
+    "Startplan ohne feste Einheiten. Die erste Wochenbesprechung schlägt Einheiten passend zu den Zielen in "
+    "config/goals.md vor; jede Änderung läuft durch die Guardrails."
+)
+
+
+def starter_plan() -> dict:
+    """Plan content of a fresh ledger: no sessions, no targets, default modulation; the review fills it from goals."""
+    return {
+        "rationale_refs": [GOALS_REF], "sessions": [],
+        "nutrition": {"kcal_target": None, "protein_g_per_kg": None, "notes_de": STARTER_NOTES_DE},
+        "supplements": [], "experiments": [],
+        "modulation": {"max_daily_load_cut_pct": 30, "allow_swap": True, "readiness_low_action": "shorten"},
+    }
+
+
+def _first_plan_problems(plan: Mapping[str, Any], rules: guardrails.Rules) -> list[str]:
+    """Schema errors, plus what only the weekly review may introduce: a kcal target or a supplement off the rules."""
+    problems = plans.validate_plan(plan)
+    if problems:
+        return problems
+    if plan["nutrition"]["kcal_target"] is not None:
+        problems.append("nutrition.kcal_target must be null; kcal targets go through the weekly review")
+    for s in plan["supplements"]:
+        problems += [f"supplement {s['name']}: {p}"
+                     for p in guardrails.supplement_check(s["name"], s["dose"], s["unit"], s["tested_by"], rules)]
+    return problems
+
+
+def cmd_init_plan(app: App) -> int:
+    if app.ledger.exists(plans.CURRENT_PATH):
+        raise UsageError(f"{plans.CURRENT_PATH} exists; change the plan through review, approve or rollback")
+    content = _json_object(app.args.from_file, "--from") if app.args.from_file else starter_plan()
+    now = app.now()
+    plan = {**content, "version": 1, "parent": None, "effective_from": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "valid_until": (now + plans.VALIDITY).strftime("%Y-%m-%dT%H:%M:%SZ"), "author": plans.WRITER,
+            "ratified_by": "owner", "data_snapshot_sha": None,
+            "rationale_refs": list(dict.fromkeys([GOALS_REF, *(content.get("rationale_refs") or ())]))}
+    problems = _first_plan_problems(plan, guardrails.load_rules(app.ledger))
+    if problems:
+        raise UsageError("refusing the first plan: " + "; ".join(problems))
+    _plan_call(app, lambda: plans._write_version(app.ledger, plan), "plan.ratified", "First plan v0001")
+    _print(f"plan v0001 written ({len(plan['sessions'])} sessions); the weekly review builds on it")
+    return EXIT_OK
+
+
+def _local_day(app: App) -> str:
+    return app.now().astimezone(ZoneInfo(app.tz)).date().isoformat()
+
+
+def _coaching_show(app: App, pineal: ModuleType) -> int:
+    held = pineal.coaching_holds(app.ledger, _local_day(app))
+    for a in held:
+        _print(f"{a['rule_id']} {a['date']}: coaching paused until a doctor has seen you")
+    if not held:
+        _print("no coaching hold")
+    return EXIT_OK
+
+
+def _clear_rule(app: App, pineal: ModuleType, rule_id: str) -> int:
+    """Clear the urgent holds of one rule; the owner confirms a doctor has seen them."""
+    held = [a for a in pineal.coaching_holds(app.ledger, _local_day(app)) if a["rule_id"] == rule_id]
+    stamp = app.now().astimezone(ZoneInfo(app.tz)).isoformat(timespec="seconds")
+    for a in held:
+        app.ledger.append_jsonl(pineal.COACHING_CLEARED_LOG, {"rule_id": a["rule_id"], "date": a["date"],
+                                                              "cleared_at": stamp}, author=pineal.WRITER)
+    return len(held)
+
+
+def _coaching_clear(app: App, pineal: ModuleType) -> int:
+    rule_id = app.args.rule_id
+    if rule_id is None:
+        cleared = pineal.clear_coaching_hold(_pineal_context(app, pineal))
+    else:
+        cleared = _clear_rule(app, pineal, rule_id)
+    if not cleared:
+        _print(f"no coaching hold{f' for {rule_id}' if rule_id else ''}")
+        return EXIT_USAGE if rule_id else EXIT_OK
+    commit(app.ledger, "coaching.cleared", f"Coaching hold cleared by the owner: {rule_id or 'all'}")
+    _print(f"cleared {cleared} coaching hold(s); coaching resumes with the next session")
+    return EXIT_OK
+
+
+_COACHING_ACTIONS: Mapping[str, Callable[[App, ModuleType], int]] = {"show": _coaching_show, "clear": _coaching_clear}
+
+
+def cmd_coaching(app: App) -> int:
+    if app.args.action == "show" and app.args.rule_id:
+        raise UsageError("coaching show takes no rule id")
+    return _COACHING_ACTIONS[app.args.action](app, _pineal())
+
+
 # --------------------------------------------------------------------------
 # Commands: experiments
 
@@ -846,14 +1000,32 @@ def _exclusion_inputs(app: App, p: experiments.Protocol, first: str, last: str) 
     return daily, flags
 
 
-def _analyze_blocked(app: App, exp_id: str, last: str) -> str | None:
-    """Why analyze must not run now: a final result exists, or the allocation has not ended."""
+def _data_pending(app: App, p: experiments.Protocol, allocation: Sequence[tuple[str, str]], extended: bool,
+                  today: str) -> str | None:
+    """Arm days of the new pairs without a stored outcome row; after FINALIZE_LAG_DAYS they count as missing."""
+    first, last = allocation[0][0], allocation[-1][0]
+    if today > _shift(last, FINALIZE_LAG_DAYS):
+        return None
+    stored = {r.date for r in app.store.daily(p.outcome_key, first, _shift(last, 1))}
+    pending = experiments.pending_days(p, allocation, stored, extended)
+    if not pending:
+        return None
+    return (f"no stored data yet for {len(pending)} day(s) from {pending[0]}; analyze once they are ingested "
+            f"(or after {_shift(last, FINALIZE_LAG_DAYS)}, when they count as missing)")
+
+
+def _analyze_blocked(app: App, exp_id: str, p: experiments.Protocol, allocation: Sequence[tuple[str, str]],
+                     extended: bool) -> str | None:
+    """Why analyze must not run now: a final result exists, the allocation has not ended, or its data is not in."""
     previous = app.ledger.read_json(f"experiments/{exp_id}/result.json", default=None)
     decision = previous.get("decision") if isinstance(previous, Mapping) else None
     if decision in FINAL_DECISIONS:
         return f"result.json already holds the final decision {decision!r}"
+    last = allocation[-1][0]
     today = app.now().astimezone(ZoneInfo(app.tz)).date().isoformat()
-    return f"allocation runs through {last}; analyze after that day" if today <= last else None
+    if today <= last:
+        return f"allocation runs through {last}; analyze after that day"
+    return _data_pending(app, p, allocation, extended, today)
 
 
 def _record_extension(app: App, exp_id: str, record: Mapping[str, Any]) -> None:
@@ -866,7 +1038,7 @@ def _record_extension(app: App, exp_id: str, record: Mapping[str, Any]) -> None:
 def _exp_analyze(app: App, exp_id: str) -> int:
     p, allocation, extended = _frozen(app, exp_id)
     first, last = allocation[0][0], allocation[-1][0]
-    blocked = _analyze_blocked(app, exp_id, last)
+    blocked = _analyze_blocked(app, exp_id, p, allocation, extended)
     if blocked:
         _print(f"experiment {exp_id}: cannot analyze: {blocked}")
         return EXIT_RUNTIME
@@ -874,14 +1046,17 @@ def _exp_analyze(app: App, exp_id: str) -> int:
     daily, flags = _exclusion_inputs(app, p, first, last)
     belief = _belief(app, p.belief_id)
     try:
-        result = experiments.analyze(p, allocation, data, experiments.excluded_days(p, daily, flags), belief.prior,
+        # The belief posterior without this experiment's own result, so a re-analysis never counts it twice.
+        prior = experiments.starting_prior(app.ledger.read_jsonl(beliefs.EVENTS_PATH), p, app.now().date().isoformat())
+        result = experiments.analyze(p, allocation, data, experiments.excluded_days(p, daily, flags), prior,
                                      extended=extended, direction=belief.claim.direction)
     except experiments.ProtocolError as exc:
         _print(f"experiment {exp_id}: cannot analyze: {exc}")
         return EXIT_RUNTIME
-    record = {**asdict(result), "experiment": exp_id, "extended": extended,
-              "analyzed_at": app.now().isoformat(timespec="seconds")}
+    at = app.now().isoformat(timespec="seconds")
+    record = {**asdict(result), "experiment": exp_id, "extended": extended, "analyzed_at": at}
     app.ledger.write_json(f"experiments/{exp_id}/result.json", record, author=CODE_AUTHOR)
+    experiments.record_result(app.ledger, p, result, at, author=CODE_AUTHOR)
     _record_extension(app, exp_id, record)
     _write_csv(app, exp_id, allocation, data)
     commit(app.ledger, "experiment.result", f"Result {exp_id}: {result.decision}")
@@ -943,13 +1118,15 @@ def cmd_score_paper(app: App) -> int:
     if record.get("blocked"):
         _print(f"{path}: blocked by audit disagreements, not scored")
         return EXIT_RUNTIME
-    owner = owner_profile(app.owner, app.now().date())
-    score, appraisal = appraise_record(app.ledger, {**record, "extraction": extraction}, owner)
-    shown = {**asdict(score), "appraisal": asdict(appraisal)} if app.args.appraise else asdict(score)
-    _print(json.dumps(shown, sort_keys=True, ensure_ascii=False))
+    today = app.now().date()
+    score, appraisal = appraise_record(app.ledger, {**record, "extraction": extraction}, owner_profile(app.owner, today),
+                                       as_of=today.isoformat())
+    # status is Appraisal.status: Score.gate before the weak-methods cap, so a weak paper never reads 'actionable'.
+    extra = {"appraisal": asdict(appraisal)} if app.args.appraise else {}
+    _print(json.dumps({**asdict(score), "status": appraisal.status, **extra}, sort_keys=True, ensure_ascii=False))
     if rel is not None and "extraction" in record:
-        extra = {"appraisal": asdict(appraisal)} if app.args.appraise else {}
-        updated = {**record, "score": asdict(score), "rubric_version": evidence.RUBRIC_VERSION, **extra}
+        updated = {**record, "score": asdict(score), "rubric_version": evidence.RUBRIC_VERSION,
+                   "appraisal": asdict(appraisal)}
         app.ledger.write_json(rel, updated, author=CODE_AUTHOR)
         commit(app.ledger, "evidence.appraisal", f"Rescore {rel} with {evidence.RUBRIC_VERSION}")
     return EXIT_OK
@@ -1010,10 +1187,31 @@ def _check_budget(app: App) -> Check:
     return (status, "budget", f"{level}: {app.budget.spent_week():.2f} of {app.budget.cap:.2f} USD this week")
 
 
+def _check_plan(app: App) -> Check:
+    try:
+        version = plans.current(app.ledger)["version"]
+    except plans.PlanError as exc:
+        return ("fail", "plan", f"{exc}; nothing coaches or reviews until 'init-plan' writes the first plan")
+    return ("ok", "plan", f"v{int(version):04d}")
+
+
+def _check_push(env: Mapping[str, str]) -> Check:
+    try:
+        url = _push_url(env)
+    except UsageError as exc:
+        return ("fail", "push", str(exc))
+    if url is None:
+        return ("warn", "push", f"{PUSH_URL_ENV} not set; on path b red flags reach only mail/owner/inbox")
+    if not env.get(PUSH_TOKEN_ENV):
+        return ("warn", "push", f"{PUSH_TOKEN_ENV} not set; anyone who knows the push URL can read the alerts")
+    return ("ok", "push", "push URL and token set")
+
+
 def cmd_doctor(app: App) -> int:
     checks = [
         _check_token(app.env), _check_host(app.env),
         ("info", "exposure", "expose only through 'tailscale serve' inside the tailnet, never 'tailscale funnel'"),
+        _check_push(app.env), _check_plan(app),
         _check_git(app.root), _check_roster(app), _check_freshness(app), _check_budget(app),
         ("warn", "halt", "config/HALT is set") if app.ledger.halted() else ("ok", "halt", "not halted"),
     ]
@@ -1206,9 +1404,14 @@ def cmd_message(app: App) -> int:
 def cmd_ingest(app: App) -> int:
     if bool(app.args.stdin) == bool(app.args.file):
         raise UsageError("pass exactly one of --stdin or --file PATH")
+    devin = _devin()
+    if app.args.llm_copy and not devin.llm_copy_allowed(app.ledger):
+        _print("refused: the payload is a model's copy of the webhook body, which nothing can verify; use the "
+               f'ingest-relay Automation, or opt in with {{"{devin.LLM_COPY_OPT_IN}": true}} in {devin.LLM_COPY_CONFIG}')
+        return EXIT_RUNTIME
     source_map, api_sources = _source_map(app.env), _api_sources(app.env)
     try:
-        out = _devin().ingest_stdin(app.store, app.ledger, app.cfg, stream=sys.stdin if app.args.stdin else None,
+        out = devin.ingest_stdin(app.store, app.ledger, app.cfg, stream=sys.stdin if app.args.stdin else None,
                                     path=app.args.file, source_map=source_map, now=app.now(), api_sources=api_sources)
     except ValueError as exc:
         raise UsageError(f"no Health Auto Export payload: {exc}") from None
@@ -1428,6 +1631,11 @@ def _add_plan_commands(subs: Any) -> None:
     _sub(subs, "rollback", cmd_rollback, "roll the plan back to VERSION").add_argument("version")
     _sub(subs, "halt", cmd_halt, "create config/HALT")
     _sub(subs, "resume", cmd_resume, "remove config/HALT")
+    _sub(subs, "init-plan", cmd_init_plan, "write the first plan v0001 (starter template or --from FILE)").add_argument(
+        "--from", dest="from_file", default=None, help="plan content JSON; version and metadata are set by code")
+    coaching = _sub(subs, "coaching", cmd_coaching, "show urgent coaching holds or clear them after a doctor visit")
+    coaching.add_argument("action", choices=sorted(_COACHING_ACTIONS))
+    coaching.add_argument("rule_id", nargs="?", default=None, help="clear: only this rule's holds (default: all)")
 
 
 def _add_data_commands(subs: Any) -> None:
@@ -1450,7 +1658,7 @@ def _add_tool_commands(subs: Any) -> None:
     score.add_argument("path")
     score.add_argument("--appraise", action="store_true", help="add promise, quality gate and frontier status")
     _sub(subs, "dashboard", cmd_dashboard, "rebuild site/")
-    _sub(subs, "doctor", cmd_doctor, "check token, bind host, exposure, git, roster, freshness, budget")
+    _sub(subs, "doctor", cmd_doctor, "check token, bind host, exposure, push, plan, git, roster, freshness, budget")
     _sub(subs, "init-ledger", cmd_init_ledger, "create the private ledger skeleton and git init it"
          ).add_argument("path")
     demo = _sub(subs, "demo", cmd_demo, "run the whole pipeline on synthetic data in a temporary ledger")
@@ -1493,6 +1701,8 @@ def _add_devin_commands(subs: Any) -> None:
     ing.set_defaults(func=cmd_ingest)
     ing.add_argument("--stdin", action="store_true")
     ing.add_argument("--file", default=None)
+    ing.add_argument("--llm-copy", action="store_true",
+                     help="the file is a model's copy of a webhook body (ingest-health); needs the opt-in")
     bot = _sub(subs, "run-bot", cmd_run_bot, "one validated LLM turn of a bot, written as that bot")
     bot.add_argument("bot")
     bot.add_argument("--context", required=True)

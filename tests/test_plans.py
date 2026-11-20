@@ -344,12 +344,44 @@ class ModulateTests(unittest.TestCase):
             day = rng.randrange(7)
             planned = plans._session_for(plan, day)
             out = plans.modulate_day(plan, day, rng.choice([None, "low", "normal", "high", "odd"]),
-                                     rng.random() < 0.1, rng.random() < 0.1)
+                                     rng.random() < 0.1, rng.random() < 0.1,
+                                     pause_intense=rng.random() < 0.3, days_off=rng.randrange(15))
             if out["session"] is not None:
                 self.assertLessEqual(plans._session_load(out["session"]), plans._session_load(planned))
                 planned_sets = sum(e["sets"] for e in planned["exercises"])
                 if out["action"] != "swap":
                     self.assertLessEqual(sum(e["sets"] for e in out["session"]["exercises"]), planned_sets)
+
+    def test_pause_intense_caps_target_rpe(self) -> None:
+        plan = _plan()
+        out = plans.modulate_day(plan, 0, "high", False, False, pause_intense=True)
+        self.assertEqual((out["action"], out["reason_codes"]), ("shorten", ["readiness_high", "pause_intense"]))
+        self.assertEqual(out["session"]["target_rpe"], plans.PAUSE_RPE_CAP)
+        self.assertLess(out["session"]["target_rpe"], plans.HARD_RPE)
+        self.assertEqual(out["session"]["duration_min"], 60)
+        easy = plans.modulate_day(plan, 2, "normal", False, False, pause_intense=True)
+        self.assertEqual((easy["action"], easy["reason_codes"]), ("as_planned", ["readiness_normal"]))
+        self.assertEqual(plan["sessions"][0]["target_rpe"], 7)
+
+    def test_return_cap_binds_an_unchanged_plan(self) -> None:
+        plan = _plan()
+        planned = plans._session_for(plan, 0)
+        for band, stale in (("high", False), (None, True), ("low", False)):
+            with self.subTest(band=band, stale=stale):
+                out = plans.modulate_day(plan, 0, band, False, stale, days_off=7)
+                self.assertIn("return_after_break", out["reason_codes"])
+                self.assertEqual(out["action"], "shorten")
+                self.assertLessEqual(plans._session_load(out["session"]), 0.7 * plans._session_load(planned) + 1e-9)
+        out = plans.modulate_day(plan, 0, "high", False, False, days_off=6)
+        self.assertEqual((out["action"], out["reason_codes"]), ("as_planned", ["readiness_high"]))
+        loose = plans.Rules(return_after_days_off=3, return_cap_pct=50)
+        out = plans.modulate_day(plan, 0, "high", False, False, days_off=3, rules=loose)
+        self.assertEqual(out["session"]["duration_min"], 30)
+
+    def test_return_cap_after_pause_intense(self) -> None:
+        out = plans.modulate_day(_plan(), 4, "normal", False, False, pause_intense=True, days_off=10)
+        self.assertEqual(out["reason_codes"], ["readiness_normal", "pause_intense", "return_after_break"])
+        self.assertLessEqual(plans._session_load(out["session"]), 0.7 * 8 * 50 + 1e-9)
 
     def test_does_not_mutate_plan(self) -> None:
         plan = _plan()
