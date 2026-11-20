@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import socket
 import stat
@@ -13,6 +14,7 @@ import tempfile
 import threading
 import unittest
 import urllib.request
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -399,9 +401,30 @@ class TokenStoreTests(unittest.TestCase):
         self.assertEqual(store.load("whoop"), _token(5.0))
         store.save("whoop", _token(5.0))
         store.delete("whoop")
-        self.assertEqual(calls[2][:7], ["security", "add-generic-password", "-U", "-s", "homunculus.trackers",
-                                        "-a", "whoop"])
+        self.assertEqual(calls[2], ["security", "-i"])
         self.assertEqual(calls[3][1], "delete-generic-password")
+
+    def test_keychain_save_keeps_secret_out_of_argv(self) -> None:
+        token = replace(_token(5.0), access_token='acc"ess\\tok', refresh_token="refresh-tok",
+                        extra={"name": "\u00fc"})
+        seen = []
+        store = KeychainTokenStore(runner=lambda args, **kw: seen.append((args, kw)) or SimpleNamespace(returncode=0))
+        store.save("whoop", token)
+        (args, kw), = seen
+        self.assertEqual(args, ["security", "-i"])
+        self.assertFalse(any("tok" in a for a in args))
+        line = kw["input"]
+        self.assertTrue(line.isascii() and line.endswith("\n") and line.count("\n") == 1)
+        self.assertTrue(line.startswith('"add-generic-password" "-U" "-s" "homunculus.trackers" "-a" "whoop" "-w" "'))
+        quoted = line[line.index('"-w" ') + 6:-2]
+        secret = re.sub(r"\\(.)", r"\1", quoted)  # undo the backslash escapes of 'security -i'
+        self.assertEqual(base.token_from_json(secret), token)
+
+    def test_keychain_save_rejects_overlong_line(self) -> None:
+        store = KeychainTokenStore(runner=mock.Mock())
+        with self.assertRaises(base.TrackerError):
+            store.save("whoop", replace(_token(5.0), access_token="a" * 5000))
+        store._run.assert_not_called()
 
 
 class CursorTests(unittest.TestCase):

@@ -41,6 +41,7 @@ KCAL_APPROVE_PCT = 5.0  # kcal changes above this need approval
 KCAL_PER_KG = 7700.0  # rule-of-thumb energy content of 1 kg body mass (UNVERIFIED)
 NOVEL_MAX_RPE = 6.0
 NOVEL_MAX_SETS = 2
+PAIN_FREE_SESSIONS = 2  # pain-free sessions before a probation exercise may progress
 EXERCISE_FEATURES_KEY = "exercise_features"  # reserved key in GuardContext.injury_constraints
 REQUIRED_FEATURES = ("pattern", "contraction", "energy_system", "joint_load")
 JOINT_LEVELS = ("none", "low", "moderate", "high")
@@ -51,6 +52,7 @@ DEFAULT_FORBIDDEN: Mapping[str, tuple[str, ...]] = MappingProxyType({
     "prescription_drug": (
         "prescription drug", "verschreibungspflichtig", "rezeptpflichtig", "metformin",
         "semaglutide", "semaglutid", "tirzepatide", "tirzepatid", "beta blocker", "betablocker",
+        "ozempic", "wegovy", "rybelsus", "mounjaro", "zepbound", "saxenda", "liraglutid",
     ),
     "wada_prohibited": (
         "anabolic steroid", "anabole steroide", "anabolika", "testosterone", "testosteron",
@@ -58,10 +60,12 @@ DEFAULT_FORBIDDEN: Mapping[str, tuple[str, ...]] = MappingProxyType({
         "epo", "erythropoietin", "sarm", "sarms", "ostarine", "ligandrol", "cardarine",
         "growth hormone", "wachstumshormon", "hgh", "dmaa", "ephedrine", "ephedrin",
         "meldonium", "higenamine", "higenamin", "dnp",
+        "clen", "anavar", "oxandrolon", "winstrol", "dianabol", "deca durabolin",
     ),
     "dehydration_cut": (
         "water cut", "dehydration cut", "wasserentzug", "entwassern", "entwasserung",
-        "diuretic", "diuretics", "diuretika", "furosemide", "furosemid",
+        "diuretic", "diuretika", "diuretikum", "furosemid", "lasix", "torasemid", "hydrochlorothiazid",
+        "wassertablette", "saunaanzug", "sauna suit", "schwitzanzug",
     ),
     "altitude_protocol": (
         "altitude tent", "hypoxic tent", "hypoxiezelt", "hohenzelt", "intermittent hypoxia",
@@ -186,11 +190,23 @@ def _has_phrase(haystack: str, needle: str) -> bool:
     return bool(needle) and f" {needle} " in f" {haystack} "
 
 
+def _starts_word(haystack: str, needle: str) -> bool:
+    """needle occurs in haystack at a word start; compounds like 'testosteronspritze' match 'testosteron'."""
+    return bool(needle) and re.search(r"(?<![0-9a-z])" + re.escape(needle), haystack) is not None
+
+
+PREFIX_MIN_LEN = 5  # shorter terms ('epo', 'hgh') match whole words only, so 'Epoche' stays clean
+
+
+def _term_hit(text: str, term: str) -> bool:
+    return _starts_word(text, term) if len(term) >= PREFIX_MIN_LEN else _has_phrase(text, term)
+
+
 def forbidden_match(name: str, rules: Rules) -> str | None:
-    """Category of the first forbidden term contained in name as whole words."""
+    """Category of the first forbidden term in name: a word start for long terms, a whole word for short ones."""
     text = normalize_name(name)
     for category, terms in rules.forbidden.items():
-        if any(_has_phrase(text, normalize_name(t)) for t in terms):
+        if any(_term_hit(text, normalize_name(t)) for t in terms):
             return category
     return None
 
@@ -354,6 +370,8 @@ class GuardContext:
     red_flag_active: bool
     ed_watch: bool
     injury_constraints: Mapping[str, Any]
+    known_exercises: Sequence[str] | None = None  # ids from prior plan versions; None: the current plan only
+    pain_free_sessions: Mapping[str, int] = field(default_factory=dict)  # per exercise id, from check-ins
 
 
 @dataclass(frozen=True)
@@ -418,15 +436,12 @@ def _return_findings(new_load: float, ctx: GuardContext, rules: Rules) -> list[F
 
 def _load_findings(cur: Mapping, new: Mapping, ctx: GuardContext, rules: Rules) -> list[Finding]:
     new_load = _plan_load(new)
+    back = _return_findings(new_load, ctx, rules)  # the return cap binds any plan after a break, not just increases
     if new_load <= _plan_load(cur):
-        return []
+        return back
     if ctx.red_flag_active or ctx.ed_watch:
-        return [("reject", "load_while_flagged", "Laststeigerung bei aktivem Warnsignal")]
-    return [
-        *_trailing_findings(new_load, ctx, rules),
-        *_two_week_findings(new_load, ctx, rules),
-        *_return_findings(new_load, ctx, rules),
-    ]
+        return [("reject", "load_while_flagged", "Laststeigerung bei aktivem Warnsignal"), *back]
+    return [*_trailing_findings(new_load, ctx, rules), *_two_week_findings(new_load, ctx, rules), *back]
 
 
 def _hard_count(plan: Mapping) -> int:
@@ -472,16 +487,50 @@ def _novel_entry(session: Mapping, ex: Mapping, feats: Mapping) -> list[Finding]
     return out or [("approve", "novel_exercise", f"Neue Übung {ex['exercise_id']}")]
 
 
+_CONTRACTION_RISK: Mapping[str, int] = MappingProxyType({
+    "isometric": 0, "cyclic": 1, "concentric": 1, "dynamic": 2, "mixed": 2, "eccentric": 3,
+    "plyometric": 4, "ballistic": 4, "reactive": 4, "eccentric overload": 5,
+})
+
+
+def _contraction_risk(feats: Mapping, unknown: int) -> int:
+    if feats.get("eccentric_overload"):
+        return _CONTRACTION_RISK["eccentric overload"]
+    return _CONTRACTION_RISK.get(normalize_name(str(feats.get("contraction", ""))), unknown)
+
+
+def _joint_levels(feats: Mapping) -> dict[str, int | None]:
+    raw = feats.get("joint_load")
+    return {normalize_name(str(j)): _level(v) for j, v in raw.items()} if isinstance(raw, Mapping) else {}
+
+
+def _no_riskier(feats: Mapping, old: Mapping) -> bool:
+    """Every joint load equal or lower and the contraction no riskier; unknown values count as riskier."""
+    old_joints, new_joints = _joint_levels(old), _joint_levels(feats)
+    if not new_joints or any(lv is None or lv > (old_joints.get(j) or 0) for j, lv in new_joints.items()):
+        return False
+    return _contraction_risk(feats, unknown=99) <= _contraction_risk(old, unknown=-1)
+
+
 def _is_swap(session: Mapping, feats: Mapping, removed: set[tuple[str, str]], ctx: GuardContext) -> bool:
     pattern = normalize_name(str(feats.get("pattern", "")))
     for sid, eid in removed:
         old = _features(ctx, eid)
-        if sid == str(session["id"]) and old and normalize_name(str(old.get("pattern", ""))) == pattern:
+        if sid != str(session["id"]) or not old or normalize_name(str(old.get("pattern", ""))) != pattern:
+            continue
+        if _no_riskier(feats, old):
             return True
     return False
 
 
-def _added_exercise(session: Mapping, ex: Mapping, removed: set[tuple[str, str]], ctx: GuardContext) -> list[Finding]:
+def _known(plan: Mapping, ctx: GuardContext) -> set[str]:
+    """Exercise ids with history: the current plan plus ctx.known_exercises."""
+    return {str(ex["exercise_id"]) for _, ex in _exercises(plan)} | {str(e) for e in ctx.known_exercises or ()}
+
+
+def _added_exercise(
+    session: Mapping, ex: Mapping, removed: set[tuple[str, str]], ctx: GuardContext, known: set[str],
+) -> list[Finding]:
     eid = str(ex["exercise_id"])
     feats = _features(ctx, eid)
     if feats is None:
@@ -489,22 +538,76 @@ def _added_exercise(session: Mapping, ex: Mapping, removed: set[tuple[str, str]]
     violations = exercise_admissible(feats, ctx.injury_constraints)
     if violations:
         return [("reject", f"injury:{v}", f"{eid} verletzt {v}") for v in violations]
-    if ex.get("novel"):
+    if ex.get("novel") or eid not in known:  # code decides novelty; the LLM's flag can only add it
         return _novel_entry(session, ex, feats)
     if _is_swap(session, feats, removed, ctx):
         return [("notify", "swap_same_pattern", f"Tausch innerhalb des Musters: {eid}")]
     return [("approve", "exercise_added", f"Übung {eid} hinzugefügt")]
 
 
-def _novel_counts(plan: Mapping) -> dict[str, int]:
+def _volume(ex: Mapping) -> float:
+    load = ex.get("load_kg")
+    return float(ex["sets"]) * float(ex["reps"]) * (float(load) if load else 1.0)
+
+
+def _rir_drop(old: Any, new: Any) -> bool:
+    """Fewer reps in reserve, or a reserve set or cleared."""
+    return old != new and (old is None or new is None or float(new) < float(old))
+
+
+def _progression_findings(old_ex: Mapping, ex: Mapping, rules: Rules) -> list[Finding]:
+    eid, out = str(ex["exercise_id"]), []
+    before, after = _volume(old_ex), _volume(ex)
+    if after > before:
+        pct = (after / before - 1) * 100 if before > 0 else math.inf
+        tier = _load_tier(pct, rules)
+        out.append((tier, f"exercise_volume_{tier}", f"{eid}: Volumen {_de(pct)} % höher"))
+    if _rir_drop(old_ex.get("rir"), ex.get("rir")):
+        out.append(("approve", "exercise_rir_down", f"{eid}: weniger Wiederholungen in Reserve"))
+    return out
+
+
+def _on_probation(ex: Mapping, ctx: GuardContext) -> bool:
+    """Flagged novel or probation, without PAIN_FREE_SESSIONS pain-free sessions on record."""
+    n = ctx.pain_free_sessions.get(str(ex["exercise_id"]))
+    pain_free = isinstance(n, int) and not isinstance(n, bool) and n >= PAIN_FREE_SESSIONS
+    return bool(ex.get("novel") or ex.get("probation")) and not pain_free
+
+
+def _probation_findings(
+    old_s: Mapping, old_ex: Mapping, session: Mapping, ex: Mapping, ctx: GuardContext,
+) -> list[Finding]:
+    if not _on_probation(old_ex, ctx):
+        return []
+    eid = str(ex["exercise_id"])
+    cleared = any(old_ex.get(k) and not ex.get(k) for k in ("novel", "probation"))
+    more_sets = int(ex["sets"]) > max(NOVEL_MAX_SETS, int(old_ex["sets"]))
+    harder = float(session["target_rpe"]) > max(NOVEL_MAX_RPE, float(old_s["target_rpe"]))
+    if cleared or more_sets or harder:
+        return [("approve", "probation_progress", f"{eid}: Steigerung vor 2 schmerzfreien Einheiten")]
+    return []
+
+
+def _kept_findings(cur: Mapping, new: Mapping, ctx: GuardContext, rules: Rules) -> list[Finding]:
+    before = {(str(s["id"]), str(ex["exercise_id"])): (s, ex) for s, ex in _exercises(cur)}
+    out: list[Finding] = []
+    for session, ex in _exercises(new):
+        hit = before.get((str(session["id"]), str(ex["exercise_id"])))
+        if hit:
+            out += _progression_findings(hit[1], ex, rules) + _probation_findings(*hit, session, ex, ctx)
+    return out
+
+
+def _novel_counts(plan: Mapping, known: set[str] | None = None) -> dict[str, int]:
     counts: dict[str, int] = {}
     for session, ex in _exercises(plan):
-        counts[str(session["id"])] = counts.get(str(session["id"]), 0) + bool(ex.get("novel"))
+        novel = bool(ex.get("novel")) or (known is not None and str(ex["exercise_id"]) not in known)
+        counts[str(session["id"])] = counts.get(str(session["id"]), 0) + novel
     return counts
 
 
-def _novel_cap_findings(cur: Mapping, new: Mapping, rules: Rules) -> list[Finding]:
-    before, after = _novel_counts(cur), _novel_counts(new)
+def _novel_cap_findings(cur: Mapping, new: Mapping, rules: Rules, known: set[str] | None = None) -> list[Finding]:
+    before, after = _novel_counts(cur), _novel_counts(new, known)
     out = []
     if any(n > rules.novel_per_session and n > before.get(sid, 0) for sid, n in after.items()):
         out.append(("reject", "novel_per_session", "Zu viele neue Übungen in einer Einheit"))
@@ -534,12 +637,15 @@ def _pull_push_findings(cur: Mapping, new: Mapping, ctx: GuardContext, rules: Ru
 
 def _exercise_findings(cur: Mapping, new: Mapping, ctx: GuardContext, rules: Rules) -> list[Finding]:
     before, after = _keys(cur), _keys(new)
-    removed = before - after
+    removed, known = before - after, _known(cur, ctx)
     out: list[Finding] = []
     for session, ex in _exercises(new):
         if (str(session["id"]), str(ex["exercise_id"])) not in before:
-            out.extend(_added_exercise(session, ex, removed, ctx))
-    return out + _novel_cap_findings(cur, new, rules) + _pull_push_findings(cur, new, ctx, rules)
+            out.extend(_added_exercise(session, ex, removed, ctx, known))
+    return [
+        *out, *_kept_findings(cur, new, ctx, rules), *_novel_cap_findings(cur, new, rules, known),
+        *_pull_push_findings(cur, new, ctx, rules),
+    ]
 
 
 # -- nutrition
@@ -587,18 +693,27 @@ def _deficit_findings(target: float, delta: float, ctx: GuardContext, rules: Rul
     return _ea_finding(delta, ctx, rules) + _loss_finding(target, ctx, rules)
 
 
+def _new_target_findings(target: float, ctx: GuardContext, rules: Rules) -> list[Finding]:
+    """A first kcal target counts as a deficit unless known intake shows it is none."""
+    out: list[Finding] = [("approve", "kcal_new_target", "Neues kcal-Ziel")]
+    ref = ctx.kcal_current
+    if not ref:
+        return out + _deficit_findings(target, 0.0, ctx, rules)  # loss rate is unknown, so this rejects
+    delta = target - ref
+    out.append(_step_finding(delta, ref, rules))
+    return out + (_deficit_findings(target, delta, ctx, rules) if delta < 0 else [])
+
+
 def _kcal_findings(cur: Mapping, new: Mapping, ctx: GuardContext, rules: Rules) -> list[Finding]:
     old, target = _kcal(cur), _kcal(new)
     if target == old:
         return []
     if target is None:
         return [("notify", "kcal_cleared", "kcal-Ziel entfernt")]
-    ref = old if old else ctx.kcal_current
-    out = [] if old else [("approve", "kcal_new_target", "Neues kcal-Ziel")]
-    if not ref:
-        return out
-    delta = target - ref
-    out.append(_step_finding(delta, ref, rules))
+    if not old:
+        return _new_target_findings(target, ctx, rules)
+    delta = target - old
+    out = [_step_finding(delta, old, rules)]
     return out + (_deficit_findings(target, delta, ctx, rules) if delta < 0 else [])
 
 
@@ -634,20 +749,49 @@ def _strings(value: Any) -> Iterator[str]:
 
 
 _FAST_WORD_RE = re.compile(r"fasten|fasting|\bfast\b")
+_NUMBER_WORDS: Mapping[str, float] = MappingProxyType({
+    "ein": 1, "eine": 1, "einen": 1, "einer": 1, "zwei": 2, "drei": 3, "vier": 4, "funf": 5,
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+})
 _DURATION_RE = re.compile(
-    r"(\d+(?:[.,]\d+)?)[\s-]*(stunden|stunde|std|hours|hour|hrs|h|tagen|tage|tag|days|day)\b"
+    r"(?<![0-9a-z])(\d+(?:[.,]\d+)?|" + "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True)) + r")[\s-]*"
+    r"(stunden|stunde|std|hours|hour|hrs|h|tagen|tage|tag|days|day|wochen|woche|weeks|week)\b"
 )
+_UNIT_HOURS = (("tag", 24.0), ("day", 24.0), ("woche", 168.0), ("week", 168.0))
+_DOSE_RE = re.compile(r"\d+(?:[.,]\d+)?\s*(?:kcal|kalorien|kilokalorien|mg|mcg|ug|µg|μg|g|ml|ie|iu)(?![0-9a-z])")
+
+
+def _fold(text: str) -> str:
+    """Casefold and strip diacritics; punctuation stays."""
+    decomposed = unicodedata.normalize("NFKD", text.casefold())
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
 def _fast_hours(text: str) -> list[float]:
-    low = text.casefold()
+    low = _fold(text)
     if not _FAST_WORD_RE.search(low):
         return []
     hours = []
     for num, unit in _DURATION_RE.findall(low):
-        value = float(num.replace(",", "."))
-        hours.append(value * 24 if unit.startswith(("tag", "day")) else value)
+        value = _NUMBER_WORDS.get(num) or float(num.replace(",", "."))
+        hours.append(value * next((h for prefix, h in _UNIT_HOURS if unit.startswith(prefix)), 1.0))
     return hours
+
+
+def _supplement_mentions(text: str, rules: Rules) -> list[str]:
+    norm = normalize_name(text)
+    return [c for c, rec in rules.supplements.items()
+            if any(_starts_word(norm, normalize_name(a)) for a in (c, *rec.get("aliases", ())))]
+
+
+def _free_text_findings(text: str, rules: Rules) -> list[Finding]:
+    """Doses, kcal numbers and supplements belong in structured fields, where their checks run."""
+    out: list[Finding] = []
+    if _DOSE_RE.search(_fold(text)):
+        out.append(("approve", "dose_in_text", "Mengenangabe im Freitext"))
+    for name in _supplement_mentions(text, rules):
+        out.append(("approve", "supplement_in_text", f"Supplement im Freitext: {name}"))
+    return out
 
 
 def _text_findings(diff: Sequence[Mapping], rules: Rules) -> list[Finding]:
@@ -659,15 +803,22 @@ def _text_findings(diff: Sequence[Mapping], rules: Rules) -> list[Finding]:
         out.extend(("reject", "banned_term", f"Diagnosebegriff: {t}") for t in scan_text(text))
         if any(h > rules.max_fast_h for h in _fast_hours(text)):
             out.append(("reject", "fast_too_long", f"Fasten über {_de(rules.max_fast_h)} h"))
+        out.extend(_free_text_findings(text, rules))
     return out
+
+
+DEEPDIVE_REF_PREFIX = "evidence/deepdives/"
 
 
 def _ref_findings(diff: Sequence[Mapping]) -> list[Finding]:
     out = []
     for op in diff:
-        papers = {r for r in op.get("refs", []) if isinstance(r, str) and r.startswith(PAPER_REF_PREFIX)}
+        refs = [r for r in op.get("refs", []) if isinstance(r, str)]
+        papers = {r.split("#", 1)[0] for r in refs if r.startswith(PAPER_REF_PREFIX)}  # one file, one study
         if len(papers) == 1:
             out.append(("approve", "single_study", f"Begründung aus nur einer Studie: {op.get('path')}"))
+        if any(r.startswith(DEEPDIVE_REF_PREFIX) for r in refs):
+            out.append(("approve", "frontier_evidence", f"Begründung aus Frontier-Evidenz: {op.get('path')}"))
     return out
 
 
@@ -675,6 +826,18 @@ _PATH_TIERS: Mapping[str, str] = MappingProxyType({
     "sessions": "auto", "nutrition": "notify", "supplements": "notify", "modulation": "notify",
     "valid_until": "notify", "experiments": "approve", "rationale_refs": "auto",
 })
+
+
+_FREE_TEXT_KEYS = frozenset({"kind", "notes_de"})
+
+
+def _free_text_value(key: str, value: Any) -> bool:
+    """value, stored under key, is or holds a non-empty kind or notes_de string."""
+    if key in _FREE_TEXT_KEYS and isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, Mapping):
+        return any(_free_text_value(str(k), v) for k, v in value.items())
+    return isinstance(value, (list, tuple)) and any(_free_text_value("", v) for v in value)
 
 
 def _path_finding(op: Mapping) -> Finding:
@@ -685,6 +848,8 @@ def _path_finding(op: Mapping) -> Finding:
     top = parts[1]
     if top not in _PATH_TIERS:
         return ("reject", "path_not_allowed", f"Pfad nicht änderbar: {path}")
+    if _free_text_value(parts[-1], op.get("value")):  # free text can carry what the structured checks would stop
+        return ("approve", "free_text", f"Freitext geändert: {path}")
     if top == "sessions" and "exercises" in parts:
         return ("notify", "exercise_change", f"Übungsänderung: {path}")
     return (_PATH_TIERS[top], f"path:{top}", f"Änderung: {path}")
@@ -744,9 +909,58 @@ _SELF_HARM_TERMS: tuple[str, ...] = (
 )
 
 
+_SELF_HARM_EXTRA_TERMS: tuple[str, ...] = (
+    "geritzt", "ritze mich", "nicht mehr aufwachen", "alles beenden", "allem ein ende",
+    "end it all", "never wake up", "don t want to live",
+)
+# Word stems that also cover compounds and inflections: Suizidgedanken, suizidal, lebensmüde, ...
+_SELF_HARM_STEM_RE = re.compile(r"(?<![0-9a-z])(?:suizid|selbstmord|lebensmud|selbstverletz|suicid|self harm)")
+# Phrases that signal self-harm only when they close a clause: "Ich will nicht mehr."
+_CLAUSE_END_TERMS: tuple[str, ...] = ("will nicht mehr",)
+_CLAUSE_SPLIT_RE = re.compile(r"[.,;:!?\n]+")
+
+
+def _clause_end_hit(text: str) -> bool:
+    clauses = (f" {normalize_name(c)}" for c in _CLAUSE_SPLIT_RE.split(text))
+    return any(c.endswith(f" {t}") for c in clauses for t in _CLAUSE_END_TERMS)
+
+
 def _self_harm(text: str) -> bool:
     norm = normalize_name(text)
-    return any(_has_phrase(norm, normalize_name(t)) for t in _SELF_HARM_TERMS)
+    if _SELF_HARM_STEM_RE.search(norm) or _clause_end_hit(text):
+        return True
+    return any(_has_phrase(norm, normalize_name(t)) for t in (*_SELF_HARM_TERMS, *_SELF_HARM_EXTRA_TERMS))
+
+
+# Normalized (normalize_name) word prefixes per urgent symptom, for free text.
+URGENT_TERMS: Mapping[str, tuple[str, ...]] = MappingProxyType({
+    "chest_pain": (
+        "brustschmerz", "brustdruck", "brustenge", "brustkorb", "schmerzen in der brust", "schmerz in der brust",
+        "druck auf der brust", "druck in der brust", "engegefuhl in der brust", "enge in der brust",
+        "stechen in der brust", "sticht in der brust", "stiche in der brust", "ziehen in der brust",
+        "brennen in der brust", "chest pain", "chest pressure", "chest tightness", "chest hurts",
+        "chest is hurting", "pain in my chest", "pain in the chest", "tight chest",
+    ),
+    "fainting": (
+        "ohnmacht", "bewusstlos", "umgekippt", "umgefallen", "kollabiert", "kollaps", "zusammengebrochen",
+        "zusammengeklappt", "fainted", "fainting", "passed out", "blacked out", "collapsed",
+    ),
+    "short_breath": (
+        "atemnot", "luftnot", "keine luft", "kaum luft", "schwer luft", "kurzatmig", "kann nicht atmen",
+        "short of breath", "shortness of breath", "can t breathe", "cannot breathe", "breathless",
+        "can t catch my breath",
+    ),
+})
+_URGENT_RES: Mapping[str, re.Pattern[str]] = MappingProxyType({
+    symptom: re.compile(r"(?<![0-9a-z])(?:" + "|".join(re.escape(t) for t in terms) + ")")
+    for symptom, terms in URGENT_TERMS.items()
+})
+
+
+def urgent_symptoms(text: str) -> list[str]:
+    """Urgent symptoms named in free text, in URGENT_TERMS order."""
+    norm = normalize_name(text or "")
+    return [s for s, rx in _URGENT_RES.items() if rx.search(norm)]
 
 
 def _shift(day: str, n: int) -> str:
@@ -771,9 +985,15 @@ def _rise(daily: Mapping[str, Sequence[DailyValue]], key: str, day: str) -> floa
     return by_date[day] - statistics.median(base)
 
 
+def _urgent_in(items: Sequence[CheckinItem], flags: Sequence[str]) -> list[str]:
+    """Urgent symptoms from structured flags, then those named in item text such as notes."""
+    named = [s for it in items if it.text for s in urgent_symptoms(it.text)]
+    return list(dict.fromkeys([*(s for s in flags if s in URGENT_SYMPTOMS), *named]))
+
+
 def _checkin_alerts(items: Sequence[CheckinItem], day: str) -> list[Alert]:
     flags = symptom_flags(items)
-    urgent = [s for s in flags if s in URGENT_SYMPTOMS]
+    urgent = _urgent_in(items, flags)
     out = [Alert("urgent", "symptom_urgent", day, {"symptoms": urgent})] if urgent else []
     if any(_self_harm(it.text) for it in items if it.text):
         out.append(Alert("urgent", "self_harm", day, {}))

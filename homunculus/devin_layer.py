@@ -55,6 +55,9 @@ DEFAULT_TZ = "UTC"
 
 MAX_INPUT_BYTES = 1024 * 1024  # a webhook carries at most 200 KB; full exports go through import-history
 WEBHOOK_MAX_BYTES = 200 * 1024
+# --file holds a webhook prompt a Bot wrote out: the body plus a little prompt text. Anything larger is not
+# a faithful copy of one webhook, so it is refused before parsing.
+FILE_MAX_BYTES = WEBHOOK_MAX_BYTES + 16 * 1024
 MAX_JSON_STARTS = 200
 SUMMARY_DIR = "data/summaries"
 DAILY_DIR = "data/daily"
@@ -352,11 +355,11 @@ def extract_payload(text: str) -> Mapping[str, Any]:
 
 
 def read_input(stream: TextIO | None = None, path: str | Path | None = None) -> str:
-    """Text from path, else from stream (default stdin), refused above MAX_INPUT_BYTES."""
+    """Text from path (refused above FILE_MAX_BYTES), else from stream (default stdin, above MAX_INPUT_BYTES)."""
     if path is not None:
         source = Path(path)
-        if source.stat().st_size > MAX_INPUT_BYTES:
-            raise ValueError(f"{source} is larger than {MAX_INPUT_BYTES} bytes; use import-history")
+        if source.stat().st_size > FILE_MAX_BYTES:
+            raise ValueError(f"{source} is larger than {FILE_MAX_BYTES} bytes; use --stdin or import-history")
         return source.read_text(encoding="utf-8")
     text = (stream or sys.stdin).read(MAX_INPUT_BYTES + 1)
     if len(text.encode("utf-8")) > MAX_INPUT_BYTES:

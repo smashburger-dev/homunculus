@@ -23,6 +23,7 @@ SOURCE = (
     "Synthetic source D: the pathway is conserved across mammals."
 )
 RULES = Rules(supplements={"creatine": {"unit": "g", "max_dose": 5}})
+KNOWN = {"doi:10.0/a": 1.0, "doi:10.0/b": 0.5, "doi:10.0/c": 3.0}  # code-scored ledger papers of the fixture
 
 
 def ev(paper: str, design: str, quote: str, relation: str = "supports") -> dict:
@@ -64,6 +65,7 @@ def dive(**over) -> dict:
 def decide(d, **kw):
     kw.setdefault("source_text", SOURCE)
     kw.setdefault("rules", RULES)
+    kw.setdefault("known", KNOWN)
     return D.decide(d, paper_key="doi:10.0/frontier", paper_ref="evidence/papers/10-0-frontier.json", at=AT, **kw)
 
 
@@ -112,17 +114,27 @@ class QuoteTest(unittest.TestCase):
 
 
 class LinkTest(unittest.TestCase):
-    def test_unscored_papers_are_capped_and_known_scores_win(self):
+    def test_unscored_papers_count_nothing_and_known_scores_win(self):
         l3 = dive()["links"][2]
-        self.assertEqual(D.assess_link(l3)["certainty"], D.UNSCORED_MAX)
-        self.assertEqual(D.assess_link(l3, {"doi:10.0/c": 3.5})["certainty"], 3.5)
-        animal = D.assess_link(dive()["links"][1])
+        unscored = D.assess_link(l3)
+        self.assertEqual((unscored["certainty"], unscored["human"]), (D.UNSCORED_MAX, False))
+        self.assertEqual(D.UNSCORED_MAX, 0.0)
+        scored = D.assess_link(l3, {"doi:10.0/c": 3.5})
+        self.assertEqual((scored["certainty"], scored["human"]), (3.5, True))
+        animal = D.assess_link(dive()["links"][1], KNOWN)
         self.assertEqual((animal["certainty"], animal["human"]), (0.5, False))
+
+    def test_human_needs_a_scored_human_primary_paper_above_link_min(self):
+        l1 = dive()["links"][0]
+        l1["evidence"] = [ev("review", "review_opinion", "q"), ev("doi:10.0/weak", "rct_parallel", "q")]
+        a = D.assess_link(l1, {"review": 1.0, "doi:10.0/weak": 0.25})
+        self.assertEqual((a["certainty"], a["human"]), (1.0, False))
+        self.assertEqual([e["human"] for e in a["evidence"]], [False, False])
 
     def test_contradiction_contests(self):
         l3 = dive()["links"][2]
         l3["evidence"].append(ev("doi:10.0/d", "rct_parallel", "x", "contradicts"))
-        a = D.assess_link(l3)
+        a = D.assess_link(l3, {"doi:10.0/c": 3.0, "doi:10.0/d": 3.0})
         self.assertEqual((a["contested"], a["certainty"]), (True, 0.0))
         self.assertFalse(D.assess_link(l3, {"doi:10.0/c": 3.0})["contested"])
 
@@ -135,7 +147,7 @@ class LinkTest(unittest.TestCase):
         self.assertEqual((gone["certainty"], gone["evidence"]), (0.0, []))
 
     def test_chain_support(self):
-        assessed = [D.assess_link(x) for x in dive()["links"]]
+        assessed = [D.assess_link(x, KNOWN) for x in dive()["links"]]
         chain = D.chain_support(assessed)
         self.assertEqual((chain["weakest"], chain["coverage"], chain["holds"]), (0.5, round(2 / 3, 10), True))
         self.assertAlmostEqual(chain["support"], 0.5 * 2 / 3)
@@ -211,9 +223,39 @@ class DecideTest(unittest.TestCase):
     def test_contested_link(self):
         d = dive()
         d["links"][2]["evidence"].append(ev("doi:10.0/d", "rct_parallel", "Synthetic source C", "contradicts"))
-        rec = decide(d)
+        rec = decide(d, known={**KNOWN, "doi:10.0/d": 4.0})
         self.assertIn("contested:l3", rec["reasons"])
         self.assertNotIn("weak_link:l3", rec["reasons"])
+
+    def test_unresolved_citations_from_one_source_stay_watch(self):
+        source = ("In a randomized trial in healthy adults, cold plunge raised vagal tone. "
+                  "A meta-analysis of randomized trials found vagal tone raises HRV.")
+        plunge, vagal, hrv = ("intervention", "Cold plunge"), ("mechanism", "Vagal tone"), ("outcome", "HRV")
+        d = {"claim": {"intervention": "Cold plunge", "category": "behavioral", "outcome": "HRV",
+                       "tracker_key": "hrv_sdnn_ln", "supplement": None},
+             "links": [link("l1", plunge, vagal, "mechanism",
+                            [ev("Smith 2024", "rct_parallel", "cold plunge raised vagal tone")]),
+                       link("l2", vagal, hrv, "outcome",
+                            [ev("Jones 2023", "meta_rct", "found vagal tone raises HRV")])],
+             "conserved_pathway": {"value": None, "quote": None}}
+        rec = decide(d, source_text=source, tracker_keys={"hrv_sdnn_ln"})
+        self.assertEqual(rec["dropped_evidence"], [])
+        self.assertEqual(rec["decision"], "watch")
+        self.assertEqual((rec["chain"]["weakest"], rec["chain"]["coverage"], rec["chain"]["holds"]), (0.0, 0.0, False))
+        self.assertEqual(len(rec["open_questions"]), 2)
+
+    def test_paper_under_review_and_reviews_do_not_support_its_chain(self):
+        d = dive()
+        own = ev("doi:10.0/frontier", "rct_parallel", "Synthetic source A")
+        review = ev("some review", "review_opinion", "Synthetic source B")
+        d["links"][0]["evidence"] = [own, review]
+        d["links"][1]["evidence"] = [own, review]
+        d["links"][2]["evidence"] = [own]
+        rec = decide(d, known={**KNOWN, "doi:10.0/frontier": 0.5})
+        self.assertEqual(rec["decision"], "watch")
+        self.assertEqual((rec["chain"]["weakest"], rec["chain"]["coverage"], rec["chain"]["holds"]), (0.0, 0.0, False))
+        self.assertFalse(any(e["paper"] == "doi:10.0/frontier" for x in rec["links"] for e in x["evidence"]))
+        self.assertFalse(any(e["human"] for x in rec["links"] for e in x["evidence"]))
 
     def test_invalid_dive_raises(self):
         with self.assertRaises(D.DiveError) as ctx:
@@ -263,7 +305,7 @@ class LedgerTest(unittest.TestCase):
         later["links"][2]["evidence"] = []  # the new paper cites nothing for l3 itself
         rec = decide(later, view=view)
         l3 = rec["links"][2]
-        self.assertEqual((l3["certainty"], l3["human"], l3["prior"]), (D.UNSCORED_MAX, True, "supported"))
+        self.assertEqual((l3["certainty"], l3["human"], l3["prior"]), (3.0, True, "supported"))
         self.assertEqual(rec["decision"], "n_of_1_candidate")
         self.assertEqual(decide(later)["decision"], "watch")
 

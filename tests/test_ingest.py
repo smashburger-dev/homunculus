@@ -36,6 +36,8 @@ RNG_SEED = 4711
 TOKEN = "t" * 40
 NOW = datetime(2026, 1, 10, 12, 0, tzinfo=timezone.utc)
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
+TAILNET_HOST = "box.example-tailnet.ts.net"
+OWNER = {"Tailscale-User-Login": "owner@example.test", "Host": TAILNET_HOST, "Sec-Fetch-Site": "same-origin"}
 
 
 def _ts(day: int, hour: int) -> str:
@@ -413,13 +415,13 @@ class AppTests(_TmpStoreCase):
         self.assertFalse(self.cfg.raw_dir.exists())
 
     def test_post_route_owner_or_token(self) -> None:
-        owner = {"Tailscale-User-Login": "owner@example.test", "Content-Type": "application/json"}
+        owner = {**OWNER, "Content-Type": "application/json"}
         self.assertEqual(self._post("/checkin", b'{"mood": 5}', owner), (201, {"stored": 1}))
-        form = {"Tailscale-User-Login": "owner@example.test", "Content-Type": "application/x-www-form-urlencoded"}
+        form = {**OWNER, "Content-Type": "application/x-www-form-urlencoded"}
         self._post("/checkin", b"mood=5&symptoms=a&symptoms=b&note=", form)
         self.assertEqual(self.forms[-1], {"mood": "5", "symptoms": ["a", "b"], "note": ""})
-        self.assertEqual(self._post("/checkin", b"{}", AUTH)[0], 201)
-        for headers in ({"Tailscale-User-Login": "intruder@example.test"}, {}):
+        self.assertEqual(self._post("/checkin", b"{}", {**AUTH, "Content-Type": "application/json"})[0], 201)
+        for headers in ({**OWNER, "Tailscale-User-Login": "intruder@example.test"}, {}):
             with self.subTest(headers=headers), self.assertRaises(ingest._HttpError) as ctx:
                 self._post("/checkin", b"{}", headers)
             self.assertEqual(ctx.exception.status, 401)
@@ -430,7 +432,51 @@ class AppTests(_TmpStoreCase):
     def test_owner_header_ignored_without_owner_login(self) -> None:
         self.app.owner_login = None
         with self.assertRaises(ingest._HttpError):
-            self._post("/checkin", b"{}", {"Tailscale-User-Login": ""})
+            self._post("/checkin", b"{}", {**OWNER, "Tailscale-User-Login": ""})
+
+    def _assert_refused(self, status: int, headers: dict, path: str = "/checkin") -> None:
+        with self.assertRaises(ingest._HttpError) as ctx:
+            self._post(path, b'{"to": "cerebellum", "text": "x"}', headers)
+        self.assertEqual(ctx.exception.status, status)
+        self.assertEqual(self.forms, [])
+
+    def test_owner_post_refuses_cross_site(self) -> None:
+        json_owner = {**OWNER, "Content-Type": "application/json"}
+        for site in ("cross-site", "same-site", "none"):
+            with self.subTest(site=site):
+                self._assert_refused(403, {**json_owner, "Sec-Fetch-Site": site})
+        no_fetch_meta = {k: v for k, v in json_owner.items() if k != "Sec-Fetch-Site"}
+        self._assert_refused(403, no_fetch_meta)
+        self._assert_refused(403, {**no_fetch_meta, "Origin": "https://evil.example"})
+        ok = {**no_fetch_meta, "Origin": f"https://{TAILNET_HOST}"}
+        self.assertEqual(self._post("/checkin", b"{}", ok)[0], 201)
+
+    def test_post_route_refuses_simple_content_types(self) -> None:
+        for ctype in ("text/plain", "multipart/form-data; boundary=x", None):
+            headers = OWNER if ctype is None else {**OWNER, "Content-Type": ctype}
+            with self.subTest(ctype=ctype):
+                self._assert_refused(415, headers)
+        self._assert_refused(415, {**AUTH, "Content-Type": "text/plain"})
+
+    def test_owner_header_needs_tailnet_host(self) -> None:
+        for host in ("127.0.0.1:8787", "evil.example", "box.ts.net.evil.example", ""):
+            with self.subTest(host=host), self.assertRaises(ingest._HttpError) as ctx:
+                self.app.get("/site/", {}, {**OWNER, "Host": host})
+            self.assertEqual(ctx.exception.status, 401)
+        self.assertEqual(self.app.get("/site/", {}, {**OWNER, "Host": TAILNET_HOST + ":443"})[0], 200)
+        self.app.cfg = _cfg(self.tmp, owner_host="box.example-tailnet.ts.net")
+        self.assertEqual(self.app.get("/site/", {}, OWNER)[0], 200)
+        with self.assertRaises(ingest._HttpError):
+            self.app.get("/site/", {}, {**OWNER, "Host": "other.example-tailnet.ts.net"})
+
+    def test_owner_login_needs_loopback_bind(self) -> None:
+        for host in ("0.0.0.0", "100.64.0.1", "box.local"):
+            with self.subTest(host=host), self.assertRaises(ConfigError):
+                make_server(_cfg(self.tmp, host=host), self.store, owner_login="owner@example.test")
+        make_server(_cfg(self.tmp), self.store, owner_login="owner@example.test").server_close()
+        env = {"HEALTH_TOKEN": TOKEN, "HOMUNCULUS_LEDGER": "/l", "HEALTH_OWNER_HOST": " box.example-tailnet.ts.net "}
+        self.assertEqual(load_config(env).owner_host, "box.example-tailnet.ts.net")
+        self.assertIsNone(load_config({**env, "HEALTH_OWNER_HOST": ""}).owner_host)
 
     def test_get_requires_token(self) -> None:
         for headers in ({}, {"Tailscale-User-Login": "owner@example.test"}):
@@ -481,7 +527,7 @@ class AppTests(_TmpStoreCase):
                 self._get("/summary", query)
 
     def test_site(self) -> None:
-        owner = {"Tailscale-User-Login": "owner@example.test"}
+        owner = OWNER
         for path in ("/site", "/site/", "/site/index.html"):
             with self.subTest(path=path):
                 status, ctype, body = self.app.get(path, {}, owner)

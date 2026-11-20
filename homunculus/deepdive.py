@@ -9,9 +9,13 @@ source text. Code does the rest:
 * ``validate`` checks the schema and that the chain is contiguous.
 * ``void_unquoted`` drops evidence whose quote is not in the source text.
 * ``assess_link`` gives each link a certainty: the strongest supporting
-  paper (its thal-2 score when known, else its base certainty capped at
-  ``UNSCORED_MAX``), merged with the lexicon's prior verdict. A link whose
-  strongest contradiction is at least as strong is contested (certainty 0).
+  paper (its thal-2 score when known, else ``UNSCORED_MAX``, which is 0: a
+  citation code has not resolved and scored counts nothing), merged with the
+  lexicon's prior verdict. A link whose strongest contradiction is at least
+  as strong is contested (certainty 0). A supporting item is human support
+  only when it is scored, reaches ``LINK_MIN`` and has a human primary
+  design (not animal, in vitro or review).
+* ``decide`` ignores the paper under review as evidence for its own chain.
 * ``chain_support`` is the weakest link plus coverage, the share of links
   with human support. The chain holds at weakest >= ``LINK_MIN``, coverage
   >= ``COVERAGE_MIN`` and no contested link.
@@ -43,7 +47,13 @@ DECISIONS = ("n_of_1_candidate", "watch")
 MAX_LINKS = 8
 LINK_MIN = 0.5  # DC: the weakest link needs at least animal-level support
 COVERAGE_MIN = 2.0 / 3.0  # DC: two of three links shown in humans
-UNSCORED_MAX = 1.0  # DC: a cited paper without a ledger score counts at most this much
+UNSCORED_MAX = 0.0  # a cited paper without a ledger score is self-attested and counts nothing
+NOT_HUMAN_PRIMARY = evidence.MECHANISTIC_ONLY | {"review_opinion"}
+# DC: desirable direction of a tracker key (+1 higher is better), for the promise benefit; unlisted keys earn none
+TRACKER_DIRECTION: dict[str, int] = {
+    "hrv_sdnn_ln": 1, "hrv_rmssd_ln": 1, "vo2max": 1, "spo2_min": 1,
+    "rhr": -1, "bp_sys": -1, "bp_dia": -1, "af_burden": -1,
+}
 
 
 class DiveError(ValueError):
@@ -164,10 +174,15 @@ def _item_certainty(item: Mapping[str, Any], known: Mapping[str, float]) -> floa
     return min(evidence.BASE_CERTAINTY[item["design"]], UNSCORED_MAX)
 
 
+def _scored_item(item: Mapping[str, Any], known: Mapping[str, float]) -> dict:
+    certainty = _item_certainty(item, known)
+    human = item["paper"] in known and certainty >= LINK_MIN and item["design"] not in NOT_HUMAN_PRIMARY
+    return {"paper": item["paper"], "design": item["design"], "relation": item["relation"],
+            "certainty": certainty, "human": human}
+
+
 def _scored(items: Sequence[Mapping[str, Any]], known: Mapping[str, float], retracted: Collection[str]) -> list[dict]:
-    return [{"paper": e["paper"], "design": e["design"], "relation": e["relation"],
-             "certainty": _item_certainty(e, known), "human": e["design"] not in evidence.MECHANISTIC_ONLY}
-            for e in items if e["paper"] not in retracted]
+    return [_scored_item(e, known) for e in items if e["paper"] not in retracted]
 
 
 def _strongest(items: Sequence[Mapping[str, Any]], relation: str, prior: float) -> float:
@@ -287,8 +302,8 @@ def decide(
     if problems:
         raise DiveError(problems)
     clean, dropped = void_unquoted(dive, source_text)
-    retracted = set((view or {}).get("retracted") or ())
-    assessed = [assess_link(link, known, lexicon.lookup(view, *_ends(link)), retracted) for link in clean["links"]]
+    ignored = {*((view or {}).get("retracted") or ()), paper_key}  # retracted papers and the paper itself
+    assessed = [assess_link(link, known, lexicon.lookup(view, *_ends(link)), ignored) for link in clean["links"]]
     chain = chain_support(assessed)
     risk = risk_problems(clean["claim"], rules)
     reasons = _reasons(assessed, chain, risk, measurable(clean["claim"], tracker_keys))
@@ -303,7 +318,7 @@ def decide(
 
 
 def promise_inputs(record: Mapping[str, Any], base: evidence.PromiseInput | None = None) -> evidence.PromiseInput:
-    """Promise inputs from a deep dive: plausible, coherent, conserved pathway and human link share."""
+    """Promise inputs from a deep dive: plausible, coherent, conserved pathway, human link share, direction."""
     links = record.get("links") or ()
     chain = record.get("chain") or {}
     plausible = bool(links) and all(link["support"] > 0 for link in links)
@@ -311,6 +326,8 @@ def promise_inputs(record: Mapping[str, Any], base: evidence.PromiseInput | None
     fields = dict((base or evidence.PromiseInput()).__dict__)
     fields.update(plausible=plausible, coherent=coherent, conserved_pathway=record.get("conserved_pathway"),
                   human_link_share=chain.get("coverage"))
+    if fields["direction"] is None:
+        fields["direction"] = TRACKER_DIRECTION.get(str((record.get("claim") or {}).get("tracker_key")))
     return evidence.PromiseInput(**fields)
 
 

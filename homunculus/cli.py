@@ -20,12 +20,14 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.request
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from functools import cached_property
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 from homunculus import (
     agents, beliefs, checkins, dashboard, deepdive, evidence, experiments, guardrails, ingest, lexicon, metrics, plans,
@@ -48,6 +50,11 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 BASELINE_DAYS = 28
 MEAN90_DAYS = 90
 EXTENSION_PAIRS = 2
+FINAL_DECISIONS = frozenset({"adopt", "reject", "inconclusive"})
+PUSH_URL_ENV = "HOMUNCULUS_PUSH_URL"
+PUSH_TOKEN_ENV = "HOMUNCULUS_PUSH_TOKEN"
+PUSH_TIMEOUT_S = 10.0
+_PUSH_PRIORITY = {"urgent": "urgent", "prompt": "high"}
 _WEEK_RE = re.compile(r"^\d{4}-W\d{2}$")
 _VERSION_RE = re.compile(r"^v?(\d+)$")
 
@@ -458,10 +465,54 @@ def _pineal() -> ModuleType:
     return pineal
 
 
+class PushNotifier:
+    """Pushes owner texts to an ntfy-style URL (POST, body = text), then keeps the inbox copy.
+
+    A failed push raises, so Pineal does not log the alert or notice as delivered and retries it next tick.
+    """
+
+    def __init__(self, url: str, inner: Any, *, token: str | None = None,
+                 opener: Callable[..., Any] | None = None) -> None:
+        self._url, self._inner, self._token = url, inner, token
+        self._open = opener or urllib.request.urlopen
+
+    def send(self, to: str, text: str, level: str) -> None:
+        if to == "owner":
+            self._push(text, level)
+        self._inner.send(to, text, level)
+
+    def _push(self, text: str, level: str) -> None:
+        headers = {"Title": "homunculus", "Priority": _PUSH_PRIORITY.get(level, "default"),
+                   "Content-Type": "text/plain; charset=utf-8"}
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        req = urllib.request.Request(self._url, data=text.encode("utf-8"), headers=headers, method="POST")
+        with self._open(req, timeout=PUSH_TIMEOUT_S) as resp:
+            status = getattr(resp, "status", 200)
+        if not 200 <= int(status) < 300:
+            raise RuntimeError(f"push to owner failed: HTTP {status}")
+
+
+def _push_url(env: Mapping[str, str]) -> str | None:
+    url = (env.get(PUSH_URL_ENV) or "").strip()
+    if not url:
+        return None
+    if not url.startswith("https://"):
+        raise UsageError(f"{PUSH_URL_ENV} must be an https:// URL")
+    return url
+
+
+def _notifier(app: App, pineal: ModuleType) -> Any:
+    """The inbox file notifier, wrapped in a PushNotifier when HOMUNCULUS_PUSH_URL is set (path b's phone channel)."""
+    inner = pineal.FileNotifier(app.ledger)
+    url = None if app.args.dry_run else _push_url(app.env)
+    return PushNotifier(url, inner, token=app.env.get(PUSH_TOKEN_ENV) or None) if url else inner
+
+
 def _pineal_context(app: App, pineal: ModuleType) -> Any:
     return pineal.Context(
         store=app.store, ledger=app.ledger, roster=app.roster, providers=app.providers, budget=app.budget,
-        http=app.http, metrics_cfg=app.cfg, notifier=pineal.FileNotifier(app.ledger), tz=app.tz,
+        http=app.http, metrics_cfg=app.cfg, notifier=_notifier(app, pineal), tz=app.tz,
         now=app.now, dry_run=bool(app.args.dry_run),
     )
 
@@ -550,6 +601,9 @@ def cmd_tick(app: App) -> int:
         from homunculus import devin_layer
 
         jobs = devin_layer.box_jobs(jobs, app.args.devin_path)
+    if app.args.devin_path == "b" and not _push_url(app.env):
+        print(f"warning: {PUSH_URL_ENV} is not set; red flags and owner notices on path b reach only "
+              "mail/owner/inbox, not the owner's phone", file=sys.stderr)
     code = _report_runs(pineal.tick(_pineal_context(app, pineal), jobs))
     return EXIT_HALTED if code == EXIT_OK and app.ledger.halted() else code
 
@@ -751,9 +805,9 @@ def _exp_design(app: App, exp_id: str) -> int:
 
 
 def _frozen(app: App, exp_id: str) -> tuple[experiments.Protocol, list[tuple[str, str]], bool]:
+    """Protocol, allocation and extension state; experiments/<id>/extension.json is written once, on 'extend'."""
     p = _protocol(app.ledger.read_json(f"experiments/{exp_id}/protocol.json"))
-    previous = app.ledger.read_json(f"experiments/{exp_id}/result.json") or {}
-    extended = isinstance(previous, Mapping) and previous.get("decision") == "extend"
+    extended = app.ledger.read_json(f"experiments/{exp_id}/extension.json", default=None) is not None
     extra = EXTENSION_PAIRS if extended else 0
     return p, experiments.allocate(p, canonical_json(p.to_dict()), extra_pairs=extra), extended
 
@@ -792,9 +846,30 @@ def _exclusion_inputs(app: App, p: experiments.Protocol, first: str, last: str) 
     return daily, flags
 
 
+def _analyze_blocked(app: App, exp_id: str, last: str) -> str | None:
+    """Why analyze must not run now: a final result exists, or the allocation has not ended."""
+    previous = app.ledger.read_json(f"experiments/{exp_id}/result.json", default=None)
+    decision = previous.get("decision") if isinstance(previous, Mapping) else None
+    if decision in FINAL_DECISIONS:
+        return f"result.json already holds the final decision {decision!r}"
+    today = app.now().astimezone(ZoneInfo(app.tz)).date().isoformat()
+    return f"allocation runs through {last}; analyze after that day" if today <= last else None
+
+
+def _record_extension(app: App, exp_id: str, record: Mapping[str, Any]) -> None:
+    rel = f"experiments/{exp_id}/extension.json"
+    if record["decision"] == "extend" and app.ledger.read_json(rel, default=None) is None:
+        app.ledger.write_json(rel, {"extra_pairs": EXTENSION_PAIRS, "decided_at": record["analyzed_at"]},
+                              author=CODE_AUTHOR)
+
+
 def _exp_analyze(app: App, exp_id: str) -> int:
     p, allocation, extended = _frozen(app, exp_id)
     first, last = allocation[0][0], allocation[-1][0]
+    blocked = _analyze_blocked(app, exp_id, last)
+    if blocked:
+        _print(f"experiment {exp_id}: cannot analyze: {blocked}")
+        return EXIT_RUNTIME
     data = _locked_values(app.store, p, first, last)
     daily, flags = _exclusion_inputs(app, p, first, last)
     belief = _belief(app, p.belief_id)
@@ -807,6 +882,7 @@ def _exp_analyze(app: App, exp_id: str) -> int:
     record = {**asdict(result), "experiment": exp_id, "extended": extended,
               "analyzed_at": app.now().isoformat(timespec="seconds")}
     app.ledger.write_json(f"experiments/{exp_id}/result.json", record, author=CODE_AUTHOR)
+    _record_extension(app, exp_id, record)
     _write_csv(app, exp_id, allocation, data)
     commit(app.ledger, "experiment.result", f"Result {exp_id}: {result.decision}")
     _print(f"experiment {exp_id}: decision={result.decision} d_bar={result.d_bar:.4g} p={result.p_value:.4g} "
@@ -840,9 +916,22 @@ def _paper_location(app: App, raw: str) -> tuple[Path, str | None]:
     return path, rel
 
 
+def _field_value(group: Any, key: str) -> Any:
+    node = group.get(key) if isinstance(group, Mapping) else None
+    return node.get("value") if isinstance(node, Mapping) and set(node) <= {"value", "quote"} else node
+
+
 def _paper_swc(extraction: Mapping[str, Any], owner: OwnerProfile) -> float | None:
-    name = ((extraction.get("outcome") or {}).get("name") or {}).get("value")
-    return owner.swc.get(name) if isinstance(name, str) else None
+    """owner.swc (raw outcome units) in the paper's effect units: MD as is, SMD / sd_pop, None for RR or unknown."""
+    name = _field_value(extraction.get("outcome"), "name")
+    swc = owner.swc.get(name) if isinstance(name, str) else None
+    effect = extraction.get("effect")
+    kind = _field_value(effect, "type")
+    if swc is None or kind == "MD":
+        return swc
+    sd_pop = _field_value(effect, "sd_pop")
+    ok = kind == "SMD" and isinstance(sd_pop, (int, float)) and not isinstance(sd_pop, bool) and sd_pop > 0
+    return swc / float(sd_pop) if ok else None
 
 
 def cmd_score_paper(app: App) -> int:

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
+from homunculus.guardrails import HARD_RPE
 from homunculus.store import Ledger, canonical_json
 
 # --------------------------------------------------------------------------
@@ -748,9 +749,11 @@ def _shorten(session: Mapping, cut_pct: float) -> dict:
 
 
 def _lighter_session(plan: Mapping, planned: Mapping) -> Mapping | None:
-    limit = _session_load(planned)
-    lighter = [s for s in plan["sessions"] if _session_load(s) < limit]
-    return min(lighter, key=_session_load) if lighter else None
+    """Lightest session with less load and no higher intensity; never a hard session."""
+    limit, rpe = _session_load(planned), float(planned["target_rpe"])
+    lighter = [s for s in plan["sessions"] if _session_load(s) < limit
+               and float(s["target_rpe"]) <= rpe and float(s["target_rpe"]) < HARD_RPE]
+    return min(lighter, key=lambda s: (float(s["target_rpe"]), _session_load(s))) if lighter else None
 
 
 def _low_readiness(plan: Mapping, planned: Mapping) -> dict:

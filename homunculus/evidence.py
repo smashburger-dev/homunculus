@@ -916,8 +916,8 @@ def _tau_het(paper: Mapping, delta: float, scale: float) -> float:
     return max(tau, (pi[1] - pi[0]) / CI_Z_WIDTH * scale) if pi is not None else tau
 
 
-def _seeds(paper: Mapping, s: Score) -> bool:
-    if s.vetoed or s.gate not in ("actionable", "n_of_1_only") or s.certainty < SEED_MIN:
+def _seeds(paper: Mapping, s: Score, certainty: float) -> bool:
+    if s.vetoed or s.gate not in ("actionable", "n_of_1_only") or certainty < SEED_MIN:
         return False
     return _get(paper, "design") not in MECHANISTIC_ONLY
 
@@ -928,20 +928,21 @@ def to_prior(paper: Mapping, s: Score, belief_id: str) -> Prior | None:
     mu0 = s * delta with s = min(SHRINK[level], SHRINK_Z(z), SHRINK_N(n)), and
     sd0^2 = (INFLATE[level] * SE)^2 + tau_het^2, where SE comes from the 95% CI
     and tau_het = max(0.5 |delta|, prediction-interval SD). level is c floored
-    to a whole number. belief_id is validated only; the source key is
-    ``dedupe_key(paper)``.
+    to a whole number; weak methods (``quality``) cap c at WEAK_CERTAINTY_CAP
+    first. belief_id is validated only; the source key is ``dedupe_key(paper)``.
     """
     if not isinstance(belief_id, str) or not belief_id:
         raise ValueError("belief_id must be a non-empty string")
-    effect = _effect_raw(paper) if _seeds(paper, s) else None
+    certainty = min(s.certainty, WEAK_CERTAINTY_CAP) if quality(paper).weak else s.certainty
+    effect = _effect_raw(paper) if _seeds(paper, s, certainty) else None
     if effect is None:
         return None
     delta, se, z, scale = effect
-    level = min(4, int(math.floor(s.certainty)))
+    level = min(4, int(math.floor(certainty)))
     shrink = min(SHRINK[level], _band(SHRINK_Z, z), _shrink_n(paper))
     tau = _tau_het(paper, delta, scale)
     sd0 = math.sqrt((INFLATE[level] * se) ** 2 + tau * tau)
-    return Prior(shrink * delta, sd0, (dedupe_key(paper),), s.certainty, s.rubric_version)
+    return Prior(shrink * delta, sd0, (dedupe_key(paper),), certainty, s.rubric_version)
 
 
 # --- promise axis and frontier lane -------------------------------------------
@@ -961,6 +962,8 @@ class PromiseInput:
     ``human_link_share`` is the share of causal-chain links with human support
     (``deepdive`` coverage). ``plausible``: every link has some support.
     ``coherent``: no link is contested. Doses are mg/kg/day in ``species``.
+    ``direction`` is the linked claim's direction (+1 higher is better, -1
+    lower is better); without it the effect earns no benefit.
     """
     plausible: bool | None = None
     coherent: bool | None = None
@@ -970,6 +973,7 @@ class PromiseInput:
     species: str | None = None
     human_max_mg_per_kg: float | None = None
     swc_paper_units: float | None = None
+    direction: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1053,15 +1057,18 @@ def _dose_translatable(paper: Mapping, inp: PromiseInput) -> bool:
         return False
 
 
-def _benefit(paper: Mapping, swc: float | None) -> float:
-    """|effect| / (2 SWC); without a SWC, |standardized effect| / 0.5; capped at 1."""
+def _benefit(paper: Mapping, swc: float | None, direction: int | None) -> float:
+    """Signed effect / (2 SWC); without a SWC, signed standardized effect / 0.5; clamped to 0..1.
+
+    The sign is ``direction * effect``, so a harmful effect or an unknown direction earns 0.
+    """
     ci = _interval(paper)
-    if ci is None:
+    if ci is None or direction not in (1, -1):
         return 0.0
     if swc is not None and swc > 0:
-        return min(1.0, abs(ci[0]) / (BENEFIT_FULL_SWC * swc))
+        return min(1.0, max(0.0, direction * ci[0]) / (BENEFIT_FULL_SWC * swc))
     d = _standardized(paper, ci[0])
-    return min(1.0, abs(d) / BENEFIT_FULL_D) if d is not None else 0.0
+    return min(1.0, max(0.0, direction * d) / BENEFIT_FULL_D) if d is not None else 0.0
 
 
 def promise(paper: Mapping, inputs: PromiseInput | None = None) -> Promise:
@@ -1072,7 +1079,7 @@ def promise(paper: Mapping, inputs: PromiseInput | None = None) -> Promise:
         "human_links": _share(inp.human_link_share),
         "conserved": 1.0 if inp.conserved_pathway is True else 0.0,
         "dose": 1.0 if _dose_translatable(paper, inp) else 0.0,
-        "benefit": _benefit(paper, inp.swc_paper_units),
+        "benefit": _benefit(paper, inp.swc_paper_units, inp.direction),
     }
     raw = round(MAX_PROMISE * sum(PROMISE_WEIGHTS[k] * v for k, v in parts.items()), 10)
     q = quality(paper)
@@ -1099,15 +1106,28 @@ def frontier_blockers(s: Score, p: Promise, certainty: float) -> tuple[str, ...]
     return tuple(name for name, unmet in rules if unmet)
 
 
+def _capped_gate(gate: str, certainty: float) -> str:
+    """The gate after the weak-methods cap: 'actionable' needs ACTIONABLE_MIN, seeding needs SEED_MIN."""
+    if gate == "actionable" and certainty < ACTIONABLE_MIN:
+        gate = "n_of_1_only"
+    if gate == "n_of_1_only" and certainty < SEED_MIN:
+        gate = "watchlist"
+    return gate
+
+
 def appraise(paper: Mapping, s: Score, inputs: PromiseInput | None = None) -> Appraisal:
-    """Both axes and the status. Certainty decides plan strength; promise opens the frontier lane."""
+    """Both axes and the status. Certainty decides plan strength; promise opens the frontier lane.
+
+    Weak methods cap the certainty, and the status follows the capped value.
+    """
     p = promise(paper, inputs)
     weak = p.quality.weak
     certainty = min(s.certainty, WEAK_CERTAINTY_CAP) if weak else s.certainty
     value = 0.0 if s.vetoed else p.value
     blockers = frontier_blockers(s, p, certainty)
     flags = (*(("quality_weak",) if weak else ()), *(("promise_capped",) if p.capped else ()))
-    return Appraisal(certainty, value, "frontier" if not blockers else s.gate, blockers, flags)
+    status = "frontier" if not blockers else _capped_gate(s.gate, certainty)
+    return Appraisal(certainty, value, status, blockers, flags)
 
 
 # --- identifiers --------------------------------------------------------------

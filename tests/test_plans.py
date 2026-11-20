@@ -323,6 +323,18 @@ class ModulateTests(unittest.TestCase):
         with self.assertRaises(PlanError):
             plans.modulate_day(plan, 7, "low", False, False)
 
+    def test_swap_never_raises_intensity(self) -> None:
+        zone2 = {"id": "z2", "weekday": 1, "kind": "ausdauer", "duration_min": 60, "target_rpe": 4, "exercises": []}
+        intervals = {"id": "iv", "weekday": 3, "kind": "ausdauer", "duration_min": 20, "target_rpe": 9, "exercises": []}
+        plan = _plan(sessions=[zone2, intervals])
+        plan["modulation"]["readiness_low_action"] = "swap"
+        out = plans.modulate_day(plan, 1, "low", False, False)
+        self.assertEqual((out["action"], out["reason_codes"]), ("shorten", ["readiness_low", "no_lighter_session"]))
+        easy = {"id": "ez", "weekday": 5, "kind": "mobilitaet", "duration_min": 30, "target_rpe": 3, "exercises": []}
+        plan["sessions"].append(easy)
+        out = plans.modulate_day(plan, 1, "low", False, False)
+        self.assertEqual((out["action"], out["session"]["id"]), ("swap", "ez"))
+
     def test_never_increases_load_seeded(self) -> None:
         rng = random.Random(RNG_SEED)
         for _ in range(300):

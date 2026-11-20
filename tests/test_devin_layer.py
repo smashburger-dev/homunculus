@@ -198,6 +198,16 @@ class IngestTest(Case):
         with self.assertRaises(ValueError):
             devin_layer.read_input(io.StringIO("x" * (devin_layer.MAX_INPUT_BYTES + 1)))
 
+    def test_oversized_inbox_file_is_refused(self) -> None:
+        """A --file inbox far above one webhook body is not a faithful copy and never reaches the parser."""
+        path = self.tmp / "inbox.txt"
+        path.write_text("x" * (devin_layer.FILE_MAX_BYTES + 1), encoding="utf-8")
+        self.assertLess(devin_layer.FILE_MAX_BYTES, devin_layer.MAX_INPUT_BYTES)
+        with self.assertRaises(ValueError):
+            devin_layer.read_input(path=path)
+        path.write_text("x" * devin_layer.FILE_MAX_BYTES, encoding="utf-8")
+        self.assertEqual(len(devin_layer.read_input(path=path)), devin_layer.FILE_MAX_BYTES)
+
     def test_fresh_store_is_rebuilt_from_the_ledger(self) -> None:
         self.ingest(stream=io.StringIO(json.dumps(_payload())))
         item = CheckinItem("2026-11-20", "wellbeing", 7.0, None, None, "2026-11-20T07:00:00+00:00", "v1", "coach")

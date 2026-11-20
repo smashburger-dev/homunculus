@@ -13,11 +13,17 @@ Routes:
     GET  /summary?days=7                  token; daily n/min/max/avg/sum per metric and field
     GET  /workouts?since=&limit=          token
     GET  /site/*                          owner login header or token; static dashboard
-    POST <post_routes>                    owner login header or token; e.g. /checkin, /message
+    POST <post_routes>                    owner login header or token; e.g. /checkin, /message;
+                                          JSON or urlencoded only, owner posts must be same-origin
+
+The owner header counts only when Host is the tailnet name (HEALTH_OWNER_HOST,
+else any *.ts.net) and the server binds loopback; ``tailscale serve`` keeps the
+client's Host (UNVERIFIED). A local process can still forge both headers.
 
 Env (see ``load_config``):
     HEALTH_TOKEN       required, at least 32 bytes
     HEALTH_HOST        bind address, default 127.0.0.1
+    HEALTH_OWNER_HOST  tailnet name the dashboard is served on, e.g. box.tailnet.ts.net
     HEALTH_PORT        default 8787
     HEALTH_DB          SQLite path, default <HOMUNCULUS_LEDGER>/.private/health.sqlite
     HEALTH_RAW         raw payload dir, default <HOMUNCULUS_LEDGER>/.private/raw
@@ -30,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import math
@@ -81,6 +88,7 @@ class IngestConfig:
     max_limit: int = 5000
     source_map: Mapping[str, str] = field(default_factory=dict)
     api_sources: frozenset[str] = frozenset()
+    owner_host: str | None = None
 
     def __repr__(self) -> str:  # never print the token
         return f"IngestConfig(host={self.host!r}, port={self.port}, db_path={self.db_path!r}, raw_dir={self.raw_dir!r})"
@@ -165,6 +173,7 @@ def load_config(env: Mapping[str, str]) -> IngestConfig:
         token=token,
         source_map=_source_map(env.get("HEALTH_SOURCE_MAP")),
         api_sources=_api_sources(env.get("HEALTH_API_SOURCES")),
+        owner_host=(env.get("HEALTH_OWNER_HOST") or "").strip() or None,
     )
 
 
@@ -215,6 +224,40 @@ def authorized(headers: Mapping[str, str], token: str) -> bool:
 def _owner_ok(headers: Mapping[str, str], owner_login: str | None) -> bool:
     got = _header(headers, OWNER_HEADER)
     return bool(owner_login) and got is not None and _same(got, owner_login)
+
+
+def _host_name(headers: Mapping[str, str]) -> str:
+    host = (_header(headers, "Host") or "").strip().lower()
+    if host.startswith("["):  # IPv6 literal: never a tailnet name
+        return host
+    return host.rsplit(":", 1)[0].rstrip(".")
+
+
+def _owner_host_ok(headers: Mapping[str, str], owner_host: str | None) -> bool:
+    """True when Host is the tailnet name; blocks DNS rebinding onto the loopback port."""
+    name = _host_name(headers)
+    if owner_host:
+        return bool(name) and _same(name, owner_host.strip().lower().rstrip("."))
+    return name.endswith(".ts.net")
+
+
+def _same_origin(headers: Mapping[str, str]) -> bool:
+    """True for a browser request from the served origin; blocks CSRF via the owner header."""
+    site = _header(headers, "Sec-Fetch-Site")
+    if site is not None:
+        return site.strip().lower() == "same-origin"
+    origin = urlparse((_header(headers, "Origin") or "").strip())
+    host = (_header(headers, "Host") or "").strip().lower()
+    return origin.scheme == "https" and bool(host) and origin.netloc.lower() == host
+
+
+def _is_loopback(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -717,7 +760,9 @@ def _parse_form(body: bytes, headers: Mapping[str, str]) -> dict:
     ctype = (_header(headers, "Content-Type") or "").split(";")[0].strip().lower()
     if ctype == "application/x-www-form-urlencoded":
         return _form_dict(parse_qs(body.decode("utf-8"), keep_blank_values=True))
-    return _json_object(body)
+    if ctype == "application/json":
+        return _json_object(body)
+    raise _HttpError(415, {"error": "content type must be application/json or application/x-www-form-urlencoded"})
 
 
 def _content_type(path: Path) -> str:
@@ -737,9 +782,13 @@ class _App:
         if not authorized(headers, self.cfg.token):
             raise _HttpError(401, {"error": "unauthorized"})
 
-    def _require_owner(self, headers: Mapping[str, str]) -> None:
-        if not _owner_ok(headers, self.owner_login):
-            self._require_token(headers)
+    def _require_owner(self, headers: Mapping[str, str], *, write: bool = False) -> None:
+        if authorized(headers, self.cfg.token):
+            return
+        if not (_owner_ok(headers, self.owner_login) and _owner_host_ok(headers, self.cfg.owner_host)):
+            raise _HttpError(401, {"error": "unauthorized"})
+        if write and not _same_origin(headers):
+            raise _HttpError(403, {"error": "cross-site request refused"})
 
     def get(self, path: str, query: Mapping[str, list[str]], headers: Mapping[str, str]) -> Response:
         if path == "/site" or path.startswith("/site/"):
@@ -759,7 +808,7 @@ class _App:
         if route is None:
             self._require_token(headers)
             raise _HttpError(404, {"error": "not found"})
-        self._require_owner(headers)
+        self._require_owner(headers, write=True)
         status, obj = route(_parse_form(read_body(MAX_FORM_BODY), headers))
         return _json(status, obj)
 
@@ -843,8 +892,10 @@ class _Handler(BaseHTTPRequestHandler):
 def make_server(cfg: IngestConfig, store: Store, *, on_events: Callable[[list[HealthEvent]], None] | None = None,
                 post_routes: Mapping[str, PostRoute] | None = None, site_dir: Path | None = None,
                 owner_login: str | None = None) -> ThreadingHTTPServer:
-    """Bind a Brainstem server; refuses a token shorter than 32 bytes."""
+    """Bind a Brainstem server; refuses a short token and an owner login on a non-loopback bind."""
     _check_token(cfg.token)
+    if owner_login and not _is_loopback(cfg.host):
+        raise ConfigError(f"owner login needs a loopback HEALTH_HOST, got {cfg.host}")
     app = _App(cfg, store, on_events, post_routes or {}, site_dir, owner_login)
     handler = type("BrainstemHandler", (_Handler,), {"app": app})
     server = ThreadingHTTPServer((cfg.host, cfg.port), handler)

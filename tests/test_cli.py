@@ -384,6 +384,10 @@ class ExperimentTest(CliCase):
         self.assertEqual(len(csv), 1 + 6 * 14)
         allocation = [tuple(line.split(",")[:2]) for line in csv[1:]]
         self.put(self.START, 6 * 14, {"A": 0.08}, allocation)
+        code, out, _ = self.run_cli("--ledger", str(self.root), "experiment", "analyze", "exp-1")
+        self.assertEqual(code, 1)  # NOW lies inside the allocation, which runs through 2027-01-24
+        self.assertIn("allocation runs through 2027-01-24", out)
+        self.at("2027-01-25")
         self.assertEqual(self.run_cli("--ledger", str(self.root), "experiment", "analyze", "exp-1")[0], 2)  # no prior
         self.belief()
         out = self.cli_ok("experiment", "analyze", "exp-1")
@@ -391,6 +395,55 @@ class ExperimentTest(CliCase):
         result = json.loads((self.root / "experiments/exp-1/result.json").read_text(encoding="utf-8"))
         self.assertEqual(len(result["pair_diffs"]), 6)
         self.assertGreater(result["d_bar"], 0)
+
+    def at(self, day: str) -> None:
+        moment = datetime.fromisoformat(day).replace(hour=12, tzinfo=timezone.utc)
+        patch = mock.patch.object(cli, "_utcnow", lambda: moment)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def allocation(self) -> list[tuple[str, ...]]:
+        csv = (self.root / "experiments/exp-1/data.csv").read_text(encoding="utf-8").splitlines()
+        return [tuple(line.split(",")[:2]) for line in csv[1:]]
+
+    def analyze(self) -> tuple[int, str]:
+        code, out, _ = self.run_cli("--ledger", str(self.root), "experiment", "analyze", "exp-1")
+        return code, out
+
+    def test_extension_is_write_once_and_final_result_is_kept(self) -> None:
+        self.put("2026-08-01", 93)
+        self.ledger.write_json("experiments/exp-1/draft.json", self.draft(), author="pineal")
+        self.cli_ok("experiment", "design", "exp-1")
+        self.cli_ok("experiment", "allocate", "exp-1")
+        self.put(self.START, 6 * 14, {"A": 0.02}, self.allocation())
+        self.belief()
+        # Every posterior lands between reject and adopt, so the decision is extend, then inconclusive.
+        for name, value in (("ADOPT_BENEFIT", 1.01), ("REJECT_BENEFIT_BELOW", -1.0)):
+            patch = mock.patch.object(cli.experiments, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.at("2027-01-25")
+        self.assertIn("decision=extend", self.analyze()[1])
+        self.assertTrue((self.root / "experiments/exp-1/extension.json").is_file())
+        self.at("2027-01-26")  # the two extension pairs have no data yet
+        code, out = self.analyze()
+        self.assertEqual(code, 1)
+        self.assertIn("allocation runs through 2027-02-21", out)
+        result = json.loads((self.root / "experiments/exp-1/result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["decision"], "extend")
+        self.cli_ok("experiment", "allocate", "exp-1")
+        allocation = self.allocation()
+        self.assertEqual(len(allocation), 8 * 14)
+        self.put("2027-01-25", 2 * 14, {"A": 0.02}, allocation)
+        self.at("2027-02-22")
+        self.assertIn("decision=inconclusive", self.analyze()[1])
+        result = json.loads((self.root / "experiments/exp-1/result.json").read_text(encoding="utf-8"))
+        self.assertEqual((result["extended"], len(result["pair_diffs"])), (True, 8))
+        code, out = self.analyze()
+        self.assertEqual(code, 1)
+        self.assertIn("final decision 'inconclusive'", out)
+        self.assertEqual(json.loads((self.root / "experiments/exp-1/result.json").read_text(encoding="utf-8")),
+                         result)
 
     def test_ineligible_draft_is_not_frozen(self) -> None:
         self.put("2026-08-01", 93)
@@ -428,6 +481,23 @@ class ScorePaperTest(CliCase):
         self.assertEqual(self.run_cli("--ledger", str(self.root), "score-paper", str(path))[0], 1)
         path.write_text(json.dumps({"extraction": {"doi": 1}}), encoding="utf-8")
         self.assertEqual(self.run_cli("--ledger", str(self.root), "score-paper", str(path))[0], 2)
+
+
+class PaperSwcTest(unittest.TestCase):
+    OWNER = cli.OwnerProfile(sex=None, age=None, training_status=None, conditions=(), swc={"rmssd": 3.0})
+
+    @staticmethod
+    def paper(kind: str, sd_pop: float | None) -> dict:
+        f = lambda v: {"value": v, "quote": None}  # noqa: E731
+        return {"outcome": {"name": f("rmssd")}, "effect": {"type": f(kind), "sd_pop": f(sd_pop)}}
+
+    def test_owner_swc_is_converted_to_paper_units(self) -> None:
+        self.assertEqual(cli._paper_swc(self.paper("MD", 10.0), self.OWNER), 3.0)
+        self.assertAlmostEqual(cli._paper_swc(self.paper("SMD", 10.0), self.OWNER), 0.3)
+        self.assertIsNone(cli._paper_swc(self.paper("SMD", None), self.OWNER))  # scale unknown
+        self.assertIsNone(cli._paper_swc(self.paper("RR", None), self.OWNER))  # no relative SWC
+        self.assertIsNone(cli._paper_swc({**self.paper("MD", None), "outcome": {"name": {"value": "x", "quote": None}}},
+                                         self.OWNER))
 
 
 # --------------------------------------------------------------------------
@@ -505,6 +575,44 @@ class PinealWiringTest(CliCase):
         event = HealthEvent("hr_notification", "2026-11-22T03:00:00+01:00", None, "{}", "watch")
         kwargs["on_events"]([event])
         self.assertEqual([a.level for a in self.stub.delivered], ["urgent"])
+
+    def test_push_url_makes_owner_notifier_push_before_inbox(self) -> None:
+        self.assertEqual(cli._pineal_context(self.app(), self.stub).notifier, "notifier")  # no URL: inbox only
+        with mock.patch.dict(os.environ, {cli.PUSH_URL_ENV: "https://push.example.test/topic"}):
+            notifier = cli._pineal_context(self.app(), self.stub).notifier
+        self.assertIsInstance(notifier, cli.PushNotifier)
+        sent: list = []
+        inner = SimpleNamespace(send=lambda to, text, level: sent.append((to, text, level)))
+        requests: list = []
+
+        def opener(req: Any, timeout: float) -> Any:
+            requests.append(req)
+            resp = mock.MagicMock()
+            resp.__enter__.return_value.status = 200
+            return resp
+
+        cli.PushNotifier("https://push.example.test/topic", inner, token="tok", opener=opener).send(
+            "owner", "Blutdruck sehr hoch", "urgent")
+        self.assertEqual(requests[0].data.decode("utf-8"), "Blutdruck sehr hoch")
+        self.assertEqual(requests[0].get_header("Priority"), "urgent")
+        self.assertEqual(requests[0].get_header("Authorization"), "Bearer tok")
+        self.assertEqual(sent, [("owner", "Blutdruck sehr hoch", "urgent")])
+
+    def test_failed_push_raises_so_alert_is_not_marked_delivered(self) -> None:
+        sent: list = []
+        inner = SimpleNamespace(send=lambda *a: sent.append(a))
+
+        def opener(req: Any, timeout: float) -> Any:
+            raise OSError("offline")
+
+        with self.assertRaises(OSError):
+            cli.PushNotifier("https://push.example.test/topic", inner, opener=opener).send("owner", "x", "urgent")
+        self.assertEqual(sent, [])
+
+    def test_push_url_must_be_https(self) -> None:
+        with mock.patch.dict(os.environ, {cli.PUSH_URL_ENV: "http://push.example.test/topic"}):
+            with self.assertRaises(cli.UsageError):
+                cli._pineal_context(self.app(), self.stub)
 
     def test_serve_refuses_short_token(self) -> None:
         with mock.patch.dict(os.environ, {"HEALTH_TOKEN": "short"}):
@@ -651,7 +759,12 @@ class DevinCliTest(CliCase):
         self.assertEqual(self.run_cli("--ledger", str(self.root), "devin-task", "nope")[0], 2)
         stub = StubPineal()
         with mock.patch.object(cli, "_pineal", lambda: stub):
-            self.assertIn("finalize_day p: ok", self.cli_ok("tick", "--devin-path", "b"))
+            code, out, err = self.run_cli("--ledger", str(self.root), "tick", "--devin-path", "b")
+            self.assertIn("finalize_day p: ok", out)
+            self.assertIn(cli.PUSH_URL_ENV, err)  # file-only delivery on the box is reported, not silent
+            with mock.patch.dict(os.environ, {cli.PUSH_URL_ENV: "https://push.example.test/topic"}):
+                code, out, err = self.run_cli("--ledger", str(self.root), "tick", "--devin-path", "b")
+            self.assertEqual((code, err), (0, ""))
 
     def test_message_short_circuits_urgent_text(self) -> None:
         text = self.tmp / "message.txt"
@@ -687,6 +800,7 @@ class FrontierCliTest(CliCase):
         self.ledger.write_json(self.PAPER, rec, author="pineal")
         self.ledger.write_text("quarantine/demo-c4.txt", demo.abstract(paper) + "\n\n" + demo.MECHANISM_SOURCES,
                                author="pineal")
+        demo.seed_mechanism_papers(self.ledger, cli.owner_profile(demo.OWNER, date(2026, 11, 15)))
 
     def dive(self, fixtures: dict | None) -> tuple[int, str, str]:
         real = agents.FakeProvider

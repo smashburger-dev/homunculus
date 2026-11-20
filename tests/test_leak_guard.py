@@ -34,6 +34,11 @@ def synthetic_payload(points: int, *, nested: bool = True, seed: int = RNG_SEED)
     return {"data": metrics} if nested else metrics
 
 
+def synthetic_route(points: int) -> list[dict]:
+    """Points around 0/0 (open ocean), never a real place."""
+    return [{"lat": i * 1e-4, "lon": i * 1e-4, "altitude": 0} for i in range(points)]
+
+
 def fake_key(prefix: str, length: int) -> str:
     rng = random.Random(RNG_SEED)
     alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -135,7 +140,72 @@ class RuleTests(TreeCase):
         self.assertEqual(self.rules(), {("assets/big.bin", "large_file")})
 
 
+class LedgerShapeTests(TreeCase):
+    def test_ledger_dirs(self) -> None:
+        for rel in (".private/inbox.txt", "data/summaries/2026/t.json", "data/daily/2026/d.json",
+                    "checkins/c.md", "quarantine/q.txt", "site/index.html", "x/data/daily/d.json"):
+            self.put(rel, "x")
+        self.put("homunculus/data/x.json", "{}")
+        self.put("docs/daily/x.md", "x")
+        self.put("homunculus/checkins.py", "x")
+        flagged = {path for path, rule in self.rules() if rule == "data_dir"}
+        self.assertEqual(flagged, {".private/inbox.txt", "data/summaries/2026/t.json",
+                                   "data/daily/2026/d.json", "checkins/c.md", "quarantine/q.txt",
+                                   "site/index.html", "x/data/daily/d.json"})
+
+    def test_points_add_up_across_metrics_and_workouts(self) -> None:
+        doc = synthetic_payload(20)
+        doc["data"]["metrics"].append(dict(doc["data"]["metrics"][0], name="other"))
+        self.put("two.json", json.dumps(doc))
+        one = synthetic_payload(20)
+        one["data"]["workouts"] = [{"name": "w"}]
+        self.put("workout.json", json.dumps(one))
+        self.assertEqual(self.rules(), {("two.json", "hae_payload"), ("workout.json", "hae_payload")})
+
+    def test_gps_routes(self) -> None:
+        self.put("w.json", json.dumps({"data": {"workouts": [{"route": synthetic_route(1)}]}}))
+        self.put("pts.json", json.dumps({"track": synthetic_route(3)}))
+        self.put("one.json", json.dumps({"home": {"lat": 0.0, "lon": 0.0}}))
+        self.put("cfg.json", json.dumps({"route": ["a", "b"]}))
+        self.assertEqual(self.rules(), {("w.json", "gps_route"), ("pts.json", "gps_route")})
+
+    def test_export_formats(self) -> None:
+        for rel in ("e.csv", "r.GPX", "export.xml", "a/export.zip", "t.tcx"):
+            self.put(rel, "x")
+        self.put("docs/n.md", "x")
+        self.assertEqual({p for p, r in self.rules() if r == "export_file"},
+                         {"e.csv", "r.GPX", "export.xml", "a/export.zip", "t.tcx"})
+
+    def test_token_fields(self) -> None:
+        self.put("tok.json", json.dumps({"access_token": "x" * 10, "nested": {"refresh_token": "y"}}))
+        self.put("c.json", json.dumps([{"Cookie": "s=1"}]))
+        self.put("empty.json", json.dumps({"access_token": "", "refresh_token": None}))
+        self.put("tests/fixtures/t.json", json.dumps({"synthetic": True, "access_token": "z"}))
+        expected = {("tok.json", "token_json"), ("c.json", "token_json"),
+                    ("tests/fixtures/t.json", "token_json")}
+        self.assertEqual(self.rules(), expected)
+
+    def test_more_github_keys(self) -> None:
+        keys = [fake_key("gh" + "s_", 36), fake_key("gh" + "u_", 36), fake_key("github" + "_pat_", 82)]
+        for i, key in enumerate(keys):
+            self.put(f"homunculus/k{i}.py", f"TOKEN = '{key}'\n")
+        details = {f.detail for f in leak_guard.scan(self.root)}
+        self.assertEqual(details, {"github-server key pattern", "github-user key pattern",
+                                   "github-fine-grained key pattern"})
+
+
 class SyntheticAllowlistTests(TreeCase):
+    def test_large_synthetic_file_is_not_exempt(self) -> None:
+        doc = synthetic_payload(3000)
+        doc["synthetic"] = True
+        self.put("tests/fixture.json", json.dumps(doc))
+        self.assertEqual(self.rules(), {("tests/fixture.json", "hae_payload")})
+
+    def test_small_synthetic_route_and_export_are_exempt(self) -> None:
+        self.put("tests/fixtures/r.json", json.dumps({"synthetic": True, "route": synthetic_route(3)}))
+        self.put("tests/fixtures/e.csv", "# leak-guard: synthetic\na,b\n")
+        self.assertEqual(self.rules(), set())
+
     def test_synthetic_field_exempts_payload_in_tests(self) -> None:
         doc = synthetic_payload(30)
         doc["synthetic"] = True
@@ -187,6 +257,48 @@ class CandidateFileTests(unittest.TestCase):
             self.assertEqual(leak_guard.scan(Path(tmp), ["gone.db"]), [])
 
 
+class GitBlobTests(unittest.TestCase):
+    """Hook modes read git blobs, never the working tree."""
+
+    def scan(self, blobs: dict[str, bytes | None], rev: str | None = None) -> tuple[list, list]:
+        calls: list = []
+
+        def git_list(root, args):
+            calls.append(args)
+            return [spec.split(":", 1)[1] for spec in blobs]
+
+        with mock.patch.object(leak_guard, "_git_list", side_effect=git_list), \
+                mock.patch.object(leak_guard, "_git_blob", side_effect=lambda root, spec: blobs[spec]):
+            return leak_guard.scan_git(Path("/nonexistent"), rev), calls
+
+    def test_staged_blobs_are_scanned(self) -> None:
+        found, calls = self.scan({":a.py": b"x = 1\n", ":ledger/b.txt": b"x"})
+        self.assertEqual({(f.path, f.rule) for f in found}, {("ledger/b.txt", "data_dir")})
+        self.assertEqual(calls[0][:2], ["diff", "--cached"])
+
+    def test_staged_content_wins_over_missing_working_tree(self) -> None:
+        found, _ = self.scan({":homunculus/x.json": json.dumps(synthetic_payload(30)).encode()})
+        self.assertEqual({f.rule for f in found}, {"hae_payload"})
+
+    def test_rev_tree_is_scanned(self) -> None:
+        found, calls = self.scan({"abc:c.csv": b"a,b\n"}, rev="abc")
+        self.assertEqual({(f.path, f.rule) for f in found}, {("c.csv", "export_file")})
+        self.assertEqual(calls[0][:2], ["ls-tree", "-r"])
+
+    def test_unreadable_blob_fails_closed(self) -> None:
+        found, _ = self.scan({":a.py": None})
+        self.assertEqual({(f.path, f.rule) for f in found}, {("a.py", "unreadable")})
+
+    def test_git_blob_reads_index_spec(self) -> None:
+        done = subprocess.CompletedProcess(["git"], 0, stdout=b"data", stderr=b"")
+        with mock.patch.object(leak_guard.subprocess, "run", return_value=done) as run:
+            self.assertEqual(leak_guard._git_blob(Path("."), ":a.py"), b"data")
+        self.assertEqual(run.call_args.args[0], ["git", "cat-file", "blob", ":a.py"])
+        failed = subprocess.CompletedProcess(["git"], 128, stdout=b"", stderr=b"")
+        with mock.patch.object(leak_guard.subprocess, "run", return_value=failed):
+            self.assertIsNone(leak_guard._git_blob(Path("."), ":a.py"))
+
+
 class MainTests(TreeCase):
     def run_main(self, *args: str) -> tuple[int, str]:
         err = io.StringIO()
@@ -203,6 +315,18 @@ class MainTests(TreeCase):
         code, err = self.run_main()
         self.assertEqual(code, 1)
         self.assertIn("health.db: sqlite", err)
+
+    def test_staged_mode_fails_closed_without_git(self) -> None:
+        self.put("a.py", "x = 1\n")
+        code, err = self.run_main("--staged")
+        self.assertEqual(code, 1)
+        self.assertIn("git could not list", err)
+
+    def test_staged_mode_uses_blobs(self) -> None:
+        with mock.patch.object(leak_guard, "scan_git", return_value=[]) as scan_git:
+            self.assertEqual(self.run_main("--staged")[0], 0)
+            self.assertEqual(self.run_main("--rev", "HEAD")[0], 0)
+        self.assertEqual([c.args[1] for c in scan_git.call_args_list], [None, "HEAD"])
 
     def test_explicit_paths(self) -> None:
         self.put("health.db", b"")

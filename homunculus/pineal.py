@@ -45,6 +45,7 @@ MAX_ATTEMPTS = 2  # first run plus at most one retry per period
 WRITER = "pineal"
 RUNS_LOG = "ops/runs.jsonl"
 ALERTS_LOG = "data/alerts.jsonl"
+COACHING_CLEARED_LOG = "data/coaching_cleared.jsonl"  # owner-confirmed doctor clearance per urgent alert
 NOTICES_LOG = "ops/notices.jsonl"
 HEARTBEAT_DIR = "ops/heartbeats"
 INCIDENT_DIR = "ops/incidents"
@@ -65,6 +66,10 @@ GOAL_RECIPIENTS = ("hippocampus", "motor_cortex", "sartorius", "vagus")
 MESSAGE_MAX = 4000
 STALE_BLOCKING = ("heart_rate_variability", "sleep_segments")
 ALERT_DAYS = 2  # today and yesterday count as active
+# Days a prompt alert keeps the session at rest, counting its own day; other prompt rules get ALERT_DAYS
+# (the alert day and the next morning). Urgent alerts hold until cleared in COACHING_CLEARED_LOG.
+PROMPT_HOLD_DAYS: Mapping[str, int] = MappingProxyType({"dark_urine": 3, "focal_bone_pain": 7})
+PROFILE_RULES = frozenset({"missed_periods"})  # date-free rules: evaluated for today only
 INBOX_MAX = 5
 NOTES_MAX = 2000
 THALAMUS_WEEKDAY = 3  # Thursday: submit; other days only collect a running batch
@@ -106,6 +111,23 @@ _URGENT_RES = {
     symptom: tuple(re.compile(r"(?<![0-9a-z])" + re.escape(t)) for t in terms)
     for symptom, terms in URGENT_TERMS.items()
 }
+
+# Coach replies: amounts with a dose unit, and normalized phrases that add load, fast, skip meals or
+# name calories, matched at word starts. "faste" covers fasten/fastest/fastet, not German "fast".
+_DOSE_RE = re.compile(r"\d+(?:[.,]\d+)?\s*(?:mg|mcg|µg|μg|ug|g|iu|ie)(?!\w)")
+COACH_BANNED_PHRASES: tuple[str, ...] = (
+    # added load
+    "satze extra", "satz extra", "extra satz", "extra satze", "zusatzlicher satz", "zusatzliche satze",
+    "zusatzliche einheit", "extra einheit", "mehr satze", "mehr wiederholungen", "mehr gewicht",
+    "extra set", "extra reps", "add a set", "more weight",
+    # fasting, skipping meals, eating less, calories
+    "faste", "intervallfast", "fasting", "abendessen weg", "fruhstuck weg",
+    "mittagessen weg", "mahlzeit weg", "mahlzeit auslassen", "mahlzeiten auslassen", "abendessen auslassen",
+    "fruhstuck auslassen", "mittagessen auslassen", "abendessen ausfallen", "fruhstuck ausfallen",
+    "iss weniger", "weniger essen", "weniger zu essen", "nichts essen", "skip a meal", "skip breakfast",
+    "skip lunch", "skip dinner", "eat less", "kalorie", "kcal", "calorie",
+)
+_COACH_BANNED_RE = re.compile(r"(?<![0-9a-z])(?:" + "|".join(map(re.escape, COACH_BANNED_PHRASES)) + ")")
 
 _HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 _HOURLY_RE = re.compile(r"^:([0-5]\d)$")
@@ -617,18 +639,63 @@ def _today_snapshot(ctx: Context, day: str) -> dict:
     return metrics.baselines(ctx.store, day, ctx.metrics_cfg)
 
 
+def _alert_key(row: Mapping) -> tuple[str, str]:
+    return str(row.get("rule_id")), str(row.get("date"))
+
+
+def _age_days(row: Mapping, day: str) -> int | None:
+    try:
+        return (Date.fromisoformat(day) - Date.fromisoformat(str(row.get("date"))[:10])).days
+    except ValueError:
+        return None
+
+
+def _holds(row: Mapping, day: str, cleared: set[tuple[str, str]]) -> bool:
+    """An urgent alert holds until cleared; a prompt alert for its rule's PROMPT_HOLD_DAYS."""
+    age = _age_days(row, day)
+    if age is None or age < 0:
+        return False
+    if row.get("level") == "urgent":
+        return _alert_key(row) not in cleared
+    return age < PROMPT_HOLD_DAYS.get(str(row.get("rule_id")), ALERT_DAYS)
+
+
+def _cleared(ledger: Ledger) -> set[tuple[str, str]]:
+    return {_alert_key(r) for r in ledger.read_jsonl(COACHING_CLEARED_LOG)}
+
+
 def _recent_alerts(ledger: Ledger, day: str) -> list[dict]:
+    """Alerts of the last ALERT_DAYS days plus every alert still holding; 'hold' marks the latter."""
     days = {_shift(day, -k) for k in range(ALERT_DAYS)}
-    rows = (r for r in ledger.read_jsonl(ALERTS_LOG) if str(r.get("date")) in days)
-    return [{"level": r.get("level"), "rule_id": r.get("rule_id"), "date": r.get("date")} for r in rows]
+    cleared = _cleared(ledger)
+    out = []
+    for r in ledger.read_jsonl(ALERTS_LOG):
+        hold = _holds(r, day, cleared)
+        if hold or str(r.get("date")) in days:
+            out.append({"level": r.get("level"), "rule_id": r.get("rule_id"), "date": r.get("date"), "hold": hold})
+    return out
+
+
+def coaching_holds(ledger: Ledger, day: str) -> list[dict]:
+    """Urgent alerts that pause coaching on day until the owner clears them."""
+    return [a for a in _recent_alerts(ledger, day) if a["hold"] and a["level"] == "urgent"]
+
+
+def clear_coaching_hold(ctx: Context) -> int:
+    """Owner confirmed a doctor has seen them: lift every urgent hold; returns how many were cleared."""
+    held = coaching_holds(ctx.ledger, _local_now(ctx).date().isoformat())
+    for a in held:
+        ctx.ledger.append_jsonl(COACHING_CLEARED_LOG, {
+            "rule_id": a["rule_id"], "date": a["date"], "cleared_at": _stamp(ctx),
+        }, author=WRITER)
+    return len(held)
 
 
 def _modulation(plan: Mapping | None, now: datetime, snap: Mapping, fresh: Mapping, alerts: Sequence[Mapping]) -> dict | None:
     if plan is None:
         return None
-    day = now.date().isoformat()
     band = (snap.get("readiness") or {}).get("band")
-    red = any(a.get("level") == "urgent" or a.get("date") == day for a in alerts)
+    red = any(a.get("hold") for a in alerts)
     stale = any(fresh.get(k, {}).get("stale", True) for k in STALE_BLOCKING)
     return plans.modulate_day(plan, now.weekday(), band, red, stale)
 
@@ -679,10 +746,28 @@ def _ask(ctx: Context, name: str, context: Mapping[str, Any], schema: Mapping[st
     return dict(resp.structured or {}), resp
 
 
-def _safe_reply(structured: Mapping[str, Any]) -> str | None:
-    """The coach's reply, or None when it is empty or holds banned diagnostic vocabulary."""
+def _rules(ledger: Ledger) -> guardrails.Rules:
+    try:
+        return guardrails.load_rules(ledger)
+    except ValueError:  # a broken config must not drop the built-in forbidden list
+        return guardrails.Rules()
+
+
+def _coach_text_problem(text: str, rules: guardrails.Rules) -> bool:
+    """Diagnosis words, forbidden products, doses, added load, fasting or meal skipping."""
+    norm = guardrails.normalize_name(text)
+    return bool(
+        guardrails.scan_text(text) or guardrails.forbidden_match(text, rules)
+        or _DOSE_RE.search(text.casefold()) or _COACH_BANNED_RE.search(norm)
+    )
+
+
+def _safe_reply(structured: Mapping[str, Any], rules: guardrails.Rules | None = None) -> str | None:
+    """The coach's reply, or None when it is empty or breaks a coach rule (_coach_text_problem)."""
     text = str(structured.get("reply_de") or "").strip()
-    return text if text and not guardrails.scan_text(text) else None
+    if not text or _coach_text_problem(text, rules or guardrails.Rules()):
+        return None
+    return text
 
 
 def _store_chat_checkin(ctx: Context, extracted: Any, now: datetime) -> int:
@@ -752,7 +837,7 @@ def _coach_reply(ctx: Context, bot: str, text: str, now: datetime) -> tuple[str,
     if bot == "vagus":
         untrusted["checkin_notes"] = _recent_notes(ctx.store, now.date().isoformat())
     out, _ = _ask(ctx, bot, context, COACH_REPLY_SCHEMA, _message_run_id(bot, now), untrusted)
-    return _safe_reply(out) or FALLBACK_DE, _store_chat_checkin(ctx, out.get("checkin"), now)
+    return _safe_reply(out, _rules(ctx.ledger)) or FALLBACK_DE, _store_chat_checkin(ctx, out.get("checkin"), now)
 
 
 def _goal_update(ctx: Context, update: str, resp: agents.LLMResponse, now: datetime) -> None:
@@ -784,7 +869,7 @@ def _cerebellum_reply(ctx: Context, _bot: str, text: str, now: datetime) -> tupl
     out, resp = _ask(ctx, "cerebellum", context, GOAL_TALK_SCHEMA, _message_run_id("cerebellum", now),
                      {"owner_message": text})
     _apply_goal_talk(ctx, out, resp, now)
-    return _safe_reply(out) or FALLBACK_DE, 0
+    return _safe_reply(out, _rules(ctx.ledger)) or FALLBACK_DE, 0
 
 
 _ROUTES: Mapping[str, Callable[[Context, str, str, datetime], tuple[str, int]]] = MappingProxyType({
@@ -883,13 +968,20 @@ def _job_budget(ctx: Context, _period: str) -> JobResult:
     return JobResult("ok", (), f"budget {level}")
 
 
-def _job_red_flags(ctx: Context, _period: str) -> JobResult:
-    day = _local_now(ctx).date().isoformat()
-    metrics.finalize_day(ctx.store, day, ctx.metrics_cfg)
+def _day_flags(ctx: Context, day: str, profile: Mapping[str, Any]) -> list[Alert]:
     since = _shift(day, -RED_FLAG_LOOKBACK_DAYS)
     daily = {key: ctx.store.daily(key, since, _shift(day, 1)) for key in RED_FLAG_KEYS}
     rhr = [metrics.rhr_state(daily["rhr"], _shift(day, -k)) for k in (2, 1, 0)]
-    alerts = guardrails.red_flags(daily, rhr, ctx.store.checkins(day, _shift(day, 1)), day, _profile(ctx.ledger))
+    return guardrails.red_flags(daily, rhr, ctx.store.checkins(day, _shift(day, 1)), day, profile)
+
+
+def _job_red_flags(ctx: Context, _period: str) -> JobResult:
+    """Today and yesterday: a morning sync carries the previous evening's values and check-ins."""
+    day = _local_now(ctx).date().isoformat()
+    metrics.finalize_day(ctx.store, day, ctx.metrics_cfg)
+    profile = _profile(ctx.ledger)
+    earlier = [a for a in _day_flags(ctx, _shift(day, -1), profile) if a.rule_id not in PROFILE_RULES]
+    alerts = sorted(_day_flags(ctx, day, profile) + earlier, key=lambda a: a.level != "urgent")
     alerts += guardrails.event_alerts(ctx.store.events("hr_notification", _shift(day, -1)))
     sent = deliver_alerts(ctx, alerts)
     return JobResult("ok", (ALERTS_LOG,) if sent else (), f"{sent} alerts delivered")
@@ -929,13 +1021,15 @@ def _coach_job(name: str, bot: str, task: str) -> Callable[[Context, str], JobRe
     @_llm_job
     def run(ctx: Context, period: str) -> JobResult:
         now = _local_now(ctx)
+        if coaching_holds(ctx.ledger, now.date().isoformat()):
+            return JobResult("skipped", (), "coaching paused: urgent alert not cleared")
         context = _coach_context(ctx, bot, task, now)
         if bot == "sartorius" and context["plan_current"] is None:
             return JobResult("skipped", (), "no plan")
         out, resp = _ask(ctx, bot, context, COACH_REPLY_SCHEMA, _run_id(name, period))
-        text = _safe_reply(out)
+        text = _safe_reply(out, _rules(ctx.ledger))
         if text is None:
-            return JobResult("failed", (), "reply rejected by scan_text")
+            return JobResult("failed", (), "reply rejected by coach text guard")
         ctx.notifier.send("owner", text, "info")
         stored = _store_chat_checkin(ctx, out.get("checkin"), now)
         return JobResult("ok", (), f"{bot} {task} sent, {stored} check-in items")

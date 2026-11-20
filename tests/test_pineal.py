@@ -17,7 +17,7 @@ from homunculus.agents import Budget, FakeProvider
 from homunculus.guardrails import Alert
 from homunculus.metrics import MetricsConfig
 from homunculus.pineal import Context, FileNotifier, Job, JobResult
-from homunculus.store import Ledger, Store
+from homunculus.store import DailyValue, Ledger, Store
 
 ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime(2026, 11, 20, 7, 31, tzinfo=timezone.utc)  # Friday of 2026-W47
@@ -579,6 +579,75 @@ class TrackerJobTest(PinealCase):
         self.assertEqual((review["surfaced"], review["met"], len(review["next"])), (0, False, 1))
         texts = [m.get("body", "") for m in self.owner_mail()]
         self.assertTrue(any("Abendessen vor 19 Uhr" in t for t in texts), texts)
+
+
+# --------------------------------------------------------------------------
+# Coaching holds, late red flags and the coach text guard
+
+
+NORMAL = {"readiness": {"band": "normal"}}
+FRESH = {k: {"stale": False} for k in pineal.STALE_BLOCKING}
+
+
+class CoachingHoldTest(PinealCase):
+    def action(self, day: str) -> str:
+        now = datetime.fromisoformat(f"{day}T07:00:00+00:00")
+        weekday_plan = {"sessions": [{"weekday": now.weekday(), "duration_min": 60, "exercises": []}]}
+        alerts = pineal._recent_alerts(self.ledger, day)
+        return pineal._modulation(weekday_plan, now, NORMAL, FRESH, alerts)["action"]
+
+    def test_evening_prompt_alert_rests_next_morning(self) -> None:
+        pineal.deliver_alerts(self.ctx, [Alert("prompt", "focal_bone_pain", "2026-11-19", {})])
+        self.assertEqual(self.action(DAY), "rest")
+        self.assertEqual(self.action("2026-11-25"), "rest")
+        self.assertEqual(self.action("2026-11-26"), "as_planned")
+
+    def test_other_prompt_alert_holds_through_next_morning_only(self) -> None:
+        pineal.deliver_alerts(self.ctx, [Alert("prompt", "spo2_low", "2026-11-19", {"days": 3, "min": 90})])
+        self.assertEqual((self.action(DAY), self.action("2026-11-21")), ("rest", "as_planned"))
+
+    def test_urgent_alert_holds_until_cleared(self) -> None:
+        pineal.deliver_alerts(self.ctx, [Alert("urgent", "symptom_urgent", "2026-11-16", {"symptoms": ["chest_pain"]})])
+        self.assertEqual(self.action("2026-11-18"), "rest")  # day 3
+        self.use_fixtures({"vagus": {"reply_de": "Guten Morgen.", "checkin": {}}})
+        job = {j.name: j for j in pineal.default_jobs()}["vagus_morning"]
+        out = pineal.run_job(self.ctx, job, DAY)
+        self.assertEqual((out["status"], self.fake.calls), ("skipped", []), out)
+        self.assertEqual(pineal.clear_coaching_hold(self.ctx), 1)
+        self.assertEqual(pineal.coaching_holds(self.ledger, DAY), [])
+        self.assertEqual(self.action(DAY), "as_planned")
+
+
+class LateRedFlagTest(PinealCase):
+    def test_yesterdays_bp_from_morning_sync_alerts(self) -> None:
+        y = "2026-11-19"
+        self.store.put_daily([DailyValue(y, "bp_sys", 190.0, "other", 1, "ok"),
+                              DailyValue(y, "bp_dia", 125.0, "other", 1, "ok")])
+        job = {j.name: j for j in pineal.default_jobs()}["red_flags"]
+        out = pineal.run_job(self.ctx, job, "2026-11-20T07")
+        self.assertEqual(out["status"], "ok", out)
+        rows = [(r["rule_id"], r["date"]) for r in self.ledger.read_jsonl(pineal.ALERTS_LOG)]
+        self.assertEqual(rows, [("bp_high", y)])
+        pineal.run_job(self.ctx, job, "2026-11-20T08")
+        self.assertEqual(len(self.ledger.read_jsonl(pineal.ALERTS_LOG)), 1)
+
+
+class CoachTextGuardTest(PinealCase):
+    def test_rejects_load_dose_fasting_and_forbidden(self) -> None:
+        for text in ("Heute 2 Sätze extra und 400 mg Koffein vorher.", "Lass heute das Abendessen weg.",
+                     "Nimm 1000 IE Vitamin D.", "Probier mal Intervallfasten.", "Faste bis mittags.",
+                     "Achte auf 2500 kcal.", "Ein Betablocker hilft da.", "Das klingt nach Insomnie."):
+            self.assertIsNone(pineal._safe_reply({"reply_de": text}), text)
+
+    def test_keeps_plain_replies(self) -> None:
+        for text in ("Du hast fast 8 Stunden geschlafen.", "Heute 40 Minuten locker.",
+                     "Iss genug, bevor du trainierst."):
+            self.assertEqual(pineal._safe_reply({"reply_de": text}), text)
+
+    def test_owner_reply_with_meal_skip_gets_fallback(self) -> None:
+        self.use_fixtures({"vagus": {"reply_de": "Lass heute das Abendessen weg.", "checkin": {}}})
+        status, body = pineal.handle_owner_message(self.ctx, "vagus", "Was soll ich heute essen?")
+        self.assertEqual((status, body["reply_de"]), (200, pineal.FALLBACK_DE))
 
 
 if __name__ == "__main__":

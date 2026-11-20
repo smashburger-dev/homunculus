@@ -427,9 +427,64 @@ MECHANISM_SOURCES = (
     "an early ten-hour window improved circadian clock alignment. "
     "Synthetic source C (doi:10.5555/demo.0102): in healthy adults, higher nocturnal vagal tone went with "
     "higher overnight heart rate variability. "
+    "Synthetic source B (doi:10.5555/demo.0103): in rats, realigned clock gene expression raised nocturnal "
+    "vagal tone. "
     "Synthetic source D: the feeding-entrained clock pathway is conserved across mammals. "
     "All data in these sources are synthetic."
 )
+
+
+def _source(doi: str, design: str, title: str, s: Mapping[str, str], v: Mapping[str, Any]) -> dict:
+    base = {"sex": "mixed", "age_mean": None, "training": None, "k": None, "i2": None, "unit": "SD", "type": "SMD",
+            "reg": None}
+    return {"doi": doi, "design": design, "title": title, "sentences": s, "values": {**base, **v}}
+
+
+_PREREG = {"prereg": True, "randomized": True, "blinded_outcome": True}
+_BLINDED = {"blinded": "Outcome assessors were blinded to group allocation.",
+            "registration_id": "The protocol was preregistered."}
+
+# The papers the deep dive cites, scored by code before the dive: unscored citations count nothing.
+MECHANISM_PAPERS: tuple[dict[str, Any], ...] = (
+    _source("10.5555/demo.0101", "rct_crossover", "Synthetic crossover trial: early eating window and clock alignment",
+            {"design": "In a randomized crossover trial in adults, eating within an early ten-hour window improved "
+                       "circadian clock alignment.",
+             "n_total": "Thirty-six adults completed both periods.",
+             "population": "Participants were recreationally active men and women aged 30 on average.",
+             "effect": "Circadian alignment improved by 0.50 SD (95% CI 0.20 to 0.80)."},
+            {"n_total": 36, "age_mean": 30.0, "training": "recreational", "outcome": "circadian_alignment",
+             "est": 0.5, "lo": 0.2, "hi": 0.8}),
+    _source("10.5555/demo.0102", "mechanistic_human", "Synthetic mechanistic study: vagal tone and overnight HRV",
+            {"design": "In this randomized mechanistic study, healthy adults had nocturnal vagal tone raised or "
+                       "left unchanged.",
+             "n_total": "A total of 160 healthy adults took part.",
+             "population": "Participants were recreationally active men and women aged 32 on average.",
+             "effect": "Higher nocturnal vagal tone went with higher overnight heart rate variability "
+                       "(0.50 SD, 95% CI 0.25 to 0.75).", **_BLINDED},
+            {"n_total": 160, "age_mean": 32.0, "training": "recreational", "outcome": "nocturnal_hrv",
+             "est": 0.5, "lo": 0.25, "hi": 0.75, **_PREREG}),
+    _source("10.5555/demo.0103", "animal", "Synthetic rodent study: clock alignment and nocturnal vagal tone in rats",
+            {"design": "In this randomized study, rats were assigned to clock-aligned or misaligned light schedules.",
+             "n_total": "Forty rats completed the protocol.", "population": "The animals were adult male rats.",
+             "effect": "Realigned clock gene expression raised nocturnal vagal tone by 0.70 SD "
+                       "(95% CI 0.30 to 1.10).", **_BLINDED},
+            {"n_total": 40, "sex": "male", "outcome": "vagal_tone", "est": 0.7, "lo": 0.3, "hi": 1.1, **_PREREG}),
+)
+
+
+def seed_mechanism_papers(ledger: Ledger, owner: Any) -> list[str]:
+    """Write the deep dive's cited papers as code-scored ledger records; returns their paths."""
+    rels = []
+    for paper in MECHANISM_PAPERS:
+        ext = extraction(paper)
+        score = evidence.score(ext, owner, update_to=[], swc_paper_units=None)
+        rel = weekly._paper_rel(paper["doi"])
+        ledger.write_json(rel, {"schema": 1, "rubric_version": evidence.RUBRIC_VERSION, "doi": paper["doi"],
+                                "meta": {"title": paper["title"]}, "update_to": [], "resolved": False,
+                                "extraction": ext, "blocked": False, "score": dataclasses_asdict(score)},
+                          author=cli.CODE_AUTHOR)
+        rels.append(rel)
+    return rels
 
 
 def _ev(paper: str, design: str, quote: str) -> dict:
@@ -455,8 +510,8 @@ DEEP_DIVE: dict[str, Any] = {
             "doi:10.5555/demo.0101", "rct_crossover",
             "eating within an early ten-hour window improved circadian clock alignment")]),
         _dive_link("l2", _CLOCK, _VAGAL, "biomarker", [_ev(
-            f"doi:{FRONTIER_DOI}", "animal",
-            "raised nocturnal vagal tone through realigned clock gene expression")],
+            "doi:10.5555/demo.0103", "animal",
+            "realigned clock gene expression raised nocturnal vagal tone")],
             "Hebt eine bessere Ausrichtung der inneren Uhr den nächtlichen Vagotonus auch beim Menschen?",
             ["vagal tone", "time-restricted eating"]),
         _dive_link("l3", _VAGAL, _HRV, "outcome", [_ev(
@@ -700,6 +755,7 @@ def step_frontier(run: Run, llm: Mapping[str, Any]) -> dict:
     """Appraise the rodent study, deep-dive it into an N-of-1 candidate, then re-appraise; cap the weak pilot."""
     frontier_rel = weekly._paper_rel(FRONTIER_DOI)
     before = _appraise_paper(run, frontier_rel)
+    seed_mechanism_papers(run.ledger, cli.owner_profile(OWNER, run.cal.now.date()))
     sources = scouts.quarantine_text(run.ledger, "demo-c4-sources", MECHANISM_SOURCES, author="retina")
     paper = next(p for p in PAPERS if p["doi"] == FRONTIER_DOI)
     text = f"{paper['title']}\n\n{abstract(paper)}\n\n{run.ledger.read_text(sources)}"

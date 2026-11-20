@@ -21,6 +21,7 @@ from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from homunculus import stats
+from homunculus.checkins import SYMPTOM_PREFIX
 from homunculus.store import CheckinItem, DailyValue, Sample, SleepNight, SleepSegment, Store, Workout
 
 DAILY_KEYS = (
@@ -46,7 +47,10 @@ ASLEEP_STAGES = frozenset({"asleep", "core", "rem", "deep", "unspecified"})
 
 _DAY_MIN = 1440
 _WAKE_SHIFT = timedelta(hours=6)  # samples from 18:00 on belong to the night ending next morning
-_NAP_HOURS = range(10, 18)  # segments starting in this local window are naps, not main sleep
+_SLEEP_GAP = timedelta(minutes=90)  # asleep segments closer than this belong to one sleep bout
+_BED_ANCHOR_MIN = 1080  # 18:00, the wake-date boundary; later bedtimes count as minutes before midnight
+_RPE_LATE_DAYS = 2  # _load_rows accepts session RPE dated up to two days after the workout
+_RECOVERY_DAYS = 3  # days after a symptom check-in that stay out of baselines
 _MAD_K = 1.4826
 _RHR_FLOOR = 1.0
 _Z_CAP = 3.0
@@ -285,35 +289,62 @@ def _night_from_row(night: SleepNight, tz: str) -> _Night:
     return _Night(start, end, hours, night.source, 1)
 
 
-def _main_sleep(seg: SleepSegment, day: str, tz: str) -> bool:
-    start = _local(seg.start, tz)
-    return seg.stage in ASLEEP_STAGES and start.hour not in _NAP_HOURS and wake_date(seg.start, tz) == day
+def _asleep_on(seg: SleepSegment, day: str, tz: str) -> bool:
+    return seg.stage in ASLEEP_STAGES and wake_date(seg.start, tz) == day
+
+
+def _span_seconds(spans: Sequence[tuple[datetime, datetime]]) -> float:
+    return math.fsum((b - a).total_seconds() for a, b in spans)
+
+
+def _main_bout(rows: Sequence[SleepSegment], tz: str) -> list[tuple[datetime, datetime]]:
+    """Spans of the longest bout: asleep segments joined across gaps up to _SLEEP_GAP; the rest are naps."""
+    bouts: list[list[tuple[datetime, datetime]]] = []
+    end = None
+    for a, b in sorted((_parse_ts(s.start, tz), _parse_ts(s.end, tz)) for s in rows):
+        if not bouts or a - end > _SLEEP_GAP:
+            bouts.append([])
+            end = b
+        bouts[-1].append((a, b))
+        end = max(end, b)
+    return max(bouts, key=_span_seconds, default=[])
 
 
 def _night_from_segments(segments: Sequence[SleepSegment], day: str, cfg: MetricsConfig) -> _Night | None:
-    main = [s for s in segments if _main_sleep(s, day, cfg.tz)]
-    source, rows = _canonical(main, cfg.sources("tst_h"))
-    if not rows:
+    asleep = [s for s in segments if _asleep_on(s, day, cfg.tz)]
+    source, rows = _canonical(asleep, cfg.sources("tst_h"))
+    spans = _main_bout(rows, cfg.tz)
+    if not spans:
         return None
-    spans = [(_parse_ts(s.start, cfg.tz), _parse_ts(s.end, cfg.tz)) for s in rows]
-    seconds = math.fsum((b - a).total_seconds() for a, b in spans)
-    return _Night(min(a for a, _ in spans), max(b for _, b in spans), seconds / 3600.0, source, len(rows))
+    seconds = _span_seconds(spans)
+    return _Night(min(a for a, _ in spans), max(b for _, b in spans), seconds / 3600.0, source, len(spans))
 
 
 def _night_for(nights: Sequence[SleepNight], segments: Sequence[SleepSegment], day: str,
                cfg: MetricsConfig) -> _Night | None:
     """The canonical source's night: nights and segments compete by source priority, not by table."""
     rows = [n for n in nights if n.wake_date == day]
-    main = [s for s in segments if _main_sleep(s, day, cfg.tz)]
-    source = pick_source([*rows, *main], cfg.sources("tst_h"))
+    asleep = [s for s in segments if _asleep_on(s, day, cfg.tz)]
+    source = pick_source([*rows, *asleep], cfg.sources("tst_h"))
     own = [n for n in rows if n.source == source]
     if own:
         return _night_from_row(own[0], cfg.tz)
-    return _night_from_segments([s for s in main if s.source == source], day, cfg)
+    return _night_from_segments([s for s in asleep if s.source == source], day, cfg)
 
 
 def _clock_of(dt: datetime | None, tz: str) -> float | None:
     return None if dt is None else _clock_min(dt.astimezone(ZoneInfo(tz)))
+
+
+def _bedtime_of(dt: datetime | None, tz: str) -> float | None:
+    """Signed minutes from local midnight: 23:30 -> -30, 00:30 -> 30; 18:00 onwards counts as before midnight.
+
+    Bedtimes straddle midnight, so linear means, SDs and thresholds need this continuous scale.
+    """
+    clock = _clock_of(dt, tz)
+    if clock is None:
+        return None
+    return clock - _DAY_MIN if clock >= _BED_ANCHOR_MIN else clock
 
 
 def _midpoint(night: _Night) -> datetime | None:
@@ -328,7 +359,7 @@ def _sleep_rows(night: _Night | None, day: str, tz: str) -> list[DailyValue]:
     values = {
         "tst_h": night.asleep_h,
         "sleep_mid_min": _clock_of(_midpoint(night), tz),
-        "sleep_start_min": _clock_of(night.start, tz),
+        "sleep_start_min": _bedtime_of(night.start, tz),
     }
     return [DailyValue(day, k, v, night.source, night.n, _quality(v, [night])) for k, v in values.items()]
 
@@ -415,11 +446,33 @@ def build_daily(store: Store, day: str, cfg: MetricsConfig) -> list[DailyValue]:
     return [rows[k] for k in DAILY_KEYS]
 
 
+def _late_load_rows(store: Store, day: str, cfg: MetricsConfig) -> list[DailyValue]:
+    """Load rows rebuilt for the already stored days before `day` whose session RPE may still arrive."""
+    stored = {r.date for r in store.daily("load_srpe", _shift(day, -_RPE_LATE_DAYS), day)}
+    return [r for d in sorted(stored) for r in _load_rows(store, d, cfg)]
+
+
 def finalize_day(store: Store, day: str, cfg: MetricsConfig) -> list[DailyValue]:
-    """build_daily, then store the rows."""
+    """build_daily, then store the rows; returns the rows of `day`.
+
+    The load rows of the _RPE_LATE_DAYS stored days before are rebuilt too, so a
+    session RPE logged the next morning still reaches the load history.
+    """
     rows = build_daily(store, day, cfg)
-    store.put_daily(rows)
+    store.put_daily([*rows, *_late_load_rows(store, day, cfg)])
     return rows
+
+
+def illness_days(store: Store, since: str, until: str) -> frozenset[str]:
+    """Dates in [since, until) with a ticked symptom, plus the _RECOVERY_DAYS after each."""
+    items = store.checkins(_shift(since, -_RECOVERY_DAYS), until)
+    sick = {it.date for it in items if it.item.startswith(SYMPTOM_PREFIX) and it.value}
+    days = {_shift(d, k) for d in sick for k in range(_RECOVERY_DAYS + 1)}
+    return frozenset(d for d in days if since <= d < until)
+
+
+def _without(by_date: Mapping[str, float], exclude: frozenset[str] | set[str]) -> Mapping[str, float]:
+    return {d: v for d, v in by_date.items() if d not in exclude} if exclude else by_date
 
 
 # --------------------------------------------------------------------------
@@ -464,16 +517,18 @@ def _only_source(series: Sequence[DailyValue], source: str | None) -> Sequence[D
     return series if source is None else [r for r in series if r.source == source]
 
 
-def hrv_state(series: Sequence[DailyValue], day: str, source: str | None = None) -> HrvState:
+def hrv_state(series: Sequence[DailyValue], day: str, source: str | None = None,
+              exclude: frozenset[str] = frozenset()) -> HrvState:
     """7-day mean of daily ln HRV against the days -67..-8 baseline.
 
     m7 needs 5 of 7 days, the baseline 30 values with spread. overreach_hint
     fires when the state is suppressed and day-to-day variation (cv7) exceeds
     the baseline's own coefficient of variation. With source (the key's lock)
-    only that source's rows count.
+    only that source's rows count. Dates in exclude (illness_days) stay out of
+    the baseline, so a cold does not inflate sd60 for the next weeks.
     """
     by_date = _by_date(_only_source(series, source))
-    week, base = _window(by_date, day, -6, 0), _window(by_date, day, -67, -8)
+    week, base = _window(by_date, day, -6, 0), _window(_without(by_date, exclude), day, -67, -8)
     m7 = stats.mean(week) if len(week) >= 5 else None
     cv7 = _cv(week) if m7 is not None else None
     mu60, sd60 = (stats.mean(base), stats.sd(base)) if len(base) >= 30 else (None, None)
@@ -817,8 +872,9 @@ def _dense(series: Sequence[DailyValue], day: str, back: int) -> list[float | No
     return [by_date.get(_shift(day, k)) for k in range(-back, 1)]
 
 
-def _z_today(by_date: Mapping[str, float], day: str, lo: int = -28, hi: int = -1) -> float | None:
-    base = _window(by_date, day, lo, hi)
+def _z_today(by_date: Mapping[str, float], day: str, lo: int = -28, hi: int = -1,
+             exclude: frozenset[str] = frozenset()) -> float | None:
+    base = _window(_without(by_date, exclude), day, lo, hi)
     today = by_date.get(day)
     if today is None or len(base) < 14:
         return None
@@ -829,18 +885,18 @@ def _rolling_mid_sd(mids: Mapping[str, float], day: str) -> float | None:
     return midpoint_sd([mids.get(_shift(day, k)) for k in range(-6, 1)])
 
 
-def _midpoint_sd_z(mids: Mapping[str, float], day: str) -> float | None:
+def _midpoint_sd_z(mids: Mapping[str, float], day: str, exclude: frozenset[str] = frozenset()) -> float | None:
     sds = {_shift(day, k): _rolling_mid_sd(mids, _shift(day, k)) for k in range(-28, 1)}
-    return _z_today({d: v for d, v in sds.items() if v is not None}, day)
+    return _z_today({d: v for d, v in sds.items() if v is not None}, day, exclude=exclude)
 
 
 def _neg(x: float | None) -> float | None:
     return None if x is None else -x
 
 
-def _wellness_z(store: Store, day: str) -> float | None:
+def _wellness_z(store: Store, day: str, exclude: frozenset[str] = frozenset()) -> float | None:
     items = store.checkins(_shift(day, -28), _shift(day, 1), item=WELLNESS_ITEM)
-    return _z_today({it.date: it.value for it in items if it.value is not None}, day)
+    return _z_today({it.date: it.value for it in items if it.value is not None}, day, exclude=exclude)
 
 
 def _hrv_z(state: HrvState) -> float | None:
@@ -848,14 +904,15 @@ def _hrv_z(state: HrvState) -> float | None:
 
 
 def _readiness_components(store: Store, day: str, hrv: HrvState, rhr: RhrState,
-                          tst: Mapping[str, float], mids: Mapping[str, float]) -> dict[str, float | None]:
+                          tst: Mapping[str, float], mids: Mapping[str, float],
+                          ill: frozenset[str] = frozenset()) -> dict[str, float | None]:
     rhr_z = None if rhr.z is None else max(-_Z_CAP, min(_Z_CAP, rhr.z))
     return {
         "hrv": _hrv_z(hrv),
         "rhr": _neg(rhr_z),
-        "tst": _z_today(tst, day),
-        "midpoint_sd": _neg(_midpoint_sd_z(mids, day)),
-        "wellness": _wellness_z(store, day),
+        "tst": _z_today(tst, day, exclude=ill),
+        "midpoint_sd": _neg(_midpoint_sd_z(mids, day, ill)),
+        "wellness": _wellness_z(store, day, ill),
     }
 
 
@@ -885,11 +942,12 @@ def _vo2_block(series: Sequence[DailyValue]) -> dict:
 
 def baselines(store: Store, day: str, cfg: MetricsConfig) -> dict:
     """JSON-serializable snapshot of every baseline for data/baselines/<week>.json."""
-    hrv = {k: hrv_state(_series(store, f"hrv_{k}_ln", day, 67), day, cfg.locked.get(f"hrv_{k}_ln"))
+    ill = illness_days(store, _shift(day, -67), day)
+    hrv = {k: hrv_state(_series(store, f"hrv_{k}_ln", day, 67), day, cfg.locked.get(f"hrv_{k}_ln"), ill)
            for k in ("sdnn", "rmssd")}
     rhr = rhr_state(_series(store, "rhr", day, 36), day, cfg.locked.get("rhr"))
     tst, mids = _series(store, "tst_h", day, 34), _series(store, "sleep_mid_min", day, 34)
-    components = _readiness_components(store, day, hrv["sdnn"], rhr, _by_date(tst), _by_date(mids))
+    components = _readiness_components(store, day, hrv["sdnn"], rhr, _by_date(tst), _by_date(mids), ill)
     return {
         "date": day,
         "hrv": {k: asdict(v) for k, v in hrv.items()},

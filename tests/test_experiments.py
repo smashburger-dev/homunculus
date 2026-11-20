@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 
+from homunculus import beliefs as B
 from homunculus import experiments as E
 from homunculus import stats
 from homunculus.beliefs import Prior
@@ -327,6 +328,61 @@ class WriteProtocolTest(unittest.TestCase):
                 E.write_protocol(ledger, replace(p, pairs=8))
             with self.assertRaises(PathNotAllowed):
                 E.write_protocol(ledger, protocol(id="exp-0002"), author="sartorius")
+
+
+CLAIM = B.Claim("adult", "x", "control", "outcome_y", "u", 1)
+
+
+def belief_events(mu0=0.0, sd0=2.0):
+    return [B.make_event("prior_set", "b-test", "2026-01-01", claim=CLAIM, prior=prior(mu0, sd0), swc=0.5,
+                         q_per_day=0.0)]
+
+
+def result(decision, d_bar=2.0, se=0.5):
+    return E.Result((d_bar,) * 6, d_bar, se, 0.03, 0.0, 1.0, 0.9, 0.01, decision, None, 0)
+
+
+class BeliefLedgerTest(unittest.TestCase):
+    def test_starting_prior_uses_posterior_without_own_result(self):
+        p = protocol()
+        other = B.make_event("personal_result", "b-test", "2026-03-01", est=1.0, se=1.0, experiment="exp-0000")
+        own = B.make_event("personal_result", "b-test", "2026-03-02", est=9.0, se=0.1, experiment=p.id)
+        start = E.starting_prior(belief_events() + [other, own], p, "2026-04-01")
+        mu, sd = stats.normal_update(0.0, 2.0, 1.0, 1.0)
+        self.assertAlmostEqual(start.mu0, mu)
+        self.assertAlmostEqual(start.sd0, sd)
+        self.assertEqual(start.sources, ("reg:T",))
+        with self.assertRaises(E.ProtocolError):
+            E.starting_prior([], p, "2026-04-01")
+
+    def test_record_result_reaches_views_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Ledger(tmp, {})
+            for ev in belief_events():
+                ledger.append_jsonl(B.EVENTS_PATH, ev, author="pineal")
+            p = protocol()
+            self.assertIsNone(E.record_result(ledger, p, result("extend"), "2026-03-01"))
+            self.assertEqual(len(ledger.read_jsonl(B.EVENTS_PATH)), 1)
+            ev = E.record_result(ledger, p, result("adopt"), "2026-03-01")
+            self.assertEqual((ev["kind"], ev["est"], ev["se"], ev["experiment"]), ("personal_result", 2.0, 0.5, p.id))
+            self.assertIsNone(E.record_result(ledger, p, result("adopt"), "2026-03-02"))
+            self.assertEqual(len(ledger.read_jsonl(B.EVENTS_PATH)), 2)
+            view = ledger.read_json("beliefs/views/b-test.json")
+            mu, sd = stats.normal_update(0.0, 2.0, 2.0, 0.5)
+            self.assertAlmostEqual(view["mu"], mu)
+            self.assertAlmostEqual(view["sd"], sd)
+
+    def test_retest_starts_from_first_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Ledger(tmp, {})
+            for ev in belief_events():
+                ledger.append_jsonl(B.EVENTS_PATH, ev, author="pineal")
+            E.record_result(ledger, protocol(), result("adopt"), "2026-03-01")
+            retest = protocol(id="exp-0002", start_date="2026-04-01")
+            start = E.starting_prior(ledger.read_jsonl(B.EVENTS_PATH), retest, "2026-04-01")
+            mu, sd = stats.normal_update(0.0, 2.0, 2.0, 0.5)
+            self.assertAlmostEqual(start.mu0, mu)
+            self.assertAlmostEqual(start.sd0, sd)
 
 
 if __name__ == "__main__":

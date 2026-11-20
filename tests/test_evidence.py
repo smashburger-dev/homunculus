@@ -690,7 +690,7 @@ def animal(**over) -> dict:
 
 
 FULL_INPUTS = E.PromiseInput(plausible=True, coherent=True, conserved_pathway=True, human_link_share=2 / 3,
-                             dose_mg_per_kg=50.0, species="rat", human_max_mg_per_kg=10.0)
+                             dose_mg_per_kg=50.0, species="rat", human_max_mg_per_kg=10.0, direction=1)
 
 
 class PromiseTest(unittest.TestCase):
@@ -730,9 +730,21 @@ class PromiseTest(unittest.TestCase):
         self.assertEqual(dict(E.promise(paper(), no_species).components)["dose"], 1.0)  # human study
 
     def test_benefit_against_swc(self):
-        inputs = E.PromiseInput(swc_paper_units=2.0)
+        inputs = E.PromiseInput(swc_paper_units=2.0, direction=1)
         self.assertAlmostEqual(dict(E.promise(paper(), inputs).components)["benefit"], 0.5)
         self.assertEqual(dict(E.promise(paper()).components)["benefit"], 0.0)  # MD without SWC or sd_pop
+
+    def test_benefit_needs_the_desirable_direction(self):
+        def benefit(p, **kw):
+            return dict(E.promise(p, E.PromiseInput(**kw)).components)["benefit"]
+        harmful = animal(effect__est=-1.2, effect__ci_lo=-1.6, effect__ci_hi=-0.8)
+        self.assertEqual(benefit(harmful, direction=1), 0.0)
+        self.assertEqual(benefit(harmful, direction=-1), 1.0)  # lower is better: the drop is the benefit
+        self.assertEqual(benefit(harmful), 0.0)  # unknown direction earns nothing
+        self.assertEqual(benefit(animal()), 0.0)
+        self.assertEqual(benefit(animal(), direction=1), 1.0)
+        self.assertEqual(benefit(paper(), swc_paper_units=2.0, direction=-1), 0.0)
+        self.assertAlmostEqual(benefit(paper(), swc_paper_units=2.0, direction=1), 0.5)
 
     def test_weak_methods_cap_both_axes(self):
         sloppy = animal(randomized=None, blinded_outcome=None, registration_id=None)
@@ -745,6 +757,20 @@ class PromiseTest(unittest.TestCase):
         a = E.appraise(rct, s, FULL_INPUTS)
         self.assertEqual(a.certainty, 1.0)
         self.assertIn("quality_weak", a.flags)
+        self.assertEqual(a.status, "n_of_1_only")
+        self.assertEqual(E.to_prior(rct, s, "b1").certainty, 1.0)
+
+    def test_weak_meta_rct_is_not_actionable_and_seeds_a_weak_prior(self):
+        clean, switched = case1(), case1(outcome_switched=True)
+        s_clean, s = doc_run(clean), doc_run(switched)
+        self.assertEqual((s.certainty, s.gate), (3.0, "actionable"))
+        self.assertEqual(E.appraise(clean, s_clean, FULL_INPUTS).status, "actionable")
+        a = E.appraise(switched, s, FULL_INPUTS)
+        self.assertEqual((a.certainty, a.status), (1.0, "n_of_1_only"))
+        strong, weak = E.to_prior(clean, s_clean, "b1"), E.to_prior(switched, s, "b1")
+        self.assertEqual(weak.certainty, 1.0)
+        self.assertAlmostEqual(weak.mu0, E.SHRINK[1] * 0.35 * 2.0)  # level 1, not 3
+        self.assertGreater(weak.sd0, strong.sd0)
 
     def test_clean_animal_study_enters_frontier(self):
         p = animal()

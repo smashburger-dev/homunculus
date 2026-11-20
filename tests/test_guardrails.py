@@ -32,7 +32,14 @@ FEATURES = {
                  "energy_system": "glycolytic", "joint_load": {"hip": "moderate"}},
     "ex-nordic": {"exercise_id": "ex-nordic", "pattern": "hinge", "contraction": "eccentric overload",
                   "energy_system": "glycolytic", "joint_load": {"knee": "moderate"}},
+    "ex-squat2": {"exercise_id": "ex-squat2", "pattern": "squat", "contraction": "concentric",
+                  "energy_system": "glycolytic", "joint_load": {"knee": "moderate"}},
+    "ex-jump": {"exercise_id": "ex-jump", "pattern": "squat", "contraction": "plyometric",
+                "energy_system": "alactic", "joint_load": {"knee": "high"}},
+    "ex-row-heavy": {"exercise_id": "ex-row-heavy", "pattern": "horizontal pull", "contraction": "concentric",
+                     "energy_system": "glycolytic", "joint_load": {"shoulder": "high"}},
 }
+HISTORY = ("ex-row2", "ex-hinge", "ex-squat2", "ex-jump", "ex-row-heavy")  # used in earlier plan versions
 
 
 def _ex(eid: str, sets: int = 3, novel: bool = False, probation: bool | None = None) -> dict:
@@ -97,6 +104,18 @@ class NamesAndForbiddenTests(unittest.TestCase):
         self.assertEqual(g.forbidden_match("Hypoxiezelt nachts", rules), "altitude_protocol")
         self.assertIsNone(g.forbidden_match("Kreatin", rules))
         self.assertIsNone(g.forbidden_match("Tempo-Lauf", rules))  # 'epo' only as a whole word
+        self.assertIsNone(g.forbidden_match("Epochen-Plan", rules))
+
+    def test_forbidden_compounds_and_brands(self) -> None:
+        rules = g.Rules()
+        cases = {
+            "Testosteronspritze": "wada_prohibited", "Entwässerungstabletten": "dehydration_cut",
+            "Ozempic": "prescription_drug", "Wegovy": "prescription_drug", "Mounjaro": "prescription_drug",
+            "Clen": "wada_prohibited", "Anavar": "wada_prohibited", "ein Diuretikum": "dehydration_cut",
+            "Lasix": "dehydration_cut", "Saunaanzug": "dehydration_cut",
+        }
+        for text, category in cases.items():
+            self.assertEqual(g.forbidden_match(text, rules), category, text)
 
     def test_forbidden_custom(self) -> None:
         rules = g.Rules(forbidden={"custom": ["Fantasy Stack"]})
@@ -254,6 +273,16 @@ class CheckDiffLoadTests(unittest.TestCase):
         no_ref = _check(_with_duration(52), _ctx(weekly_loads=[0, 0, 0, 0], days_off=30))
         self.assertIn("return_no_reference", no_ref.rule_ids)
 
+    def test_return_cap_binds_unchanged_and_reduced_plans(self) -> None:
+        ctx = _ctx(weekly_loads=[700, 700, 700, 650], days_off=9)  # cap 455
+        reduced = _check(_with_duration(45), ctx)  # load 570, below the current 600
+        self.assertIn("return_cap", reduced.rule_ids)
+        self.assertEqual(reduced.tier, "reject")
+        unchanged = _plan()
+        unchanged["modulation"]["allow_swap"] = False  # load stays 600
+        self.assertIn("return_cap", _check(unchanged, ctx).rule_ids)
+        self.assertNotIn("return_cap", _check(_with_duration(10), ctx).rule_ids)  # load 360
+
     def test_hard_sessions(self) -> None:
         plan = _plan()
         for s in plan["sessions"]:
@@ -270,20 +299,69 @@ class CheckDiffExerciseTests(unittest.TestCase):
         plan["sessions"][session]["exercises"].append(ex)
         return plan
 
-    def test_volume_change_notify(self) -> None:
+    def _edit(self, **fields) -> dict:
         plan = _plan()
-        plan["sessions"][0]["exercises"][0]["sets"] = 4
-        self.assertEqual(_check(plan).tier, "notify")
+        plan["sessions"][1]["exercises"][0].update(fields)  # ex-squat: 3 x 8 x 20 kg, rir 2
+        return plan
+
+    def test_volume_change_tiers(self) -> None:
+        self.assertEqual(_check(self._edit(load_kg=21.0)).tier, "notify")     # +5 %
+        small = _check(self._edit(load_kg=23.0))                                # +15 %
+        self.assertEqual(small.tier, "approve")
+        self.assertIn("exercise_volume_approve", small.rule_ids)
+        self.assertEqual(_check(self._edit(sets=4)).tier, "reject")           # +33 %
+        self.assertEqual(_check(self._edit(sets=2)).tier, "notify")           # decrease
+        self.assertEqual(_check(self._edit(load_kg=None)).tier, "notify")     # 20 kg -> bodyweight
+
+    def test_big_exercise_load_jump_rejects(self) -> None:
+        v = _check(self._edit(load_kg=140.0, sets=10, rir=0))
+        self.assertEqual(v.tier, "reject")
+        self.assertIn("exercise_volume_reject", v.rule_ids)
+        self.assertIn("exercise_rir_down", v.rule_ids)
+        self.assertEqual(_check(self._edit(rir=1)).tier, "approve")
 
     def test_swap_same_pattern_notify(self) -> None:
         plan = _plan()
         plan["sessions"][0]["exercises"][0] = _ex("ex-row2")
-        v = _check(plan)
+        v = _check(plan, _ctx(known_exercises=HISTORY))
         self.assertEqual(v.tier, "notify")
         self.assertIn("swap_same_pattern", v.rule_ids)
 
+    def test_swap_to_riskier_exercise_is_not_a_swap(self) -> None:
+        heavier = _plan()
+        heavier["sessions"][0]["exercises"][0] = _ex("ex-row-heavy")  # shoulder moderate -> high
+        v = _check(heavier, _ctx(known_exercises=HISTORY))
+        self.assertNotIn("swap_same_pattern", v.rule_ids)
+        self.assertEqual(v.tier, "approve")
+        jump = _plan()
+        jump["sessions"][1]["exercises"][0] = _ex("ex-jump", sets=6)  # concentric -> plyometric
+        self.assertNotIn("swap_same_pattern", _check(jump, _ctx(known_exercises=HISTORY)).rule_ids)
+        lighter = _plan()
+        lighter["sessions"][1]["exercises"][0] = _ex("ex-squat2")
+        self.assertIn("swap_same_pattern", _check(lighter, _ctx(known_exercises=HISTORY)).rule_ids)
+
+    def test_novelty_comes_from_history_not_the_flag(self) -> None:
+        jump = _plan()
+        jump["sessions"][1]["exercises"][0] = _ex("ex-jump", sets=6)  # novel=False from the LLM
+        v = _check(jump)
+        self.assertEqual(v.tier, "reject")
+        self.assertIn("novel_sets", v.rule_ids)
+        self.assertIn("novel_probation", v.rule_ids)
+
+    def test_probation_progress_needs_pain_free_sessions(self) -> None:
+        cur = _plan()
+        cur["sessions"][0]["exercises"].append(_ex("ex-hinge", sets=2, novel=True))
+        for change in ({"novel": False, "probation": False}, {"sets": 3, "novel": True}):
+            new = copy.deepcopy(cur)
+            new["sessions"][0]["exercises"][2].update(change)
+            v = _check(new, cur=cur)
+            self.assertEqual(v.tier, "reject" if "sets" in change else "approve")
+            self.assertIn("probation_progress", v.rule_ids)
+            done = _check(new, _ctx(pain_free_sessions={"ex-hinge": 2}), cur=cur)
+            self.assertNotIn("probation_progress", done.rule_ids)
+
     def test_added_exercise_needs_approval(self) -> None:
-        v = _check(self._add(_ex("ex-hinge")))
+        v = _check(self._add(_ex("ex-hinge")), _ctx(known_exercises=HISTORY))
         self.assertEqual(v.tier, "approve")
         self.assertIn("exercise_added", v.rule_ids)
 
@@ -377,16 +455,62 @@ class CheckDiffNutritionTests(unittest.TestCase):
         self.assertIn("kcal_new_target", v.rule_ids)
         self.assertEqual(v.tier, "approve")
 
+    def test_new_target_is_checked_as_deficit(self) -> None:
+        cur = self._kcal(None)
+        flagged = _check(self._kcal(1200), _ctx(ed_watch=True, kcal_current=None), cur=cur)
+        self.assertEqual(flagged.tier, "reject")
+        self.assertIn("deficit_while_flagged", flagged.rule_ids)
+        unknown = _check(self._kcal(1200), _ctx(kcal_current=None), cur=cur)
+        self.assertIn("loss_rate_unknown", unknown.rule_ids)
+        self.assertEqual(_check(self._kcal(1200), cur=cur).tier, "reject")  # 1300 kcal below intake
+        above = _check(self._kcal(2600), _ctx(ed_watch=True), cur=cur)
+        self.assertEqual(above.tier, "approve")
+
     def test_fasting_and_text(self) -> None:
         plan = _plan()
         plan["nutrition"]["notes_de"] = "Einmal pro Woche 36-Stunden-Fasten"
         self.assertIn("fast_too_long", _check(plan).rule_ids)
         plan["nutrition"]["notes_de"] = "16 h Intervallfasten an Ruhetagen"
-        self.assertEqual(_check(plan).tier, "notify")
+        self.assertEqual(_check(plan).tier, "approve")  # free text needs the owner's yes
+        self.assertNotIn("fast_too_long", _check(plan).rule_ids)
+        for text in ("Fasten für 1 Woche, nur Wasser", "Fasten über eine Woche", "fasting for 2 weeks"):
+            plan["nutrition"]["notes_de"] = text
+            self.assertIn("fast_too_long", _check(plan).rule_ids, text)
         plan["nutrition"]["notes_de"] = "Vor dem Wiegen Wasserentzug"
         self.assertIn("forbidden:dehydration_cut", _check(plan).rule_ids)
         plan["nutrition"]["notes_de"] = "Wegen Infekt weniger Training"
         self.assertIn("banned_term", _check(plan).rule_ids)
+
+
+class CheckDiffFreeTextTests(unittest.TestCase):
+    def _notes(self, text: str) -> g.Verdict:
+        plan = _plan()
+        plan["nutrition"]["notes_de"] = text
+        return _check(plan, rules=g.Rules(supplements={"Koffein": {"max_dose": 200, "unit": "mg"}}))
+
+    def test_notes_need_approval(self) -> None:
+        v = self._notes("Iss an Ruhetagen nur 1000 kcal und lass das Frühstück weg.")
+        self.assertEqual(v.tier, "approve")
+        self.assertIn("free_text", v.rule_ids)
+        self.assertIn("dose_in_text", v.rule_ids)
+        supp = self._notes("Nimm täglich 600 mg Koffein und 10 g Kreatin, dazu Yohimbin.")
+        self.assertIn("supplement_in_text", supp.rule_ids)
+        self.assertEqual(supp.tier, "approve")
+        drugs = self._notes("Testosteronspritze oder Entwässerungstabletten, Ozempic, Clen, Diuretikum, Lasix")
+        self.assertEqual(drugs.tier, "reject")
+        self.assertTrue(any(r.startswith("forbidden:") for r in drugs.rule_ids))
+        self.assertEqual(self._notes("").tier, "auto")  # clearing the notes
+
+    def test_session_kind_needs_approval(self) -> None:
+        plan = _plan()
+        plan["sessions"][1]["kind"] = "VO2max 8x4 min all-out + Sprints"
+        v = _check(plan)
+        self.assertEqual(v.tier, "approve")
+        self.assertIn("free_text", v.rule_ids)
+        added = _plan()
+        added["sessions"].append({"id": "s3", "weekday": 5, "kind": "Sprints", "duration_min": 5,
+                                  "target_rpe": 6, "exercises": []})
+        self.assertIn("free_text", _check(added).rule_ids)
 
 
 class CheckDiffMiscTests(unittest.TestCase):
@@ -407,6 +531,15 @@ class CheckDiffMiscTests(unittest.TestCase):
         self.assertIn("single_study", v.rule_ids)
         two = ["evidence/papers/a.json", "evidence/papers/b.json"]
         self.assertEqual(_check(_with_duration(52), refs=two).tier, "auto")
+        same_file = ["evidence/papers/a.json", "evidence/papers/a.json#/effect"]
+        v = _check(_with_duration(52), refs=same_file)
+        self.assertEqual(v.tier, "approve")
+        self.assertIn("single_study", v.rule_ids)
+
+    def test_frontier_refs_need_approval(self) -> None:
+        v = _check(_with_duration(52), refs=["evidence/deepdives/x.json"])
+        self.assertEqual(v.tier, "approve")
+        self.assertIn("frontier_evidence", v.rule_ids)
 
     def test_paths(self) -> None:
         cur = _plan()
@@ -484,6 +617,31 @@ class RedFlagTests(unittest.TestCase):
         self.assertEqual(alerts[1].data, {})  # no text copied into alert data
         other_day = self._flags(checkins=[_checkin("symptom:fainting", day="2026-03-09")])
         self.assertEqual(other_day, [])
+
+    def test_note_text_raises_urgent_symptoms(self) -> None:
+        alerts = self._flags(checkins=[_checkin("note", None, "Brustschmerzen beim Intervall")])
+        self.assertEqual([(a.rule_id, a.data) for a in alerts], [("symptom_urgent", {"symptoms": ["chest_pain"]})])
+        both = self._flags(checkins=[_checkin("symptom:chest_pain"), _checkin("note", None, "kaum Luft bekommen")])
+        self.assertEqual(both[0].data["symptoms"], ["chest_pain", "short_breath"])
+        self.assertEqual(self._flags(checkins=[_checkin("note", None, "Lockerer Lauf, gute Beine")]), [])
+
+    def test_urgent_symptom_phrasings(self) -> None:
+        cases = {
+            "Druck in der Brust": ["chest_pain"], "Schmerzen im Brustkorb": ["chest_pain"],
+            "Stechen in der Brust": ["chest_pain"], "my chest hurts": ["chest_pain"],
+            "bekomme kaum Luft": ["short_breath"], "bin beim Laufen umgefallen": ["fainting"],
+            "Beine schwer, sonst gut": [],
+        }
+        for text, expected in cases.items():
+            self.assertEqual(g.urgent_symptoms(text), expected, text)
+
+    def test_self_harm_phrasings(self) -> None:
+        for text in ("Ich habe Suizidgedanken", "Ich bin suizidal", "Selbstmordgedanken seit Tagen",
+                     "bin lebensmüde", "Ich will nicht mehr.", "Ich will nicht mehr", "habe mich geritzt",
+                     "möchte nicht mehr aufwachen", "Ich will nicht mehr, alles ist sinnlos"):
+            self.assertTrue(g._self_harm(text), text)
+        for text in ("Ich will nicht mehr so viel Cardio", "Neues Ritzel am Rad", "Lauf war hart"):
+            self.assertFalse(g._self_harm(text), text)
 
     def test_bp(self) -> None:
         alerts = self._flags({"bp_sys": _series("bp_sys", {0: 182.0}), "bp_dia": _series("bp_dia", {0: 95.0})})

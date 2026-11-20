@@ -391,6 +391,12 @@ class FileTokenStore:
 
 
 _KEYCHAIN_NOT_FOUND = 44  # exit status of 'security' for a missing item
+_SECURITY_LINE_MAX = 4096  # 'security -i' runs the rest of a longer stdin line as a new command
+
+
+def _security_quote(value: str) -> str:
+    """One double-quoted argument for a 'security -i' command line."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 class KeychainTokenStore:
@@ -412,8 +418,14 @@ class KeychainTokenStore:
         return token_from_json(proc.stdout.strip())
 
     def save(self, name: str, token: Token) -> None:
-        proc = self._security("add-generic-password", "-U", "-s", self.service, "-a", _check_name(name),
-                              "-w", token_to_json(token))
+        # The secret goes to 'security -i' on stdin, never into argv where ps can read it.
+        # ASCII-only JSON keeps the line free of control characters and 'find -w' from printing hex.
+        secret = json.dumps(json.loads(token_to_json(token)), sort_keys=True, separators=(",", ":"))
+        args = ("add-generic-password", "-U", "-s", self.service, "-a", _check_name(name), "-w", secret)
+        line = " ".join(map(_security_quote, args)) + "\n"
+        if len(line) > _SECURITY_LINE_MAX:
+            raise TrackerError("token too large for the keychain; use FileTokenStore")
+        proc = self._run(["security", "-i"], input=line, capture_output=True, text=True, check=False)
         if proc.returncode != 0:
             raise TrackerError("keychain write failed")
 

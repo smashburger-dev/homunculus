@@ -20,7 +20,10 @@ that would run more than one frontier experiment is re-asked, and Amygdala
 round 1 must challenge every frontier promotion with the deep-dive ref.
 
 ``run_insula`` and ``run_motor_cortex`` are the Saturday steps,
-``run_thalamus`` the Thursday batch extraction. All LLM calls go through
+``run_thalamus`` the Thursday batch extraction, which first runs
+``recheck_retractions`` over every stored paper and deep-dive citation.
+Free text from extracted papers and deep dives stays out of the packet; the
+review bots get it as a ``<data>`` block (``packet_texts``). All LLM calls go through
 ``agents.call`` or the roster provider's batch API, priced by ``Budget``.
 This module never commits; Pineal commits what it wrote.
 """
@@ -38,7 +41,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
-from homunculus import agents, beliefs, deepdive, evidence, experiments, guardrails, insula, metrics, plans, scouts
+from homunculus import (agents, beliefs, deepdive, evidence, experiments, guardrails, insula, lexicon, metrics, plans,
+                        scouts)
 from homunculus.agents import BotSpec, Budget, LLMRequest, LLMResponse, Provider
 from homunculus.checkins import NOTE_ITEM, SESSION_ITEM, SYMPTOM_PREFIX, subjective_scores
 from homunculus.evidence import OwnerProfile
@@ -82,6 +86,14 @@ HOLD_ASK_DE = (
     "Schau dir die offenen Punkte im Dashboard an und sag Cerebellum, wie es weitergehen soll."
 )
 ABORT_DE = "Wochenreview $week abgebrochen ($reason). Der aktuelle Plan bleibt unverändert."
+NO_PLAN_DE = (
+    "Wochenreview $week übersprungen ($reason): Es gibt noch keinen ratifizierten Plan. Ohne Plan prüft "
+    "niemand deine Woche und Sartorius schickt keine Einheiten. Lege zuerst einen ersten Plan an."
+)
+PACKET_TEXTS_SOURCE = "packet_texts"  # data block with the free text behind packet refs
+# Paper blockers that keep a deep dive out of the frontier candidates (evidence.frontier_blockers names)
+_DIVE_BLOCKERS = frozenset({"vetoed", "concern", "discarded", "weak_methods", "audit_blocked"})
+_CONCERN_FLAGS = frozenset({"expression_of_concern", "cap:includes_retracted"})
 REASK_DE = (
     "Deine letzte Antwort wurde abgelehnt: {problems}. Antworte erneut als ein JSON-Objekt im selben "
     "Schema und vermeide genau diese Probleme."
@@ -335,13 +347,31 @@ def _actionable(rec: Mapping) -> bool:
     return score.get("gate") == "actionable" and not rec.get("blocked") and rec.get("resolved") is True
 
 
+_PAPER_TEXT_FIELDS = (("population", "condition"), ("outcome", "name"), ("outcome", "unit"))
+
+
 def _paper_summary(rel: str, rec: Mapping) -> dict:
+    """Code-resolved paper fields only: enums, numbers and ids. Free text goes to _paper_texts."""
     score, paper = rec.get("score") or {}, rec.get("extraction") or {}
-    return {
-        "ref": rel, "doi": rec.get("doi"), "pmid": rec.get("pmid"), "title": (rec.get("meta") or {}).get("title"),
+    out = {
+        "ref": rel, "doi": rec.get("doi"), "pmid": rec.get("pmid"),
         "certainty": score.get("certainty"), "gate": score.get("gate"), "flags": list(score.get("flags") or ()),
         **{k: _plain(paper.get(k)) for k in ("design", "n_total", "population", "outcome", "effect")},
     }
+    for section, key in _PAPER_TEXT_FIELDS:
+        if isinstance(out.get(section), dict):
+            out[section].pop(key, None)
+    return out
+
+
+def _paper_texts(rec: Mapping) -> dict:
+    """Free strings of a paper record (title, condition, outcome name and unit): untrusted, LLM-extracted."""
+    paper = rec.get("extraction") or {}
+    texts: dict[str, Any] = {"title": (rec.get("meta") or {}).get("title")}
+    for section, key in _PAPER_TEXT_FIELDS:
+        node = paper.get(section)
+        texts[f"{section}.{key}"] = _plain(node.get(key)) if isinstance(node, Mapping) else None
+    return texts
 
 
 def _papers_actionable(ledger: Ledger) -> list[dict]:
@@ -410,12 +440,64 @@ def _dive_rank(item: tuple[str, Mapping[str, Any]]) -> tuple:
     return rec.get("decision") != "n_of_1_candidate", -support, rel
 
 
+def _safe_claim(claim: Any) -> dict:
+    """The claim fields code resolves: the category enum and a tracker key that exists."""
+    claim = claim if isinstance(claim, Mapping) else {}
+    category, key = claim.get("category"), claim.get("tracker_key")
+    return {"category": category if category in deepdive.CATEGORIES else None,
+            "tracker_key": key if key in metrics.DAILY_KEYS else None}
+
+
+def _questions(rec: Mapping[str, Any]) -> list:
+    return [q.get("text") for q in rec.get("open_questions") or () if isinstance(q, Mapping)]
+
+
 def _dive_summary(rel: str, rec: Mapping[str, Any]) -> dict:
+    """Packet view of a deep dive without free text; the claim strings and questions go to _dive_texts."""
     return {
         "ref": rel, "paper": rec.get("paper"), "belief_id": rec["belief_id"], "decision": rec.get("decision"),
-        "claim": rec.get("claim"), "chain": rec.get("chain"), "reasons": list(rec.get("reasons") or ()),
-        "open_questions": [q.get("text") for q in rec.get("open_questions") or () if isinstance(q, Mapping)],
+        "claim": _safe_claim(rec.get("claim")), "chain": rec.get("chain"), "reasons": list(rec.get("reasons") or ()),
+        "n_open_questions": len(_questions(rec)),
     }
+
+
+def _dive_texts(rec: Mapping[str, Any]) -> dict:
+    """Free strings of a deep dive (claim and open questions): untrusted, LLM-extracted."""
+    return {"claim": rec.get("claim"), "open_questions": _questions(rec)}
+
+
+def _dive_report(rel: str, rec: Mapping[str, Any]) -> dict:
+    """Owner-facing view for the monthly frontier review: the packet view plus the free text."""
+    return {**_dive_summary(rel, rec), **_dive_texts(rec)}
+
+
+def _paper_blockers(rec: Mapping[str, Any]) -> set[str]:
+    """Hard frontier blockers a stored paper record carries (audit block, veto, concern, discard, weak methods)."""
+    found = {"audit_blocked"} if rec.get("blocked") else set()
+    score, extraction = rec.get("score"), rec.get("extraction")
+    if isinstance(score, Mapping):
+        rules = (("vetoed", score.get("vetoed") is True), ("discarded", score.get("gate") == "discard"),
+                 ("concern", bool(_CONCERN_FLAGS & set(score.get("flags") or ()))))
+        found |= {name for name, hit in rules if hit}
+    if isinstance(extraction, Mapping) and evidence.quality(extraction).weak:
+        found.add("weak_methods")
+    return (found | _stored_blockers(rec)) & _DIVE_BLOCKERS
+
+
+def _stored_blockers(rec: Mapping[str, Any]) -> set[str]:
+    """Blockers of an appraisal `score-paper --appraise` stored on the record."""
+    appraisal = rec.get("appraisal")
+    return set(appraisal.get("frontier_blockers") or ()) if isinstance(appraisal, Mapping) else set()
+
+
+def _eligible(ledger: Ledger, dives: Sequence[tuple[str, dict]]) -> list[tuple[str, dict]]:
+    """Dives whose paper record carries no hard blocker; a vetoed or weak paper never surfaces as a candidate."""
+    out = []
+    for rel, rec in dives:
+        paper = ledger.read_json(rec["paper"]) if isinstance(rec.get("paper"), str) else None
+        if not isinstance(paper, Mapping) or not _paper_blockers(paper):
+            out.append((rel, rec))
+    return out
 
 
 def _month(week: str) -> str:
@@ -457,7 +539,7 @@ def _frontier(ledger: Ledger, week: str) -> dict:
     frontier_exps = [e for e in _experiments(ledger) if e.get("belief_id") in beliefs_map]
     running = [e["ref"] for e in frontier_exps if _running(e)]
     before = _surfaced_before(ledger, week)
-    chosen = select_frontier(dives, {str(e.get("belief_id")) for e in frontier_exps}, before)
+    chosen = select_frontier(_eligible(ledger, dives), {str(e.get("belief_id")) for e in frontier_exps}, before)
     return {"quota": frontier_quota(len(running), before, len(chosen)),
             "candidates": [_dive_summary(rel, rec) for rel, rec in chosen], "running": running,
             "beliefs": beliefs_map}
@@ -479,10 +561,10 @@ def frontier_month(ledger: Ledger, month: str) -> dict:
     dives = _dives(ledger)
     beliefs_map = {rec["belief_id"]: rel for rel, rec in dives}
     exps = [e for e in _experiments(ledger) if e.get("belief_id") in beliefs_map]
-    chosen = select_frontier(dives, {str(e.get("belief_id")) for e in exps}, surfaced)
+    chosen = select_frontier(_eligible(ledger, dives), {str(e.get("belief_id")) for e in exps}, surfaced)
     return {"schema": 1, "month": month, "surfaced": surfaced, "met": surfaced >= FRONTIER_MIN_PER_MONTH,
             "running": [e["ref"] for e in exps if _running(e)],
-            "next": [_dive_summary(rel, rec) for rel, rec in chosen]}
+            "next": [_dive_report(rel, rec) for rel, rec in chosen]}
 
 
 def _frontier_proposals(draft: Mapping[str, Any], frontier: Any) -> list[tuple[str, str]]:
@@ -687,6 +769,30 @@ def known_refs(packet: Mapping, ledger: Ledger) -> set[str]:
     return refs
 
 
+def _texts_for(ledger: Ledger, refs: Sequence[Any], extract: Callable[[Mapping], dict]) -> dict[str, Any]:
+    out = {}
+    for ref in refs:
+        rec = ledger.read_json(ref) if isinstance(ref, str) else None
+        if isinstance(rec, Mapping):
+            out[ref] = _clean(extract(rec))
+    return out
+
+
+def packet_texts(packet: Mapping, ledger: Ledger) -> dict[str, str]:
+    """Free text behind the packet's frontier candidates and actionable papers, keyed by ref, as one data block.
+
+    These strings come from LLM extraction of web text, so the review bots get
+    them only inside a <data> block, never as packet JSON.
+    """
+    frontier = packet.get("frontier") if isinstance(packet.get("frontier"), Mapping) else {}
+    dives = [c.get("ref") for c in frontier.get("candidates") or () if isinstance(c, Mapping)]
+    papers = [p.get("ref") for p in packet.get("papers_actionable") or () if isinstance(p, Mapping)]
+    texts = {**_texts_for(ledger, dives, _dive_texts), **_texts_for(ledger, papers, _paper_texts)}
+    if not texts:
+        return {}
+    return {PACKET_TEXTS_SOURCE: json.dumps(texts, sort_keys=True, indent=1, ensure_ascii=False)}
+
+
 def drop_unreferenced(items: Sequence[Mapping], refs: set[str]) -> tuple[list[dict], list[dict]]:
     """(kept, dropped): an item survives only when its ref resolves."""
     kept: list[dict] = []
@@ -836,6 +942,7 @@ class _Review:
     thread: list[dict] = field(default_factory=list)
     paths: list[str] = field(default_factory=list)
     hashes: set[str] = field(default_factory=set)
+    texts: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def thread_id(self) -> str:
@@ -865,10 +972,11 @@ def run_review(
     if ledger.halted():
         return ReviewOutcome(week, "keep", None, None, (), (), (), "halted")
     plan = _plan_or_none(ledger)
-    if plan is None:
-        return ReviewOutcome(week, "keep", None, None, (), (), (), "no_plan")
     rv = _Review(week, packet, packet_sha(packet), known_refs(packet, ledger),
-                 _Caller(roster, providers, budget, Path(prompts_dir)), ledger, guard_ctx, rules, plan, now)
+                 _Caller(roster, providers, budget, Path(prompts_dir)), ledger, guard_ctx, rules, plan or {}, now,
+                 texts=packet_texts(packet, ledger))
+    if plan is None:
+        return _abort(rv, "no_plan", NO_PLAN_DE)  # alert the owner instead of skipping in silence
     return _guarded(rv)
 
 
@@ -907,21 +1015,39 @@ def _round(rv: _Review, round_: int, diff: list[dict], changed: set[str] | None,
         return diff, set()
     blockers.update({f"r{round_}:{i['cid']}": i for i in items if i["severity"] == "blocker"})
     answer = _turn(rv, STEPS[f"answer{round_}"], {"task": "answer"}, REBUTTAL_SCHEMA, _answer_shape(rv))
-    _resolve(blockers, round_, answer["answers"], rv.refs)
     revised = [dict(op) for op in answer["plan_diff"]]
+    if round_ >= MAX_ROUNDS:
+        revised = _removals_only(diff, revised)
+    _resolve(blockers, round_, answer["answers"], diff, revised)
     return revised, _changed(diff, revised)
 
 
-def _closes(answer: Mapping[str, Any], refs: set[str]) -> bool:
-    if answer.get("action") == "accept":
-        return True
-    return answer.get("action") == "rebut" and answer.get("ref") in refs
+def _removals_only(diff: Sequence[Mapping], revised: Sequence[Mapping]) -> list[dict]:
+    """The last answer may only drop ops: an op no critic has seen never reaches the ruling."""
+    seen = {_sha(op) for op in diff}
+    return [dict(op) for op in revised if _sha(op) in seen]
 
 
-def _resolve(blockers: dict[str, dict], round_: int, answers: Sequence[Mapping], refs: set[str]) -> None:
+def _closes(answer: Mapping[str, Any], blocker: Mapping[str, Any], old: Sequence[Mapping],
+            revised: Sequence[Mapping]) -> bool:
+    """A blocker closes only on accept with a real change: every op of `change` is in the revised diff,
+    and the revision touches the blocker's diff_paths (any path when it names none). A rebuttal never
+    closes a blocker; it stays open for Cerebellum and the owner."""
+    if answer.get("action") != "accept":
+        return False
+    kept = {_sha(op) for op in revised}
+    if not all(isinstance(op, Mapping) and _sha(op) in kept for op in answer.get("change") or ()):
+        return False
+    moved = _changed(old, revised)
+    paths = set(blocker.get("diff_paths") or ())
+    return bool(moved & paths) if paths else bool(moved)
+
+
+def _resolve(blockers: dict[str, dict], round_: int, answers: Sequence[Mapping], old: Sequence[Mapping],
+             revised: Sequence[Mapping]) -> None:
     for answer in answers:
         key = f"r{round_}:{answer.get('cid')}"
-        if key in blockers and _closes(answer, refs):
+        if key in blockers and _closes(answer, blockers[key], old, revised):
             del blockers[key]
 
 
@@ -957,7 +1083,8 @@ def _turn(rv: _Review, step: _Step, extra: Mapping[str, Any], schema: Mapping[st
     if len(rv.paths) >= MAX_MESSAGES:
         raise _Abort("loop")
     run_id = _run_id(rv.week, step.bot, step.round)
-    structured, resp = rv.caller.ask(step.bot, _context(rv, step, extra), schema, run_id, check)
+    untrusted = None if step.bot == "cerebellum" else rv.texts  # Cerebellum sees aggregates only
+    structured, resp = rv.caller.ask(step.bot, _context(rv, step, extra), schema, run_id, check, untrusted)
     digest = _sha(structured)
     if digest in rv.hashes:
         raise _Abort("loop")
@@ -1129,8 +1256,8 @@ def _finish(rv: _Review, ruling: str, verdict: Verdict | None, pending_id: str |
     return ReviewOutcome(rv.week, ruling, verdict, pending_id, open_blockers, asks, tuple(rv.paths), None)
 
 
-def _abort(rv: _Review, reason: str) -> ReviewOutcome:
-    body = ABORT_DE.replace("$week", rv.week).replace("$reason", reason)
+def _abort(rv: _Review, reason: str, template: str = ABORT_DE) -> ReviewOutcome:
+    body = template.replace("$week", rv.week).replace("$reason", reason)
     rv.paths.append(_owner_message(rv, CODE_AUTHOR, "alert", body, [{"reason": reason}], "none"))
     return ReviewOutcome(rv.week, "keep", None, None, (), (), tuple(rv.paths), reason)
 
@@ -1457,6 +1584,129 @@ def _process_batch(th: _Thalamus, state: Mapping[str, Any], results: Mapping[str
     return written
 
 
+# -- retraction recheck
+
+
+def _key_of(source: Any) -> str | None:
+    try:
+        return evidence.dedupe_key(source) if isinstance(source, Mapping) else None
+    except ValueError:
+        return None
+
+
+def _record_key(rec: Mapping[str, Any]) -> str | None:
+    """The paper's dedupe key: from the extraction, else from the record's doi or pmid."""
+    return _key_of(rec.get("extraction")) or _key_of({"doi": rec.get("doi"), "pmid": rec.get("pmid")})
+
+
+def _dive_cited_keys(ledger: Ledger) -> set[str]:
+    """Dedupe keys of every paper a deep dive cites as link evidence."""
+    keys: set[str] = set()
+    for _, rec in _dives(ledger):
+        for link in rec.get("links") or ():
+            items = link.get("evidence") or () if isinstance(link, Mapping) else ()
+            keys.update(str(e["paper"]) for e in items if isinstance(e, Mapping) and e.get("paper"))
+    return keys
+
+
+def _recheck_targets(ledger: Ledger) -> list[tuple[str, str, str | None]]:
+    """(dedupe key, doi, paper record path or None) per DOI: stored paper records first, then dive citations."""
+    by_doi: dict[str, tuple[str, str | None]] = {}
+    for rel in _paper_files(ledger):
+        rec = ledger.read_json(rel)
+        doi_key = _key_of({"doi": rec.get("doi")}) if isinstance(rec, Mapping) else None
+        if doi_key:
+            by_doi.setdefault(doi_key[len("doi:"):], (_record_key(rec) or doi_key, rel))
+    for key in sorted(_dive_cited_keys(ledger)):
+        doi_key = _key_of({"doi": key[len("doi:"):]}) if key.startswith("doi:") else None
+        if doi_key:
+            by_doi.setdefault(doi_key[len("doi:"):], (key, None))
+    return [(key, doi, rel) for doi, (key, rel) in sorted(by_doi.items())]
+
+
+def _retraction_notice(updates: Sequence[Mapping], key: str, owner: OwnerProfile) -> str | None:
+    """Key of the first notice that retracts the paper (evidence.score's veto rule); None when none does."""
+    for update in updates:
+        if evidence.score({}, owner, update_to=[update], swc_paper_units=None).vetoed:
+            doi = update.get("doi")
+            return f"doi:{str(doi).lower()}" if doi else f"notice:{key}"
+    return None
+
+
+def _rescored(ledger: Ledger, rec: Mapping[str, Any], owner: OwnerProfile, view: Mapping[str, Any]) -> dict:
+    """Score (and a stored appraisal) recomputed with the record's current update_to."""
+    extraction, key = rec["extraction"], _record_key(rec)
+    swc = _swc(extraction, owner)
+    score = evidence.score(extraction, owner, update_to=rec["update_to"], swc_paper_units=swc,
+                           replications=lexicon.replications(view, key) if key else 0)
+    out: dict[str, Any] = {"score": asdict(score)}
+    if "appraisal" in rec:
+        dive = ledger.read_json(deepdive.record_rel(key)) if key else None
+        base = evidence.PromiseInput(swc_paper_units=swc)
+        inputs = deepdive.promise_inputs(dive, base) if isinstance(dive, Mapping) else base
+        out["appraisal"] = asdict(evidence.appraise(extraction, score, inputs))
+    return out
+
+
+def _refresh_record(ledger: Ledger, rel: str, updates: Sequence[Mapping], owner: OwnerProfile,
+                    view: Mapping[str, Any]) -> bool:
+    """Store changed Crossref notices on a paper record and rescore it; False when nothing changed."""
+    rec = dict(ledger.read_json(rel) or {})
+    if {_sha(u) for u in rec.get("update_to") or ()} == {_sha(u) for u in updates}:
+        return False
+    rec["update_to"] = [dict(u) for u in updates]
+    if not rec.get("blocked") and isinstance(rec.get("extraction"), Mapping):
+        rec.update(_rescored(ledger, rec, owner, view))
+    ledger.write_json(rel, rec, author=CODE_AUTHOR)
+    return True
+
+
+def _retract(ledger: Ledger, key: str, notice: str, at: str) -> int:
+    """Lexicon edge notice -retracts-> key plus one source_retracted event per belief citing key."""
+    lexicon.append(ledger, [lexicon.make_edge("retracts", lexicon.paper_node(notice), lexicon.paper_node(key),
+                                              notice, at)], author=CODE_AUTHOR)
+    events = beliefs.retract(beliefs.fold(ledger.read_jsonl(beliefs.EVENTS_PATH), at), key, at)
+    for ev in events:
+        ledger.append_jsonl(beliefs.EVENTS_PATH, ev, author=CODE_AUTHOR)
+    return len(events)
+
+
+def _finish_recheck(ledger: Ledger, out: Mapping[str, Any], at: str) -> None:
+    if out["retracted"]:
+        lexicon.rebuild_view(ledger, author=CODE_AUTHOR)
+    if out["beliefs_retracted"]:
+        beliefs.rebuild_views(ledger, at, author=CODE_AUTHOR)
+
+
+def recheck_retractions(ledger: Ledger, http: "scouts.Http", owner: OwnerProfile, now: datetime) -> dict:
+    """Re-query Crossref update notices for every stored paper and every DOI a deep dive cites.
+
+    Changed notices are stored on the paper record, which is rescored. A
+    retraction the lexicon does not know yet appends a ``retracts`` edge, so
+    lexicon.fold drops every edge of the retracted paper, and emits
+    beliefs.retract events. Failed lookups are listed and retried next run.
+    """
+    at, view = _utc(now).isoformat(timespec="seconds"), lexicon.load_view(ledger)
+    known = set(view.get("retracted") or ())
+    out: dict[str, Any] = {"checked": 0, "rescored": [], "retracted": [], "beliefs_retracted": 0, "errors": []}
+    for key, doi, rel in _recheck_targets(ledger):
+        try:
+            updates = scouts.crossref_updates(http, doi)
+        except _TRANSPORT_ERRORS:
+            out["errors"].append(doi)
+            continue
+        out["checked"] += 1
+        if rel is not None and _refresh_record(ledger, rel, updates, owner, view):
+            out["rescored"].append(rel)
+        notice = _retraction_notice(updates, key, owner) if key not in known else None
+        if notice is not None:
+            out["beliefs_retracted"] += _retract(ledger, key, notice, at)
+            out["retracted"].append(key)
+            known.add(key)
+    _finish_recheck(ledger, out, at)
+    return out
+
+
 def run_thalamus(ledger: Ledger, http: "scouts.Http", owner: OwnerProfile, now: datetime, top_n: int = 10,
                  audit_share: float = 0.1, **llm: Any) -> list[str]:
     """Batch extraction of the top candidates, then quotes, Crossref, audit and score. Returns written paper paths.
@@ -1468,6 +1718,8 @@ def run_thalamus(ledger: Ledger, http: "scouts.Http", owner: OwnerProfile, now: 
     caller = _caller(llm)
     state = ledger.read_json(THALAMUS_BATCH)
     if not isinstance(state, Mapping) or state.get("status") != "submitted":
+        if not ledger.halted():
+            recheck_retractions(ledger, http, owner, now)  # once per weekly run, not on every batch poll
         state = _submit_thalamus(caller, ledger, now, top_n)
         if state is None:
             return []

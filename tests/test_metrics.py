@@ -143,7 +143,7 @@ class BuildDailyTests(StoreCase):
         self.assertEqual((hrv.n, hrv.source, hrv.quality), (2, "watch", "ok"))
         self.assertAlmostEqual(by_key["tst_h"].value, 7.5)
         self.assertAlmostEqual(by_key["sleep_mid_min"].value, 180.0)
-        self.assertAlmostEqual(by_key["sleep_start_min"].value, 23 * 60.0)
+        self.assertAlmostEqual(by_key["sleep_start_min"].value, -60.0)  # 23:00, minutes before midnight
 
     def test_hrv_single_sample_is_sparse(self) -> None:
         self._seed_night()
@@ -189,6 +189,45 @@ class BuildDailyTests(StoreCase):
         self.assertAlmostEqual(by_key["sleep_mid_min"].value, 3 * 60.0)
         self.assertEqual(by_key["tst_h"].n, 2)
 
+    def test_sleep_running_past_ten_stays_main_sleep(self) -> None:
+        start = datetime(2026, 3, 10, 2, 0, tzinfo=timezone(timedelta(hours=1)))
+        self.store.upsert_sleep_segments([
+            SleepSegment(str(start + timedelta(minutes=30 * i)), str(start + timedelta(minutes=30 * (i + 1))),
+                         "core", "watch") for i in range(19)])  # 02:00-11:30
+        by_key = {r.key: r for r in build_daily(self.store, DAY, _cfg())}
+        self.assertAlmostEqual(by_key["tst_h"].value, 9.5)
+        self.assertAlmostEqual(by_key["sleep_start_min"].value, 120.0)
+        self.assertAlmostEqual(by_key["sleep_mid_min"].value, 6 * 60 + 45.0)
+
+    def test_evening_nap_stays_out_of_the_night(self) -> None:
+        self.store.upsert_sleep_segments([
+            SleepSegment("2026-03-09 18:30:00 +0100", "2026-03-09 19:15:00 +0100", "core", "watch"),
+            SleepSegment("2026-03-09 23:30:00 +0100", "2026-03-10 07:00:00 +0100", "core", "watch"),
+        ])
+        self.store.upsert_samples([
+            Sample("heart_rate_variability", "ms", "2026-03-09 21:00:00 +0100", "qty", 99.0, "watch"),
+            Sample("heart_rate_variability", "ms", "2026-03-10 01:00:00 +0100", "qty", 40.0, "watch"),
+            Sample("heart_rate_variability", "ms", "2026-03-10 04:00:00 +0100", "qty", 60.0, "watch"),
+        ])
+        by_key = {r.key: r for r in build_daily(self.store, DAY, _cfg())}
+        self.assertAlmostEqual(by_key["tst_h"].value, 7.5)
+        self.assertAlmostEqual(by_key["sleep_start_min"].value, -30.0)
+        self.assertAlmostEqual(by_key["sleep_mid_min"].value, 195.0)
+        self.assertAlmostEqual(by_key["hrv_sdnn_ln"].value, (math.log(40) + math.log(60)) / 2)
+
+    def test_sleep_start_is_continuous_across_midnight(self) -> None:
+        bedtimes = ["23:40", "00:20", "23:50", "00:10"]
+        for k, hhmm in enumerate(bedtimes):
+            wake = _shift(DAY, k)
+            start_day = _shift(wake, -1) if hhmm.startswith("23") else wake
+            self.store.upsert_sleep_nights([SleepNight(
+                wake, f"{start_day} {hhmm}:00 +0100", f"{wake} 07:00:00 +0100", None, None,
+                7.0, 6.5, 3.0, 1.5, 1.5, 0.5, "watch")])
+        values = [{r.key: r for r in build_daily(self.store, _shift(DAY, k), _cfg())}["sleep_start_min"].value
+                  for k in range(len(bedtimes))]
+        self.assertEqual(values, [-20.0, 20.0, -10.0, 10.0])
+        self.assertLess(metrics.stats.sd(values), 20.0)
+
     def _workout(self, wid: str, minutes: int, bpm: float) -> Workout:
         start = datetime(2026, 3, 10, 17, 0, tzinfo=timezone(timedelta(hours=1)))
         series = tuple(((start + timedelta(minutes=i)).isoformat(), bpm) for i in range(minutes + 1))
@@ -213,6 +252,15 @@ class BuildDailyTests(StoreCase):
         row = {r.key: r for r in build_daily(self.store, DAY, _cfg())}["load_srpe"]
         self.assertIsNone(row.value)
         self.assertEqual((row.quality, row.n), ("sparse", 2))
+
+    def test_late_session_rpe_refreshes_finalized_day(self) -> None:
+        self.store.upsert_workouts([self._workout("w1", 30, 152.0)])
+        self.assertIsNone({r.key: r for r in finalize_day(self.store, DAY, _cfg())}["load_srpe"].value)
+        self.store.put_checkins([CheckinItem(_shift(DAY, 1), "session_rpe", 6, None, "w1",
+                                             f"{_shift(DAY, 1)}T07:00:00+01:00", "de-1", "form")])
+        finalize_day(self.store, _shift(DAY, 1), _cfg())
+        stored = self.store.daily("load_srpe", _shift(DAY, -2), _shift(DAY, 2))
+        self.assertEqual([(r.date, r.value) for r in stored], [(DAY, 180.0), (_shift(DAY, 1), 0.0)])
 
     def test_edwards_needs_hrmax(self) -> None:
         self.store.upsert_workouts([self._workout("w1", 30, 150.0)])
@@ -259,6 +307,20 @@ class HrvRhrTests(unittest.TestCase):
         state = hrv_state(_series("hrv_sdnn_ln", DAY, values), DAY)
         self.assertEqual(state.state, "suppressed")
         self.assertTrue(state.overreach_hint)
+
+    def _ill_series(self) -> tuple[list[DailyValue], frozenset[str]]:
+        base = math.log(50)
+        values = [base + (0.06 if i % 2 else -0.06) for i in range(61)] + [base - 0.07] * 7
+        sick = frozenset(_shift(DAY, k) for k in range(-30, -23))
+        series = _series("hrv_sdnn_ln", DAY, values)
+        return [_dv(r.date, r.key, r.value - 0.35) if r.date in sick else r for r in series], sick
+
+    def test_illness_days_stay_out_of_hrv_baseline(self) -> None:
+        series, sick = self._ill_series()
+        self.assertEqual(hrv_state(series, DAY).state, "normal")  # the cold inflates sd60
+        clean = hrv_state(series, DAY, exclude=sick)
+        self.assertEqual(clean.state, "suppressed")
+        self.assertAlmostEqual(clean.sd60, 0.06, delta=0.005)
 
     def test_rhr_watch_on_two_consecutive_days(self) -> None:
         base = [50.0 + (i % 3 - 1) for i in range(34)]
@@ -452,6 +514,25 @@ class BaselinesTests(StoreCase):
         self.assertIsNotNone(snap["readiness"]["score"])
         self.assertEqual(snap["readiness"]["missing"], [])
         self.assertIsNone(snap["sleep"]["sri"])  # no segments stored
+
+    def test_symptom_checkins_exclude_days_from_baselines(self) -> None:
+        series, sick = HrvRhrTests._ill_series(self)
+        self.store.put_daily(series)
+        first = min(sick)
+        self.store.put_checkins([CheckinItem(d, "symptom:sore_throat", 1.0, None, None, f"{d}T07:00:00+01:00",
+                                             "de-1", "form") for d in sorted(sick)])
+        ill = metrics.illness_days(self.store, _shift(DAY, -67), DAY)
+        self.assertEqual(ill, frozenset(_shift(first, k) for k in range(10)))
+        self.assertEqual(baselines(self.store, DAY, _cfg())["hrv"]["sdnn"]["state"], "suppressed")
+
+    def test_z_today_skips_excluded_days(self) -> None:
+        tst = {_shift(DAY, k): 7.0 + (0.5 if k % 2 else -0.5) for k in range(-28, 0)}
+        sick = frozenset(_shift(DAY, k) for k in range(-10, -5))
+        tst.update({d: 3.0 for d in sick})
+        tst[DAY] = 6.0
+        clean = metrics._z_today({d: v for d, v in tst.items() if d not in sick}, DAY)
+        self.assertAlmostEqual(metrics._z_today(tst, DAY, exclude=sick), clean)
+        self.assertNotAlmostEqual(metrics._z_today(tst, DAY), clean)
 
     def test_empty_store_is_all_none(self) -> None:
         snap = baselines(self.store, DAY, _cfg())

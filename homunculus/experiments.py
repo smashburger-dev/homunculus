@@ -38,7 +38,7 @@ from dataclasses import dataclass, fields
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Mapping, Sequence
 
-from . import stats
+from . import beliefs, stats
 from .beliefs import Prior
 from .beliefs import p_benefit as _p_benefit
 from .beliefs import p_harm as _p_harm
@@ -47,6 +47,7 @@ from .store import SOURCES, Ledger, canonical_json
 DESIGNS = ("paired_blocks", "daily_alternating")
 LABELS = ("A", "B", "washout")
 DECISIONS = ("adopt", "reject", "inconclusive", "extend")
+FINAL_DECISIONS = ("adopt", "reject", "inconclusive")
 
 MIN_PAIRS = 6
 MIN_BASELINE_DAYS = 21
@@ -534,6 +535,9 @@ def analyze(
 ) -> Result:
     """Randomization test plus normal-normal update of the belief prior.
 
+    Pass ``starting_prior(...)`` as ``prior`` so the update starts from the
+    belief posterior (literature plus earlier personal results), not the
+    literature prior alone.
     ``extended`` means the allocation carries the 2 extension pairs; the
     decision is then never 'extend' again. ``direction`` is the claim's
     direction (+1 higher is better, -1 lower is better).
@@ -565,3 +569,35 @@ def write_protocol(ledger: Ledger, p: Protocol, *, author: str = "hippocampus") 
     _fail(ledger.exists(rel), f"{rel} exists; a protocol is never overwritten")
     ledger.write_json(rel, p.to_dict(), author=author)
     return hashlib.sha256(_canonical(p)).hexdigest()
+
+
+def _own_result(ev: Mapping[str, Any], p: Protocol) -> bool:
+    return ev.get("kind") == "personal_result" and ev.get("belief_id") == p.belief_id and ev.get("experiment") == p.id
+
+
+def starting_prior(events: Sequence[Mapping[str, Any]], p: Protocol, as_of: str) -> Prior:
+    """The belief posterior at as_of as the prior for analyze.
+
+    This experiment's own personal_result is left out, so a re-analysis never
+    counts the same data twice.
+    """
+    folded = beliefs.fold([ev for ev in events if not _own_result(ev, p)], as_of)
+    belief = folded.get(p.belief_id)
+    _fail(belief is None or belief.mu is None or belief.prior is None, f"belief {p.belief_id!r} has no prior")
+    base = belief.prior
+    return Prior(belief.mu, belief.sd, base.sources, base.certainty, base.rubric_version)
+
+
+def record_result(ledger: Ledger, p: Protocol, result: Result, at: str, *, author: str = "pineal") -> dict | None:
+    """Append a final result to the belief ledger as personal_result and rebuild the views.
+
+    Returns the event, or None for 'extend' or when this experiment already has one.
+    """
+    if result.decision not in FINAL_DECISIONS:
+        return None
+    if any(_own_result(ev, p) for ev in ledger.read_jsonl(beliefs.EVENTS_PATH)):
+        return None
+    event = beliefs.make_event("personal_result", p.belief_id, at, est=result.d_bar, se=result.se, experiment=p.id)
+    ledger.append_jsonl(beliefs.EVENTS_PATH, event, author=author)
+    beliefs.rebuild_views(ledger, at, author=author)
+    return event
