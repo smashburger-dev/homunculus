@@ -49,6 +49,9 @@ log = logging.getLogger(__name__)
 ALLOWED_HOSTS: frozenset[str] = frozenset({
     "eutils.ncbi.nlm.nih.gov", "www.ebi.ac.uk", "api.biorxiv.org", "api.crossref.org",
     "api.openalex.org", "api.semanticscholar.org", "wger.de", "api.ods.od.nih.gov",
+    # full-text resolver (homunculus.fulltext): open-access sources, archives, publisher TDM APIs
+    "api.unpaywall.org", "api.core.ac.uk", "core.ac.uk", "arxiv.org", "www.biorxiv.org", "www.medrxiv.org",
+    "api.fatcat.wiki", "web.archive.org", "api.elsevier.com", "api.springernature.com", "api.wiley.com",
 })
 
 DEFAULT_RATE_PER_S = 1.0
