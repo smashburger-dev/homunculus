@@ -188,6 +188,22 @@ class WeekAndChallengeTests(unittest.TestCase):
     def test_no_open_challenges(self) -> None:
         self.assertIn("Keine offenen Einwände", dashboard.render_challenges([]))
 
+    def test_conflicts_section(self) -> None:
+        conflicts = [{"id": "abc", "rule_id": "R1_sustained", "window": ["2026-02-16", "2026-02-18"],
+                      "interpretation_de": EVIL, "question_for_owner_de": None}]
+        page = dashboard.render_challenges([], conflicts)
+        _assert_safe_page(self, page)
+        self.assertIn("1 Konflikte", page)
+        self.assertIn("2026-02-16 bis 2026-02-18", page)
+        self.assertIn("Keine offenen Konflikte", dashboard.render_challenges([]))
+
+    def test_week_follows_turn_order_with_equal_timestamps(self) -> None:
+        msgs = [_msg("m-0", "rebuttal", []), _msg("m-1", "challenge", [])]
+        for m in msgs:
+            m["round"] = 2
+        page = dashboard.render_week(msgs)
+        self.assertLess(page.index("Einwand"), page.index("Antwort"))
+
 
 class ExperimentTests(unittest.TestCase):
     def test_running_and_finished(self) -> None:

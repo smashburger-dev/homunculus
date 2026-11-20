@@ -97,6 +97,12 @@ KIND_DE: Mapping[str, str] = {
     "goal.update": "Ziel", "evidence.candidate": "Studienkandidat",
     "evidence.appraisal": "Studienbewertung", "checkin.received": "Check-in",
 }
+RULE_DE: Mapping[str, str] = {
+    "R1_sustained": "Gefühl und Körperdaten mehrere Tage gegensätzlich",
+    "R2_single_day": "Gefühl und Körperdaten an einem Tag gegensätzlich",
+    "R3_session_residual": "Einheit härter empfunden als der Puls zeigt",
+    "DATA_GAP": "Datenlücke",
+}
 SEVERITY_ORDER: Mapping[str, int] = {"blocker": 0, "major": 1, "minor": 2}
 SEVERITY_DE: Mapping[str, str] = {"blocker": "Blocker", "major": "wichtig", "minor": "klein"}
 DECISION_DE: Mapping[str, str] = {
@@ -518,9 +524,14 @@ def _is_message(obj: Any) -> bool:
     return isinstance(obj, Mapping) and all(isinstance(obj.get(k), str) for k in ("id", "kind", "thread"))
 
 
+# Turn order inside one review round; messages of one run share created_at.
+_KIND_ORDER: Mapping[str, int] = {"review.draft": 0, "challenge": 1, "rebuttal": 2, "ruling": 3, "ask.owner": 4}
+
+
 def _msg_key(msg: Mapping) -> tuple:
     rnd = msg.get("round")
-    return (str(msg.get("created_at", "")), rnd if isinstance(rnd, int) else 0, str(msg.get("id")))
+    return (str(msg.get("created_at", "")), rnd if isinstance(rnd, int) else 0,
+            _KIND_ORDER.get(str(msg.get("kind")), len(_KIND_ORDER)), str(msg.get("id")))
 
 
 def _recipients(msg: Mapping) -> str:
@@ -575,18 +586,42 @@ def _open_challenges(messages: Sequence[Mapping]) -> list[tuple[Mapping, Mapping
     return sorted(found, key=lambda p: (SEVERITY_ORDER.get(str(p[1].get("severity")), 9), _msg_key(p[0])))
 
 
-def render_challenges(messages: Sequence[Mapping]) -> str:
-    """Challenge items without an answer, blockers first."""
+def _challenges_section(messages: Sequence[Mapping]) -> str:
     open_items = _open_challenges(messages)
     if not open_items:
-        return _page("challenges.html", "Einwände", _section("Offene Einwände", _p("Keine offenen Einwände.")))
+        return _section("Offene Einwände", _p("Keine offenen Einwände."))
     rows = [(_e(_label(SEVERITY_DE, it.get("severity"))), _e(it.get("claim", "")),
              f"<code>{_e(it.get('ref', ''))}</code>",
              _e(f"{m['thread']} · {m.get('from', '?')} · {it.get('cid', '?')}")) for m, it in open_items]
     blockers = sum(1 for _, it in open_items if it.get("severity") == "blocker")
     head = _p(f"{len(open_items)} offen, davon {blockers} Blocker.")
-    return _page("challenges.html", "Einwände",
-                 _section("Offene Einwände", head + _table(("Schwere", "Einwand", "Beleg", "Herkunft"), rows)))
+    return _section("Offene Einwände", head + _table(("Schwere", "Einwand", "Beleg", "Herkunft"), rows))
+
+
+def _span(window: Any) -> str:
+    if not isinstance(window, Sequence) or isinstance(window, str) or not window:
+        return "–"
+    first, last = str(window[0]), str(window[-1])
+    return first if first == last else f"{first} bis {last}"
+
+
+def _conflicts_section(conflicts: Sequence[Mapping]) -> str:
+    if not conflicts:
+        return _section("Offene Konflikte", _p("Keine offenen Konflikte."))
+    rows = [(_e(_label(RULE_DE, c.get("rule_id"))), _e(_span(c.get("window"))),
+             _e(c.get("interpretation_de") or "–"), _e(c.get("question_for_owner_de") or "–")) for c in conflicts]
+    head = _p(f"{len(conflicts)} Konflikte zwischen Gefühl und Körperdaten oder Datenlücken, erkannt von Insula.")
+    return _section("Offene Konflikte", head + _table(("Regel", "Zeitraum", "Deutung", "Frage an dich"), rows))
+
+
+def render_challenges(messages: Sequence[Mapping], conflicts: Sequence[Mapping] = ()) -> str:
+    """Challenge items without an answer, blockers first; then the week's Insula conflicts.
+
+    conflicts: data/conflicts/<week>.json entries, optionally joined with Insula's
+    interpretation_de and question_for_owner_de.
+    """
+    body = _challenges_section(messages) + _conflicts_section([c for c in conflicts if isinstance(c, Mapping)])
+    return _page("challenges.html", "Einwände", body)
 
 
 # --------------------------------------------------------------------------
@@ -791,6 +826,33 @@ def _latest_review(messages: Sequence[Mapping]) -> list[Mapping]:
     return [m for m in messages if m["thread"] == latest]
 
 
+def _conflicts_week(ledger: Ledger, review: Sequence[Mapping]) -> str | None:
+    """ISO week of the latest review thread, else of the latest conflicts file."""
+    weeks = sorted(m["thread"].split("/", 1)[1] for m in review)
+    if weeks:
+        return weeks[-1]
+    files = ledger.glob("data/conflicts/*.json")
+    return files[-1].rsplit("/", 1)[-1][:-len(".json")] if files else None
+
+
+def _insula_by_id(ledger: Ledger, week: str) -> dict[str, Mapping]:
+    out = _read_json_safe(ledger, f"reviews/{week}/00-insula-reconciliation.json")
+    items = out.get("items") if isinstance(out, Mapping) else None
+    return {str(i.get("conflict_id")): i for i in items or () if isinstance(i, Mapping)}
+
+
+def _week_conflicts(ledger: Ledger, review: Sequence[Mapping]) -> list[dict]:
+    """Conflicts of that week, joined with Insula's interpretation and owner question."""
+    week = _conflicts_week(ledger, review)
+    rec = _read_json_safe(ledger, f"data/conflicts/{week}.json") if week else None
+    if not isinstance(rec, Mapping):
+        return []
+    by_id = _insula_by_id(ledger, week)
+    keys = ("interpretation_de", "question_for_owner_de")
+    return [{**c, **{k: by_id.get(str(c.get("id")), {}).get(k) for k in keys}}
+            for c in rec.get("conflicts") or () if isinstance(c, Mapping)]
+
+
 def _experiments(ledger: Ledger) -> list[dict]:
     out = []
     for rel in ledger.glob("experiments/*/protocol.json"):
@@ -834,7 +896,7 @@ def build(store: Store, ledger: Ledger, out_dir: Path, now: datetime, cfg: Metri
         "index.html": _today_html(store, ledger, now, cfg, day),
         "plan.html": render_plan(*_plan_pair(ledger)),
         "week.html": render_week(review),
-        "challenges.html": render_challenges(review),
+        "challenges.html": render_challenges(review, _week_conflicts(ledger, review)),
         "experiments.html": render_experiments(_experiments(ledger)),
         "budget.html": render_budget(*_budget_inputs(ledger, now)),
         "checkin.html": _page("checkin.html", "Check-in", f"<section>{checkins.morning_form_html(day)}</section>"),
