@@ -1,0 +1,559 @@
+{
+ "roster": [
+  {
+   "name": "Cerebellum",
+   "anatomy": "Cerebellum: compares intended with actual movement and corrects the error",
+   "role": "Orchestrator. Holds the owner's goals, relays them to other bots as goal.update, issues the weekly ruling (ratify, partial, keep), runs the monthly goal review",
+   "tier": "frontier-top",
+   "model": "claude-fable-5-2 at effort high; alternative Gemini 4 Carbon (availability and model ID UNVERIFIED). Requires 30-day retention, so it receives goal-level context and packet aggregates only",
+   "user_facing": true,
+   "cadence": "Weekly ruling Sun 21:00; monthly goal review; on owner message addressed to Cerebellum",
+   "reads": [
+    "config/goals.md",
+    "reviews/<week>/packet.json",
+    "reviews/<week>/01..05-*.json",
+    "plans/CURRENT",
+    "plans/v*.json",
+    "mail/cerebellum/inbox/"
+   ],
+   "writes": [
+    "reviews/<week>/06-cerebellum-ruling.json",
+    "plans/pending/<id>.json (via plans.propose/ratify only)",
+    "config/goals.md (after owner goal talk)",
+    "mail/*/inbox/ (goal.update, ask.owner)"
+   ]
+  },
+  {
+   "name": "Hippocampus",
+   "anatomy": "Hippocampus: consolidates the day's memories during sleep",
+   "role": "Weekly reviewer. Drafts review and typed plan_diff from the packet, answers each Amygdala challenge with accept or rebut, designs N-of-1 protocols",
+   "tier": "frontier",
+   "model": "claude-opus-5-5 at effort high; alternative Gemini frontier model (owner's 'Gemini 4 Neon', ID UNVERIFIED)",
+   "user_facing": false,
+   "cadence": "Weekly Sun 17:00 draft, then rounds 1 and 2 until 20:30; experiment design on demand",
+   "reads": [
+    "reviews/<week>/packet.json",
+    "reviews/<week>/02-amygdala-r1.json",
+    "reviews/<week>/04-amygdala-r2.json",
+    "beliefs/views/",
+    "experiments/",
+    "evidence/papers/"
+   ],
+   "writes": [
+    "reviews/<week>/01-hippocampus-draft.json",
+    "reviews/<week>/03-hippocampus-r1.json",
+    "reviews/<week>/05-hippocampus-r2.json",
+    "experiments/<id>/protocol.json (draft, committed only after guardrails and owner consent)"
+   ]
+  },
+  {
+   "name": "Amygdala",
+   "anatomy": "Amygdala: threat detection",
+   "role": "Adversarial critic. Challenges Hippocampus and Cerebellum with ref-backed items (blocker/major/minor) using the weekly checklist; re-extracts 10% of papers as an audit; a blocker holds the diff until the owner resolves it",
+   "tier": "frontier",
+   "model": "Paid-tier Gemini frontier model with logging off (different family from Hippocampus); alternative claude-opus-5-5 with its own prompt, flagged in the packet as same-family",
+   "user_facing": false,
+   "cadence": "Weekly Sun round 1 and round 2; Thu audit of 10% of new extractions",
+   "reads": [
+    "reviews/<week>/packet.json",
+    "reviews/<week>/01-hippocampus-draft.json",
+    "reviews/<week>/03-hippocampus-r1.json",
+    "evidence/papers/",
+    "quarantine/<id>.txt (audit extraction only)"
+   ],
+   "writes": [
+    "reviews/<week>/02-amygdala-r1.json",
+    "reviews/<week>/04-amygdala-r2.json",
+    "evidence/papers/<slug>.audit.json"
+   ]
+  },
+  {
+   "name": "Thalamus",
+   "anatomy": "Thalamus: gates which sensory signals reach the cortex",
+   "role": "Evidence extraction. Fills paper.json fields with verbatim quote spans from quarantined abstracts; never sees or produces the certainty score, which evidence.score computes",
+   "tier": "frontier",
+   "model": "claude-opus-5-5 via Message Batches at effort medium; alternative claude-sonnet-5-5 (also the second extractor for disagreement checks)",
+   "user_facing": false,
+   "cadence": "Weekly Thu, top 10 candidates",
+   "reads": [
+    "evidence/candidates/*.jsonl",
+    "quarantine/<id>.txt",
+    "evidence/cache/crossref/"
+   ],
+   "writes": [
+    "evidence/papers/<slug>.json (extraction; score fields added by code)"
+   ]
+  },
+  {
+   "name": "Motor Cortex",
+   "anatomy": "Primary motor cortex: plans and issues movement",
+   "role": "Proposes session changes and novel exercises as feature records (pattern, contraction, energy system, joint load) toward goal quotas; the guardrails solver admits or rejects them",
+   "tier": "frontier",
+   "model": "claude-opus-5-5 at effort medium; alternative Gemini frontier model",
+   "user_facing": false,
+   "cadence": "Weekly Sat",
+   "reads": [
+    "config/goals.md",
+    "config/exercises.json",
+    "plans/CURRENT",
+    "data/baselines/<week>.json",
+    "checkins/ (session RPE, pain flags)",
+    "evidence/candidates/ (spindle, structured fields only)"
+   ],
+   "writes": [
+    "reviews/<week>/00-motor-cortex-proposals.json"
+   ]
+  },
+  {
+   "name": "Insula",
+   "anatomy": "Insular cortex: interoception, links body signals to feelings",
+   "role": "Reads code-detected conflicts (R1/R2/R3, DATA_GAP) and explains them, judges which signal is noisier per case, drafts at most 3 questions for the owner via the coaches",
+   "tier": "mid",
+   "model": "claude-sonnet-5-5; alternative claude-haiku-5-5",
+   "user_facing": false,
+   "cadence": "Weekly Sat",
+   "reads": [
+    "data/conflicts/<week>.json",
+    "checkins/<week days>",
+    "data/daily/<week days>"
+   ],
+   "writes": [
+    "reviews/<week>/00-insula-reconciliation.json",
+    "mail/sartorius/inbox/",
+    "mail/vagus/inbox/"
+   ]
+  },
+  {
+   "name": "Sartorius",
+   "anatomy": "Sartorius: the tailor's muscle, longest in the body",
+   "role": "Personal fitness coach. Morning session message from plans.modulate_day, collects post-session CR-10 RPE and gym feel, relays Insula questions; may shorten or swap a session inside plan bounds, never add load",
+   "tier": "frontier (low effort)",
+   "model": "claude-opus-5-5 at effort low with cached persona and plan prefix; alternative claude-sonnet-5-5",
+   "user_facing": true,
+   "cadence": "Daily 07:00; after each workout; on owner message",
+   "reads": [
+    "plans/CURRENT",
+    "data/daily/<today>.json",
+    "data/freshness.json",
+    "data/alerts.jsonl",
+    "mail/sartorius/inbox/"
+   ],
+   "writes": [
+    "checkins/<date>.json (via checkins.from_chat)",
+    "mail/owner/inbox/"
+   ]
+  },
+  {
+   "name": "Vagus",
+   "anatomy": "Vagus nerve: rest-and-digest, the source of HRV",
+   "role": "Personal well-being coach. Sleep, mood, stress, enjoyment; morning greeting and 21:00 evening check-in; relays Insula questions",
+   "tier": "frontier (low effort)",
+   "model": "claude-opus-5-5 at effort low with cached persona prefix; alternative claude-sonnet-5-5",
+   "user_facing": true,
+   "cadence": "Daily 07:00 and 21:00; on owner message",
+   "reads": [
+    "data/daily/<today>.json",
+    "data/freshness.json",
+    "data/alerts.jsonl",
+    "checkins/ (last 7 days)",
+    "mail/vagus/inbox/"
+   ],
+   "writes": [
+    "checkins/<date>.json (via checkins.from_chat)",
+    "mail/owner/inbox/"
+   ]
+  },
+  {
+   "name": "Retina",
+   "anatomy": "Retina: turns light into neural signal",
+   "role": "Paper scout for biology, physiology and neurobiology. Code fetches from PubMed, Europe PMC, bioRxiv; Haiku classifies design, population and relevance into enums only",
+   "tier": "small",
+   "model": "claude-haiku-5-5 via Message Batches; alternative code-only keyword ranking (owner's 'SWE2 flash' is a Devin mode, not an API model)",
+   "user_facing": false,
+   "cadence": "Daily 03:00, cap 30 candidates; asks owner for keywords at setup",
+   "reads": [
+    "config/keywords.json (retina)",
+    "quarantine/<id>.txt"
+   ],
+   "writes": [
+    "evidence/candidates/<date>.jsonl",
+    "quarantine/<id>.txt",
+    "evidence/cache/"
+   ]
+  },
+  {
+   "name": "Spindle",
+   "anatomy": "Muscle spindle: senses stretch and length change",
+   "role": "Workout and sport-methods scout. Sport-science literature plus open exercise databases (wger API, UNVERIFIED); outputs exercise feature records, never transcripts",
+   "tier": "small",
+   "model": "claude-haiku-5-5 via Message Batches; alternative code-only ranking",
+   "user_facing": false,
+   "cadence": "Daily 03:00, cap 30",
+   "reads": [
+    "config/keywords.json (spindle)",
+    "quarantine/<id>.txt"
+   ],
+   "writes": [
+    "evidence/candidates/<date>.jsonl",
+    "quarantine/<id>.txt",
+    "evidence/cache/"
+   ]
+  },
+  {
+   "name": "Papilla",
+   "anatomy": "Lingual papilla: carries the taste buds",
+   "role": "Nutrition and supplement scout. Nutrition literature plus supplement label data (NIH DSLD API, UNVERIFIED); checks names against the forbidden list in code before output",
+   "tier": "small",
+   "model": "claude-haiku-5-5 via Message Batches; alternative code-only ranking",
+   "user_facing": false,
+   "cadence": "Daily 03:00, cap 30",
+   "reads": [
+    "config/keywords.json (papilla)",
+    "config/forbidden.json",
+    "quarantine/<id>.txt"
+   ],
+   "writes": [
+    "evidence/candidates/<date>.jsonl",
+    "quarantine/<id>.txt",
+    "evidence/cache/"
+   ]
+  },
+  {
+   "name": "Brainstem",
+   "anatomy": "Brainstem: keeps the vital signs running",
+   "role": "Ingest server evolved from the seed webhook: POST /health from Health Auto Export, POST /checkin and /message from the dashboard, read endpoints; strips GPS and device names; fires event alerts at once",
+   "tier": "code",
+   "model": "none (deterministic Python)",
+   "user_facing": false,
+   "cadence": "On event (always-on HTTP server on 127.0.0.1 behind tailscale serve)",
+   "reads": [
+    "HAE JSON payloads",
+    "dashboard form posts"
+   ],
+   "writes": [
+    "SQLite health.db",
+    "health_raw/ (chmod 700, 30-day retention)"
+   ]
+  },
+  {
+   "name": "Pineal",
+   "anatomy": "Pineal gland: sets the circadian clock",
+   "role": "Scheduler and single git writer. Runs due jobs idempotently, enforces path ownership and budget, delivers templated alerts, honours HALT, reports scrubbed incidents to the Devin repair Automation",
+   "tier": "code",
+   "model": "none (deterministic Python)",
+   "user_facing": true,
+   "cadence": "Every minute via launchd/systemd/cron tick",
+   "reads": [
+    "config/cadence.json",
+    "config/roster.json",
+    "config/budget.json",
+    "config/HALT",
+    "ops/runs.jsonl",
+    "SQLite health.db"
+   ],
+   "writes": [
+    "git commits on the ledger repo",
+    "ops/runs.jsonl",
+    "ops/budget.jsonl",
+    "ops/heartbeats/",
+    "ops/incidents/",
+    "data/daily/",
+    "data/baselines/",
+    "data/conflicts/",
+    "data/freshness.json",
+    "data/alerts.jsonl",
+    "site/"
+   ]
+  }
+ ],
+ "modules": [
+  {
+   "path": "homunculus/store.py",
+   "purpose": "SQLite schema with migrations and shared row dataclasses; ledger file IO with path ownership and git commits. Base layer every other module uses.",
+   "public_api": "SCHEMA_VERSION: int = 1\nSOURCES = ('watch','phone','garmin','other')\n@dataclass(frozen=True) Sample(metric: str, unit: str|None, ts: str, field: str, value: float, source: str)  # ts ISO-8601 with offset as HAE sends; PK (metric, ts, field, source)\n@dataclass(frozen=True) SleepSegment(start: str, end: str, stage: str, source: str)  # stage in {'awake','asleep','inbed','core','rem','deep','unspecified'}; PK (start, stage, source)\n@dataclass(frozen=True) SleepNight(wake_date: str, sleep_start: str|None, sleep_end: str|None, in_bed_start: str|None, in_bed_end: str|None, total_h: float|None, asleep_h: float|None, core_h: float|None, deep_h: float|None, rem_h: float|None, awake_h: float|None, source: str)  # PK (wake_date, source)\n@dataclass(frozen=True) Workout(id: str, name: str, start: str, end: str, duration_s: float|None, active_kcal: float|None, hr_avg: float|None, hr_max: float|None, hr_series: tuple[tuple[str, float], ...], is_indoor: bool|None, source: str, raw_json: str)  # PK id; raw_json has route/location removed\n@dataclass(frozen=True) HealthEvent(kind: str, start: str, end: str|None, payload_json: str, source: str)  # kind in {'hr_notification','ecg','symptom','state_of_mind'}; PK (kind, start, source)\n@dataclass(frozen=True) DailyValue(date: str, key: str, value: float|None, source: str, n: int, quality: str)  # quality in {'ok','sparse','missing'}; PK (date, key)\n@dataclass(frozen=True) CheckinItem(date: str, item: str, value: float|None, text: str|None, ref: str|None, ts: str, wording_version: str, origin: str)  # origin in {'form','coach','hae'}; ref = workout id for 'session_rpe'; PK (date, item, ref)\nclass Store:\n  def __init__(self, db_path: str | Path) -> None  # check_same_thread=False, internal threading.Lock\n  def migrate(self) -> int\n  def upsert_samples(self, rows: Iterable[Sample]) -> int\n  def upsert_sleep_segments(self, rows: Iterable[SleepSegment]) -> int\n  def upsert_sleep_nights(self, rows: Iterable[SleepNight]) -> int\n  def upsert_workouts(self, rows: Iterable[Workout]) -> int\n  def insert_events(self, rows: Iterable[HealthEvent]) -> int  # returns number of NEW rows (for alerting)\n  def samples(self, metric: str, since: str, until: str | None = None, source: str | None = None) -> list[Sample]\n  def sleep_segments(self, since: str, until: str | None = None) -> list[SleepSegment]\n  def sleep_nights(self, since: str, until: str | None = None) -> list[SleepNight]\n  def workouts(self, since: str, until: str | None = None) -> list[Workout]\n  def events(self, kind: str | None, since: str) -> list[HealthEvent]\n  def put_daily(self, rows: Iterable[DailyValue]) -> int\n  def daily(self, key: str, since: str, until: str | None = None) -> list[DailyValue]  # ordered by date asc\n  def put_checkins(self, rows: Iterable[CheckinItem]) -> int\n  def checkins(self, since: str, until: str | None = None, item: str | None = None) -> list[CheckinItem]\n  def latest_ts(self) -> dict[str, str]  # metric/table -> latest ts\n  def close(self) -> None\nclass PathNotAllowed(PermissionError)\nclass Ledger:\n  def __init__(self, root: str | Path, write_rules: Mapping[str, Sequence[str]]) -> None  # author -> fnmatch globs (from roster.json 'writes'); author 'pineal' may write anything\n  root: Path\n  def read_json(self, rel: str, default: Any = None) -> Any\n  def write_json(self, rel: str, obj: Any, *, author: str) -> Path  # json.dumps(sort_keys=True, indent=2, ensure_ascii=False) + '\\n'; atomic rename; raises PathNotAllowed\n  def write_text(self, rel: str, text: str, *, author: str) -> Path\n  def read_text(self, rel: str) -> str\n  def append_jsonl(self, rel: str, obj: Mapping[str, Any], *, author: str) -> None\n  def read_jsonl(self, rel: str) -> list[dict]\n  def exists(self, rel: str) -> bool\n  def glob(self, pattern: str) -> list[str]  # sorted rel paths\n  def sha256(self, rel: str) -> str\n  def pending(self) -> list[str]  # paths written since last commit\n  def commit(self, *, author: str, message: str, trailers: Mapping[str, str]) -> str | None  # subprocess git; fcntl lock on .git/homunculus.lock; author 'Name <name@homunculus.local>'; returns sha or None if nothing changed\n  def halted(self) -> bool  # config/HALT exists\ndef canonical_json(obj: Any) -> bytes  # sorted keys, no whitespace; used for every sha256",
+   "depends_on": [],
+   "test_path": "tests/test_store.py"
+  },
+  {
+   "path": "homunculus/stats.py",
+   "purpose": "Pure numeric helpers used by metrics, insula, beliefs and experiments. No IO.",
+   "public_api": "def mean(xs: Sequence[float]) -> float  # raises ValueError on empty\ndef sd(xs: Sequence[float], ddof: int = 1) -> float\ndef median(xs: Sequence[float]) -> float\ndef mad(xs: Sequence[float]) -> float  # raw median absolute deviation\ndef percentile(xs: Sequence[float], p: float) -> float  # linear interpolation, p in [0,100]\ndef ols(xs: Sequence[float], ys: Sequence[float]) -> tuple[float, float, float]  # (slope, intercept, residual_sd)\ndef ewma(values: Sequence[float | None], n: int, seed_after: int = 0) -> list[float | None]  # lambda = 2/(n+1); None input -> None output, state unchanged; outputs None until seed_after non-None values seen\ndef lag1_autocorr(xs: Sequence[float]) -> float\ndef zscore(x: float | None, mu: float | None, sigma: float | None, cap: float = 3.0) -> float | None  # None if any input None or sigma <= 0\ndef phi(x: float) -> float  # 0.5*(1+erf(x/sqrt2))\ndef phi_inv(p: float) -> float  # Acklam, |err| < 1e-8\ndef t_ppf(p: float, df: int) -> float  # df >= 1, abs error < 1e-3 vs reference table for df 1..120\ndef sign_flip_pvalue(d: Sequence[float]) -> float  # exact two-sided, len(d) <= 20 else ValueError; p = #{|sum s_j d_j| >= |sum d_j|} / 2^m\ndef mc_pvalue(observed: float, null_draws: Iterable[float]) -> float  # (1 + #{|x| >= |observed|}) / (1 + n)\ndef benjamini_hochberg(pvals: Sequence[float], q: float = 0.1) -> list[bool]\ndef normal_update(mu0: float, sd0: float, est: float, se: float) -> tuple[float, float]  # precision-weighted posterior (mu1, sd1)",
+   "depends_on": [],
+   "test_path": "tests/test_stats.py"
+  },
+  {
+   "path": "homunculus/ingest.py",
+   "purpose": "Brainstem. Hardened successor of docs/_seed_webhook.py: parses Health Auto Export payloads (metrics incl. string sleep fields and unaggregated sleep segments, workouts v2 keyed on id, heartRateNotifications, ecg, symptoms, stateOfMind), strips GPS and device names, stores via Store, serves read endpoints and pluggable POST routes. No SWARM_URL forwarding.",
+   "public_api": "class ConfigError(Exception)\n@dataclass(frozen=True) IngestConfig(host: str, port: int, db_path: Path, raw_dir: Path, token: str, raw_retention_days: int = 30, max_body: int = 200 * 1024 * 1024, max_limit: int = 5000, source_map: Mapping[str, str] = field(default_factory=dict))\ndef load_config(env: Mapping[str, str]) -> IngestConfig  # HEALTH_HOST default '127.0.0.1', HEALTH_PORT 8787, HEALTH_DB, HEALTH_RAW, HEALTH_TOKEN required len >= 32 else ConfigError, HEALTH_SOURCE_MAP JSON {substring: 'watch'|'phone'|'garmin'}\ndef normalize_source(name: str | None, source_map: Mapping[str, str]) -> str  # returns one of store.SOURCES, never the raw device name; default heuristics: 'watch' if 'watch' in lower name, 'garmin', 'iphone'->'phone', else 'other'\ndef authorized(headers: Mapping[str, str], token: str) -> bool  # hmac.compare_digest against Bearer and X-Token\ndef strip_workout(w: Mapping[str, Any]) -> dict  # drops route, location coordinates, source names, metadata device fields\n@dataclass ParsedBatch(samples: list[Sample], sleep_segments: list[SleepSegment], sleep_nights: list[SleepNight], workouts: list[Workout], events: list[HealthEvent], skipped: dict[str, int])\ndef parse_payload(payload: Mapping[str, Any], source_map: Mapping[str, str]) -> ParsedBatch  # accepts {'data': {...}} or bare; sleep_analysis with 'value' stage -> SleepSegment, with sleepStart/sleepEnd -> SleepNight; v1 workouts without id get id = sha256(name|start)[:16]\ndef ingest_payload(store: Store, payload: Mapping[str, Any], cfg: IngestConfig) -> tuple[dict[str, int], list[HealthEvent]]  # counts per table, newly inserted events\ndef save_raw(raw_dir: Path, body: bytes, now: datetime) -> Path  # dir mode 0o700, file 0o600\ndef prune_raw(raw_dir: Path, days: int, now: datetime) -> int\nPostRoute = Callable[[dict], tuple[int, dict]]\ndef make_server(cfg: IngestConfig, store: Store, *, on_events: Callable[[list[HealthEvent]], None] | None = None, post_routes: Mapping[str, PostRoute] | None = None, site_dir: Path | None = None, owner_login: str | None = None) -> ThreadingHTTPServer\n# Routes: POST /health (token); GET /metrics /latest /samples?metric&since&limit(<=max_limit) /summary?days /workouts?since /freshness (token); GET /site/* static and post_routes (e.g. /checkin, /message) require Tailscale-User-Login == owner_login (header name UNVERIFIED) or token\ndef serve(cfg: IngestConfig, store: Store, **kwargs) -> None",
+   "depends_on": [
+    "homunculus/store.py"
+   ],
+   "test_path": "tests/test_ingest.py"
+  },
+  {
+   "path": "homunculus/metrics.py",
+   "purpose": "Deterministic physiology: canonical source selection, daily table, HRV/RHR baselines and states, sleep debt/midpoint/SRI, sRPE and TRIMP load with EWMA/monotony/strain, weight and VO2max trends, readiness composite, freshness. Every function returns None on insufficient data.",
+   "public_api": "DAILY_KEYS = ('hrv_sdnn_ln','hrv_rmssd_ln','rhr','tst_h','sleep_mid_min','sleep_start_min','weight_kg','vo2max','load_srpe','load_edwards','resp_rate','wrist_temp_c','spo2_min','steps','active_kcal','bp_sys','bp_dia','af_burden')\n@dataclass(frozen=True) MetricsConfig(tz: str, source_priority: Mapping[str, Sequence[str]], sleep_target_h: float = 7.5, hrmax: float | None = None, hrrest: float | None = None, sex: str | None = None, work_days: tuple[int, ...] = (0, 1, 2, 3, 4)); @classmethod from_dict(cls, d: Mapping) -> MetricsConfig\ndef wake_date(ts: str, tz: str) -> str\ndef pick_source(rows: Sequence[Sample], priority: Sequence[str]) -> str | None\ndef build_daily(store: Store, day: str, cfg: MetricsConfig) -> list[DailyValue]  # one row per DAILY_KEYS entry; load_srpe reads CheckinItem 'session_rpe' (value=RPE, ref=workout id) x workout minutes; rest day = 0.0, no data = None\ndef finalize_day(store: Store, day: str, cfg: MetricsConfig) -> list[DailyValue]  # build_daily + store.put_daily\n@dataclass(frozen=True) HrvState(m7: float|None, mu60: float|None, sd60: float|None, swc: float|None, cv7: float|None, state: str|None, overreach_hint: bool, reason: str)  # state in {'suppressed','normal','elevated'}\ndef hrv_state(series: Sequence[DailyValue], day: str) -> HrvState  # m7 needs 5/7; baseline days -67..-8 needs >= 30 values\n@dataclass(frozen=True) RhrState(med28: float|None, mad28: float|None, delta: float|None, z: float|None, watch: bool)\ndef rhr_state(series: Sequence[DailyValue], day: str) -> RhrState  # baseline days -35..-8; watch = delta >= max(5, 2*1.4826*mad) on 2 consecutive days\ndef sleep_debt(tst_h: Sequence[float | None], target_h: float) -> float | None  # needs >= 10 of 14\ndef midpoint_sd(mid_min: Sequence[float | None]) -> float | None  # circular-safe around midnight\ndef social_jetlag(mid_by_date: Mapping[str, float | None], work_days: Sequence[int]) -> float | None\ndef sri(segments: Sequence[SleepSegment], start_day: str, days: int, tz: str, epoch_s: int = 60) -> float | None  # -100..100, None if coverage < 0.8 or days < 7\ndef srpe_load(rpe: float, duration_min: float) -> float\ndef edwards_trimp(hr_series: Sequence[tuple[str, float]], hrmax: float | None) -> float | None\ndef banister_trimp(duration_min: float, hr_avg: float, hrrest: float, hrmax: float, sex: str) -> float | None\n@dataclass(frozen=True) LoadSummary(acute: float|None, chronic: float|None, monotony: float|None, strain: float|None, wow_change_pct: float|None, weekly_load: float|None)\ndef load_summary(daily_loads: Sequence[float | None]) -> LoadSummary  # input oldest->newest, >= 28 days for chronic\n@dataclass(frozen=True) WeightTrend(trend: list[float | None], rate_pct_bw_week: float | None)\ndef weight_trend(weights: Sequence[float | None]) -> WeightTrend\ndef vo2max_trend(points: Sequence[tuple[str, float]]) -> tuple[float | None, str | None]  # (slope per 90 d, 'up'|'down'|'flat'|None); needs >= 6 points; direction only if |change| > 2\n@dataclass(frozen=True) Readiness(score: float|None, band: str|None, contributions: dict[str, float], missing: list[str])\ndef readiness(components: Mapping[str, float | None], weights: Mapping[str, float]) -> Readiness  # band 'low' <= -1 < 'normal' < 1 <= 'high'; None if < 3 inputs\ndef baselines(store: Store, day: str, cfg: MetricsConfig) -> dict  # JSON-serializable snapshot for data/baselines/<week>.json: hrv, rhr, sleep, load, weight, vo2max, readiness\ndef freshness(latest: Mapping[str, str], now: datetime, thresholds_h: Mapping[str, float]) -> dict[str, dict]  # {key: {'latest': ts|None, 'age_h': float|None, 'stale': bool}}",
+   "depends_on": [
+    "homunculus/store.py",
+    "homunculus/stats.py"
+   ],
+   "test_path": "tests/test_metrics.py"
+  },
+  {
+   "path": "homunculus/checkins.py",
+   "purpose": "Subjective scales: German item wording (version-stamped), validation of the morning form and per-session RPE, conversion of coach structured output into CheckinItems, per-item personal z-scores, symptom and restrictive-language detection.",
+   "public_api": "WORDING_VERSION: str = 'de-1'\n@dataclass(frozen=True) ItemSpec(key: str, prompt_de: str, lo: int, hi: int, inverted: bool)\nITEMS: Mapping[str, ItemSpec]  # sleep_quality, energy, mood, soreness(inverted), stress(inverted), motivation: 1-7 Likert; wellbeing: 0-10; session_rpe: CR-10 0-10\nSYMPTOMS: tuple[str, ...] = ('fever','sore_throat','chest_pain','dizziness','palpitations','fainting','short_breath','dark_urine','focal_bone_pain','pain_3plus')\nURGENT_SYMPTOMS: frozenset[str] = frozenset({'chest_pain','fainting','short_breath'})\nclass CheckinError(ValueError)\ndef validate(form: Mapping[str, Any], *, date: str, ts: str, origin: str = 'form') -> list[CheckinItem]  # symptoms stored as item 'symptom:<name>' value 1.0; free text as item 'note'\ndef record(store: Store, form: Mapping[str, Any], now: datetime, tz: str) -> tuple[int, dict]  # POST /checkin handler: (http_status, {'stored': n, 'symptoms': [...]})\nCOACH_CHECKIN_SCHEMA: dict  # JSON Schema for the 'checkin' part of coach structured output\ndef from_chat(extracted: Mapping[str, Any], *, date: str, ts: str) -> list[CheckinItem]  # origin='coach'; ignores unknown keys; clamps nothing, rejects out-of-range\ndef morning_form_html(date: str, action: str = '/checkin') -> str  # escaped static HTML form, no JS required\ndef subjective_scores(store: Store, day: str, window: int = 28) -> dict[str, float | None]  # per-item z vs own baseline (days -window..-1), inverted items sign-flipped\ndef composite(scores: Mapping[str, float | None]) -> float | None  # mean of non-None, None if < 3\ndef symptom_flags(items: Sequence[CheckinItem]) -> list[str]\ndef restrictive_language(text: str) -> bool  # case-insensitive German/English keyword list from module constant RESTRICTIVE_TERMS",
+   "depends_on": [
+    "homunculus/store.py",
+    "homunculus/stats.py"
+   ],
+   "test_path": "tests/test_checkins.py"
+  },
+  {
+   "path": "homunculus/insula.py",
+   "purpose": "Deterministic disagreement detector between subjective and objective signals (rules R1, R2, R3, DATA_GAP) and the weekly reconciliation file that the Insula LLM reads. Pure functions over data; no LLM calls.",
+   "public_api": "@dataclass(frozen=True) DayScore(date: str, objective: float | None, subjective: float | None, gap: float | None, quality_ok: bool, inputs: dict[str, float | None])\n@dataclass(frozen=True) Conflict(id: str, rule_id: str, window: tuple[str, str], numbers: dict[str, float | None], sign: int, session_id: str | None)  # rule_id in {'R1_sustained','R2_single_day','R3_session_residual','DATA_GAP'}; id = sha256(rule_id|window|session_id)[:10]\ndef day_score(objective_z: Mapping[str, float | None], subjective_z: Mapping[str, float | None], date: str) -> DayScore  # objective = mean(hrv_m7_z, -rhr_z, tst_z) needs all 3 else quality_ok False\ndef detect_day_conflicts(scores: Sequence[DayScore]) -> list[Conflict]  # R1: |gap|>=1.5 on >=3 of last 5 days, same sign; R2: |gap|>=2.5 with opposite-sign S,O each |.|>=1; any quality_ok False in window -> DATA_GAP\ndef detect_session_conflicts(sessions: Sequence[tuple[str, str, float, float]]) -> list[Conflict]  # (workout_id, date, srpe_load, edwards_trimp) over 60 days; OLS srpe~trimp, flag residual z >= 2; needs >= 15 sessions\ndef weekly_reconciliation(store: Store, week: str, cfg: MetricsConfig) -> dict  # {'week', 'days': [DayScore as dict], 'conflicts': [Conflict as dict], 'sessions_flagged': [...]} for data/conflicts/<week>.json\nINSULA_OUTPUT_SCHEMA: dict  # {'items': [{'conflict_id', 'interpretation_de', 'noisier_signal': 'subjective'|'objective'|'unclear', 'question_for_owner_de': str|null, 'refs': [str]}]} max 3 questions",
+   "depends_on": [
+    "homunculus/store.py",
+    "homunculus/stats.py",
+    "homunculus/metrics.py",
+    "homunculus/checkins.py"
+   ],
+   "test_path": "tests/test_insula.py"
+  },
+  {
+   "path": "homunculus/evidence.py",
+   "purpose": "Paper extraction schema and the thal-1 certainty rubric: quote verification, population match, GRIM, retraction veto, gates, dual-extraction comparison, conversion to a belief prior. Pure; network lookups live in scouts.",
+   "public_api": "RUBRIC_VERSION: str = 'thal-1'\nDESIGNS = ('meta_rct','rct_parallel','rct_crossover','cohort_prospective','case_control','cross_sectional','mechanistic_human','animal','in_vitro','review_opinion')\nPAPER_SCHEMA: dict  # JSON Schema for Thalamus output: each field {'value': ..., 'quote': str|null}; fields doi, pmid, design, n_total, n_per_arm, population{sex, age_mean, training_status, bmi_mean, condition}, outcome{name, unit, is_surrogate}, effect{type MD|SMD|RR, est, ci_lo, ci_hi, sd_pop}, registration_id, preregistered, attrition_pct, blinded_outcome, outcome_switched, funding_industry_product, i2, k_studies, peer_reviewed, dose_response, reported_means[{mean, n, decimals, items}]\n@dataclass(frozen=True) OwnerProfile(sex: str|None, age: int|None, training_status: str|None, conditions: tuple[str, ...], swc: Mapping[str, float])\n@dataclass(frozen=True) Score(certainty: float, base: float, adjustments: tuple[tuple[str, float], ...], vetoed: bool, flags: tuple[str, ...], gate: str, rubric_version: str)  # gate in {'actionable','n_of_1_only','watchlist','discard'}\ndef verify_quotes(paper: Mapping, abstract_text: str) -> list[str]  # field paths whose quote is not a whitespace-normalized substring; those values are treated as missing\ndef population_match(population: Mapping, owner: OwnerProfile) -> float  # weights sex .25, age +-10y .25, training .3, condition .2\ndef grim_ok(mean: float, n: int, decimals: int, items: int = 1) -> bool\ndef score(paper: Mapping, owner: OwnerProfile, *, update_to: Sequence[Mapping], swc_paper_units: float | None, replications: int = 0, independent_rcts: int = 0) -> Score  # update_to from Crossref (code), never from paper; actionable needs c>=2 and (design=='meta_rct' or independent_rcts>=2)\ndef compare_extractions(a: Mapping, b: Mapping, tol: float = 0.01) -> list[str]  # disagreeing field paths\ndef to_prior(paper: Mapping, s: Score, belief_id: str) -> 'beliefs.Prior | None'  # mu0 = shrink(c)*delta, sd0^2 = (k(c)*SE)^2 + tau_het^2, SE=(ci_hi-ci_lo)/3.92, tau_het default 0.5*|delta|\ndef dedupe_key(paper: Mapping) -> str  # 'reg:<id>' > 'doi:<lower>' > 'pmid:<id>'\ndef slug(doi_or_pmid: str) -> str  # filesystem-safe",
+   "depends_on": [
+    "homunculus/beliefs.py"
+   ],
+   "test_path": "tests/test_evidence.py"
+  },
+  {
+   "path": "homunculus/beliefs.py",
+   "purpose": "Event-sourced belief ledger: priors from literature, personal N-of-1 results, retractions, decisions; deterministic fold into views with variance decay, status and review triggers.",
+   "public_api": "EVENT_KINDS = ('prior_set','evidence_added','personal_result','source_retracted','decision','review')\nSTATUSES = ('hypothesis','testing','adopted','rejected','stale')\n@dataclass(frozen=True) Prior(mu0: float, sd0: float, sources: tuple[str, ...], certainty: float, rubric_version: str)\n@dataclass(frozen=True) Claim(population: str, intervention: str, comparator: str, outcome: str, unit: str, direction: int)  # direction +1 higher is better, -1 lower is better\n@dataclass Belief(id: str, claim: Claim, prior: Prior | None, personal: list[dict], mu: float | None, sd: float | None, p_benefit: float | None, p_harm: float | None, status: str, as_of: str, review_after: str | None, decisions: list[dict], swc: float, swc_harm: float)\ndef make_event(kind: str, belief_id: str, at: str, **data: Any) -> dict  # validates kind; adds 'schema': 1\ndef combine_priors(priors: Sequence[Prior]) -> Prior  # precision-weighted, sources deduped by registration key\ndef p_benefit(mu: float, sd: float, swc: float) -> float  # 1 - phi((swc - mu)/sd)\ndef p_harm(mu: float, sd: float, swc_harm: float) -> float  # phi((-swc_harm - mu)/sd)\ndef decayed_sd(sd1: float, q_per_day: float, days: float) -> float  # sqrt(sd1^2 + q*days)\ndef fold(events: Iterable[Mapping], as_of: str) -> dict[str, Belief]  # deterministic; q default sd0^2/365; status 'stale' when decay alone drops p_benefit below 0.8 for an adopted belief; review_after default +90 d\ndef retract(beliefs: Mapping[str, Belief], source_key: str, at: str) -> list[dict]  # source_retracted events for every belief citing it\ndef due_for_review(beliefs: Mapping[str, Belief], as_of: str) -> list[str]\ndef rebuild_views(ledger: Ledger, as_of: str, *, author: str = 'pineal') -> list[str]  # reads beliefs/events.jsonl, writes beliefs/views/<id>.json",
+   "depends_on": [
+    "homunculus/store.py",
+    "homunculus/stats.py"
+   ],
+   "test_path": "tests/test_beliefs.py"
+  },
+  {
+   "path": "homunculus/experiments.py",
+   "purpose": "N-of-1 design and analysis: eligibility, MDE, preregistered seeded allocation (paired blocks or daily alternating), exclusions, sign-flip / Monte Carlo randomization test, Bayesian update against a belief prior, decision and carryover check.",
+   "public_api": "class ProtocolError(ValueError)\n@dataclass(frozen=True) Protocol(id: str, belief_id: str, intervention: str, comparator: str, outcome_key: str, source: str, design: str, block_days: int, washout_days: int, pairs: int, a_days_per_week: tuple[int, int] | None, swc: float, swc_harm: float, exclusions: tuple[Mapping[str, Any], ...], covariates: tuple[str, ...], start_date: str, created_at: str)  # design in {'paired_blocks','daily_alternating'}; to_dict()/from_dict()\ndef baseline_stats(values: Sequence[float | None]) -> tuple[float, float, float]  # (sigma, rho, mean); needs >= 21 non-None\ndef mde(sigma: float, rho: float, block_days: int, washout_days: int, pairs: int, tau_drift: float = 0.0, alpha: float = 0.05, power: float = 0.8) -> float\ndef eligibility(p: Protocol, baseline: Sequence[float | None], mean90: float, sd90: float) -> list[str]  # problems: 'pairs_lt_6', 'mde_gt_2swc', 'baseline_outside_1sd', 'washout_lt_1', 'source_unlocked'\ndef seed(protocol_bytes: bytes) -> int  # int(sha256(b).hexdigest()[:16], 16)\ndef allocate(p: Protocol, protocol_bytes: bytes) -> list[tuple[str, str]]  # [(date, 'A'|'B'|'washout')], random.Random(seed)\ndef excluded_days(p: Protocol, daily: Mapping[str, Mapping[str, float | None]], checkin_flags: Mapping[str, Sequence[str]]) -> set[str]\n@dataclass(frozen=True) Result(pair_diffs: tuple[float, ...], d_bar: float, se: float, p_value: float, mu1: float, sd1: float, p_benefit: float, p_harm: float, decision: str, carryover_slope: float | None, n_excluded: int)  # decision in {'adopt','reject','inconclusive','extend'}\ndef analyze(p: Protocol, allocation: Sequence[tuple[str, str]], data: Mapping[str, float | None], excluded: set[str], prior: Prior, *, extended: bool = False, mc_draws: int = 20000) -> Result  # s^2 = max(sd(D)^2/m, model SE^2) * (m-1)/(m-3) for m > 3\ndef write_protocol(ledger: Ledger, p: Protocol, *, author: str = 'hippocampus') -> str  # writes experiments/<id>/protocol.json, returns sha256 of canonical bytes; refuses to overwrite",
+   "depends_on": [
+    "homunculus/store.py",
+    "homunculus/stats.py",
+    "homunculus/beliefs.py"
+   ],
+   "test_path": "tests/test_experiments.py"
+  },
+  {
+   "path": "homunculus/guardrails.py",
+   "purpose": "Safety code: change budget tiers for plan diffs, novel-exercise admission solver, nutrition floor and ed_watch, forbidden list and supplement allowlist with interaction table, red-flag detection with fixed German templates, banned-vocabulary scan. Pure over passed-in data.",
+   "public_api": "TIERS = ('auto','notify','approve','reject')\n@dataclass(frozen=True) Rules(load_auto_pct: float = 10, load_approve_pct: float = 20, two_week_reject_pct: float = 30, max_added_hard_sessions: int = 1, return_after_days_off: int = 7, return_cap_pct: float = 70, cumulative_3wk_pct: float = 20, ea_floor: float = 30, ea_approve: float = 35, kcal_step_pct: float = 10, kcal_step_abs: float = 250, max_loss_pct_bw_week: float = 1.0, max_fast_h: float = 24, novel_per_session: int = 1, novel_per_week: int = 2, pull_push: tuple[float, float] = (1.0, 2.0), forbidden: Mapping[str, Sequence[str]] = ..., supplements: Mapping[str, Mapping] = ..., interactions: Sequence[Mapping] = ..., meds: Sequence[str] = ...)\ndef load_rules(ledger: Ledger) -> Rules  # config/guardrails.json, forbidden.json, supplements.json, profile/meds.json\n@dataclass(frozen=True) GuardContext(weekly_loads: Sequence[float], hard_sessions_last_week: int, days_off: int, ea_7d: float | None, kcal_current: float | None, weight_kg: float | None, ffm_kg: float | None, auto_changes_3wk_pct: float, red_flag_active: bool, ed_watch: bool, injury_constraints: Mapping[str, Any])\n@dataclass(frozen=True) Verdict(tier: str, reasons: tuple[str, ...], rule_ids: tuple[str, ...])\ndef check_diff(current_plan: Mapping, new_plan: Mapping, diff: Sequence[Mapping], ctx: GuardContext, rules: Rules) -> Verdict  # strictest rule wins; red_flag_active or ed_watch -> any load/kcal increase rejected\ndef exercise_admissible(features: Mapping[str, Any], constraints: Mapping[str, Any]) -> list[str]  # violated constraint ids; empty = admissible\ndef normalize_name(s: str) -> str  # casefold, strip punctuation/diacritics\ndef forbidden_match(name: str, rules: Rules) -> str | None  # category\ndef supplement_check(name: str, dose: float, unit: str, tested_by: str | None, rules: Rules) -> list[str]\ndef energy_availability(intake_kcal: float, exercise_kcal: float, ffm_kg: float) -> float\ndef ed_watch(intake_7d: Sequence[float | None], ea_7d: Sequence[float | None], weigh_ins_per_day: Sequence[int], checkin_texts: Sequence[str], rules: Rules) -> bool\n@dataclass(frozen=True) Alert(level: str, rule_id: str, date: str, data: Mapping[str, Any])  # level in {'urgent','prompt'}\ndef red_flags(daily: Mapping[str, Sequence[DailyValue]], rhr: Sequence[RhrState], checkins: Sequence[CheckinItem], day: str, profile: Mapping[str, Any]) -> list[Alert]\ndef event_alerts(events: Sequence[HealthEvent]) -> list[Alert]  # every hr_notification -> urgent\nTEMPLATES_DE: Mapping[str, str]  # rule_id -> string.Template text; names 112, Telefonseelsorge 0800 111 0 111, profile doctor contact\ndef render_alert(alert: Alert, profile: Mapping[str, Any]) -> str\nBANNED_TERMS: tuple[str, ...]\ndef scan_text(text: str) -> list[str]  # banned diagnostic vocabulary found (en+de)",
+   "depends_on": [
+    "homunculus/store.py",
+    "homunculus/metrics.py",
+    "homunculus/checkins.py"
+   ],
+   "test_path": "tests/test_guardrails.py"
+  },
+  {
+   "path": "homunculus/plans.py",
+   "purpose": "Versioned training and nutrition plan as typed JSON: schema, JSON-pointer diff apply/compute, weekly load estimate, pending proposals, ratification by tier (auto, 24 h veto, owner approval), rollback, German markdown rendering, deterministic daily modulation the coaches read, exercise library IO.",
+   "public_api": "PLAN_SCHEMA: dict  # {version:int, parent:int|null, effective_from, valid_until, author, ratified_by, data_snapshot_sha, rationale_refs:[str], sessions:[{id, weekday:0-6, kind, duration_min, target_rpe, exercises:[{exercise_id, sets, reps, load_kg|null, rir|null, novel:bool, probation:bool}]}], nutrition:{kcal_target|null, protein_g_per_kg|null, notes_de}, supplements:[{name, dose, unit, tested_by}], experiments:[id], modulation:{max_daily_load_cut_pct, allow_swap:bool, readiness_low_action:'shorten'|'swap'|'rest'}}\nDIFF_SCHEMA: dict  # [{op:'set'|'add'|'remove', path:'/sessions/2/exercises/0/sets', value?, refs:[str]}]\nclass PlanError(ValueError)\ndef validate_plan(plan: Mapping) -> list[str]\ndef apply_diff(plan: Mapping, diff: Sequence[Mapping]) -> dict  # pure, raises PlanError\ndef compute_diff(a: Mapping, b: Mapping) -> list[dict]\ndef changed_paths(diff: Sequence[Mapping]) -> set[str]\ndef weekly_load(plan: Mapping) -> float  # sum(target_rpe * duration_min)\ndef current(ledger: Ledger) -> dict\ndef get(ledger: Ledger, version: int) -> dict\n@dataclass(frozen=True) Pending(id: str, diff: tuple[Mapping, ...], tier: str, reasons: tuple[str, ...], created_at: str, veto_until: str | None, refs: tuple[str, ...], ruling_ref: str)\ndef propose(ledger: Ledger, diff: Sequence[Mapping], verdict_tier: str, reasons: Sequence[str], refs: Sequence[str], ruling_ref: str, now: datetime) -> Pending  # writes plans/pending/<id>.json (author cerebellum)\ndef ratify_due(ledger: Ledger, now: datetime, data_snapshot_sha: str) -> list[int]  # applies auto now and notify after veto_until; writes plans/vNNNN.json + .md, updates CURRENT; returns new versions\ndef approve(ledger: Ledger, pending_id: str, now: datetime) -> int\ndef veto(ledger: Ledger, pending_id: str, now: datetime) -> None\ndef rollback(ledger: Ledger, to_version: int, now: datetime) -> int  # new version copying old content, parent = current\ndef render_markdown_de(plan: Mapping) -> str\ndef modulate_day(plan: Mapping, weekday: int, readiness_band: str | None, red_flag_active: bool, stale: bool) -> dict  # {'session': ..., 'action': 'as_planned'|'shorten'|'swap'|'rest', 'reason_codes': [...]}; never increases load\ndef load_exercises(ledger: Ledger) -> dict[str, dict]  # config/exercises.json feature records",
+   "depends_on": [
+    "homunculus/store.py"
+   ],
+   "test_path": "tests/test_plans.py"
+  },
+  {
+   "path": "homunculus/scouts.py",
+   "purpose": "Retina, Spindle and Papilla code path: allowlisted, rate-limited, cached HTTP client; PubMed, Europe PMC, bioRxiv/medRxiv search; Crossref resolution and retraction lookup; OpenAlex enrichment; dedupe and ranking; quarantine of fetched text; Batch request bodies for Haiku triage into enums.",
+   "public_api": "ALLOWED_HOSTS: frozenset[str] = frozenset({'eutils.ncbi.nlm.nih.gov','www.ebi.ac.uk','api.biorxiv.org','api.crossref.org','api.openalex.org','api.semanticscholar.org','wger.de','api.ods.od.nih.gov'})\nclass HostNotAllowed(PermissionError)\nclass Http:\n  def __init__(self, cache_dir: Path, *, mailto: str | None, keys: Mapping[str, str], rate_per_s: Mapping[str, float], opener: Callable[[urllib.request.Request], bytes] | None = None, offline: bool = False) -> None  # opener injectable for tests; offline reads cache only\n  def get_json(self, url: str, params: Mapping[str, str] | None = None) -> Any\n  def get_text(self, url: str, params: Mapping[str, str] | None = None) -> str\n@dataclass(frozen=True) Candidate(id: str, scout: str, doi: str | None, pmid: str | None, registration_id: str | None, title: str, year: int | None, pub_types: tuple[str, ...], source_api: str, preprint: bool, query: str, found_at: str, quarantine_path: str | None, triage: Mapping[str, Any] | None, score: float)\ndef search_pubmed(http: Http, term: str, reldays: int = 7) -> list[Candidate]  # excludes 'Retracted Publication[pt]'\ndef search_europepmc(http: Http, query: str, since: str) -> list[Candidate]\ndef search_biorxiv(http: Http, server: str, since: str, until: str, terms: Sequence[str]) -> list[Candidate]\ndef resolve_doi(http: Http, doi: str) -> dict | None  # Crossref work: title, authors, journal, update_to\ndef crossref_updates(http: Http, doi: str) -> list[dict]  # update-to entries incl. source 'retraction-watch'\ndef title_match(a: str, b: str) -> float  # difflib ratio on normalized titles\ndef dedupe(cands: Sequence[Candidate]) -> list[Candidate]  # by doi, then pmid, then registration id\ndef rank(cands: Sequence[Candidate], keywords: Mapping[str, Any]) -> list[Candidate]  # deterministic keyword/pub-type score\ndef run_scout(scout: str, keywords: Mapping[str, Any], http: Http, ledger: Ledger, now: datetime, cap: int = 30) -> list[Candidate]  # fetch, dedupe vs evidence/candidates history, retraction veto, quarantine abstracts, write evidence/candidates/<date>.jsonl\ndef quarantine_text(ledger: Ledger, cand_id: str, text: str, *, author: str) -> str\nTRIAGE_SCHEMA: dict  # {'relevance': 0-3, 'design': enum evidence.DESIGNS, 'population': enum, 'is_human': bool, 'exercise': {pattern, equipment, ...}|null}\ndef triage_requests(cands: Sequence[Candidate], ledger: Ledger, keywords: Mapping[str, Any]) -> list[tuple[str, 'agents.LLMRequest']]  # custom_id = candidate id; abstract inside a <data> block\ndef apply_triage(cands: Sequence[Candidate], results: Mapping[str, Mapping]) -> list[Candidate]  # schema-invalid results dropped",
+   "depends_on": [
+    "homunculus/store.py",
+    "homunculus/evidence.py",
+    "homunculus/agents.py"
+   ],
+   "test_path": "tests/test_scouts.py"
+  },
+  {
+   "path": "homunculus/agents.py",
+   "purpose": "Roster registry, prompt rendering from agents/<bot>.md with escaped data blocks, message envelopes and validation, LLM provider interface (Anthropic Messages + Batches over urllib, Gemini REST, deterministic FakeProvider for tests and --dry-run), pricing and budget guard.",
+   "public_api": "@dataclass(frozen=True) BotSpec(name: str, anatomy: str, role: str, tier: str, provider: str, model: str, alt_provider: str | None, alt_model: str | None, effort: str, user_facing: bool, cadence: str, prompt_file: str, writes: tuple[str, ...], max_tokens: int, daily_usd_cap: float)  # provider in {'anthropic','gemini','none'}\ndef load_roster(data: Mapping[str, Any]) -> dict[str, BotSpec]  # from config/roster.json; validates every name is in the known anatomy list\ndef write_rules(roster: Mapping[str, BotSpec]) -> dict[str, list[str]]  # input for store.Ledger\ndef render_prompt(bot: BotSpec, prompts_dir: Path, context: Mapping[str, Any], untrusted: Mapping[str, str] | None = None) -> tuple[str, str]  # (system, user); string.Template; untrusted text wrapped as <data source=\"k\">...</data> with '<' escaped\n@dataclass(frozen=True) LLMRequest(bot: str, system: str, messages: tuple[Mapping[str, Any], ...], output_schema: Mapping[str, Any] | None, max_tokens: int, effort: str, cache_system: bool = True)\n@dataclass(frozen=True) LLMResponse(text: str, structured: Mapping[str, Any] | None, model: str, tokens_in: int, tokens_out: int, cache_read: int, cache_write: int, usd: float, stop_reason: str)\nclass ProviderError(Exception); class ProviderUnavailable(ProviderError); class SchemaViolation(ProviderError)\nclass Provider(Protocol):\n  name: str\n  def complete(self, req: LLMRequest, model: str) -> LLMResponse\n  def submit_batch(self, items: Sequence[tuple[str, LLMRequest]], model: str) -> str\n  def batch_results(self, batch_id: str) -> dict[str, LLMResponse] | None  # None while processing\nclass AnthropicProvider:  # POST https://api.anthropic.com/v1/messages and /v1/messages/batches; headers x-api-key, anthropic-version; output_config {'effort', 'format': json_schema}; no thinking param (adaptive default); never forced tool_choice; checks stop_reason incl. 'refusal'\n  def __init__(self, api_key: str, prices: Mapping[str, Mapping[str, float]], opener: Callable | None = None) -> None\nclass GeminiProvider:  # REST generateContent with responseSchema; request shape for Gemini 4 UNVERIFIED\n  def __init__(self, api_key: str, prices: Mapping[str, Mapping[str, float]], opener: Callable | None = None) -> None\nclass FakeProvider:  # deterministic: responses from a fixtures dict keyed by bot name, or a schema-valid minimal object generated from output_schema; records calls in .calls\n  def __init__(self, fixtures: Mapping[str, Any] | None = None) -> None\ndef price(model: str, usage: Mapping[str, int], prices: Mapping[str, Mapping[str, float]], batch: bool = False) -> float\nclass BudgetExceeded(Exception)\nclass Budget:\n  def __init__(self, ledger: Ledger, config: Mapping[str, Any], now: Callable[[], datetime]) -> None  # config/budget.json: weekly_cap_usd (40), reduce_at (0.8), prices\n  def level(self) -> str  # 'normal'|'reduced'|'core_only'\n  def allow(self, bot: BotSpec, est_usd: float) -> bool\n  def record(self, bot: str, resp: LLMResponse, run_id: str) -> None  # append ops/budget.jsonl\ndef call(bot: BotSpec, req: LLMRequest, providers: Mapping[str, Provider], budget: Budget, run_id: str) -> LLMResponse  # alt model only on ProviderUnavailable and only if alt tier == bot tier, else raises; validates structured output against output_schema (SchemaViolation)\ndef validate_json(instance: Any, schema: Mapping[str, Any]) -> list[str]  # stdlib subset validator: type, enum, required, properties, items, additionalProperties, min/max, maxLength\nMESSAGE_KINDS: tuple[str, ...]\ndef message_id(sender: str, kind: str, thread: str, round_: int, data_sha: str) -> str  # 'm-' + sha256(...)[:12]\ndef make_message(*, sender: str, to: Sequence[str], kind: str, thread: str, round_: int, max_rounds: int, refs: Sequence[str], data_sha: str, run_id: str, model: str, body: str, items: Sequence[Mapping] = (), cc: Sequence[str] = (), created_at: str) -> dict\ndef validate_message(msg: Mapping[str, Any]) -> list[str]\ndef commit_trailers(msg: Mapping[str, Any], resp: LLMResponse | None) -> dict[str, str]  # Msg-Id, Run-Id, Model, Tokens-In, Tokens-Out, Usd, Kind",
+   "depends_on": [
+    "homunculus/store.py"
+   ],
+   "test_path": "tests/test_agents.py"
+  },
+  {
+   "path": "homunculus/weekly.py",
+   "purpose": "Review packet builder and the bounded Hippocampus/Amygdala/Cerebellum loop: draft, guardrail pre-tier, two challenge rounds with ref validation and round-2 restriction, ruling, final guardrail check, proposal. Also the Saturday Insula and Motor Cortex steps and Thursday Thalamus step.",
+   "public_api": "def build_packet(store: Store, ledger: Ledger, week: str, cfg: MetricsConfig, now: datetime) -> dict  # keys: week, generated_at, daily (aggregates per key per day), baselines, conflicts, insula, motor_cortex, papers_actionable, beliefs_changed, experiments, plan_current, guard_context, freshness, budget, critic_same_family: bool; no device names, GPS or free-text notes beyond 280 chars\ndef packet_sha(packet: Mapping) -> str  # sha256(store.canonical_json(packet))\ndef known_refs(packet: Mapping, ledger: Ledger) -> set[str]  # JSON pointers 'reviews/<week>/packet.json#/...' plus existing ledger paths\nDRAFT_SCHEMA: dict  # {'summary_md', 'plan_diff': plans.DIFF_SCHEMA, 'claims': [{'id', 'text', 'refs'}], 'experiments_proposed': [...]}\nCHALLENGE_SCHEMA: dict  # {'items': [{'cid', 'severity': 'blocker'|'major'|'minor', 'claim', 'ref', 'diff_paths': [str]}]}\nREBUTTAL_SCHEMA: dict  # {'answers': [{'cid', 'action': 'accept'|'rebut', 'ref'|null, 'change': diff ops}], 'plan_diff': revised}\nRULING_SCHEMA: dict  # {'ruling': 'ratify'|'partial'|'keep', 'plan_diff': [...], 'rationale_md', 'ask_owner_de': [str] (<=3)}\ndef drop_unreferenced(items: Sequence[Mapping], refs: set[str]) -> tuple[list[dict], list[dict]]\ndef restrict_round2(items: Sequence[Mapping], changed: set[str]) -> list[dict]  # keep only items whose diff_paths intersect paths changed in round 1\n@dataclass(frozen=True) ReviewOutcome(week: str, ruling: str, verdict: Verdict | None, pending_id: str | None, open_blockers: tuple[str, ...], asks_owner: tuple[str, ...], messages: tuple[str, ...], aborted: str | None)\ndef run_review(week: str, packet: Mapping, *, roster: Mapping[str, BotSpec], providers: Mapping[str, Provider], budget: Budget, ledger: Ledger, guard_ctx: GuardContext, rules: Rules, prompts_dir: Path, now: datetime) -> ReviewOutcome  # max 6 messages; same output hash twice or 7th message -> aborted='loop'; open blocker -> ruling forced 'keep', valid_until +7d, ask.owner; scan_text on every body, hits -> message rejected and re-asked once\ndef run_insula(week: str, ledger: Ledger, store: Store, cfg: MetricsConfig, **llm: Any) -> dict\ndef run_motor_cortex(week: str, ledger: Ledger, rules: Rules, **llm: Any) -> dict  # proposals filtered by guardrails.exercise_admissible\ndef run_thalamus(ledger: Ledger, http: 'scouts.Http', owner: OwnerProfile, now: datetime, top_n: int = 10, audit_share: float = 0.1, **llm: Any) -> list[str]  # batch extraction, verify_quotes, Crossref overwrite, score, 10% Amygdala re-extraction with compare_extractions",
+   "depends_on": [
+    "homunculus/store.py",
+    "homunculus/metrics.py",
+    "homunculus/insula.py",
+    "homunculus/evidence.py",
+    "homunculus/beliefs.py",
+    "homunculus/experiments.py",
+    "homunculus/guardrails.py",
+    "homunculus/plans.py",
+    "homunculus/scouts.py",
+    "homunculus/agents.py"
+   ],
+   "test_path": "tests/test_weekly.py"
+  },
+  {
+   "path": "homunculus/dashboard.py",
+   "purpose": "Static HTML generator: Today, Plan (with diff to parent), Week thread, Open challenges, Experiments, Budget, Check-in form. Inline CSS and SVG sparklines, every value html.escaped, no JavaScript framework or CDN; shows the intended-purpose statement.",
+   "public_api": "INTENDED_PURPOSE_DE: str\nINTENDED_PURPOSE_EN: str\ndef sparkline_svg(values: Sequence[float | None], width: int = 120, height: int = 24) -> str  # gaps for None\ndef render_today(daily: Mapping[str, Any], readiness: Readiness, day_plan: Mapping, freshness: Mapping, alerts: Sequence[Alert]) -> str\ndef render_plan(plan: Mapping, parent: Mapping | None) -> str\ndef render_week(messages: Sequence[Mapping]) -> str\ndef render_challenges(messages: Sequence[Mapping]) -> str\ndef render_experiments(experiments: Sequence[Mapping]) -> str\ndef render_budget(budget_rows: Sequence[Mapping], cap_usd: float) -> str\ndef build(store: Store, ledger: Ledger, out_dir: Path, now: datetime, cfg: MetricsConfig) -> list[Path]  # writes index.html, plan.html, week.html, challenges.html, experiments.html, budget.html, checkin.html; atomic writes",
+   "depends_on": [
+    "homunculus/store.py",
+    "homunculus/metrics.py",
+    "homunculus/checkins.py",
+    "homunculus/plans.py",
+    "homunculus/guardrails.py"
+   ],
+   "test_path": "tests/test_dashboard.py"
+  },
+  {
+   "path": "homunculus/pineal.py",
+   "purpose": "Scheduler and single writer: job table from config/cadence.json, idempotent (job, period) runs, HALT handling, commits with bot identity and trailers, heartbeats, freshness, incidents and scrubbed Devin repair webhook, alert and message delivery, owner message routing to coaches and Cerebellum.",
+   "public_api": "@dataclass(frozen=True) Job(name: str, cadence: str, at: str | None, weekday: int | None, bot: str | None, essential: bool, fn: Callable[['Context', str], 'JobResult'])  # cadence in {'minute','hourly','daily','weekly','monthly'}; essential jobs run under HALT and core_only budget (ingest-prune, red_flags, finalize_day, weekly_review)\n@dataclass(frozen=True) JobResult(status: str, written: tuple[str, ...], message: str, trailers: Mapping[str, str])  # status in {'ok','skipped','deferred','failed'}\n@dataclass Context(store: Store, ledger: Ledger, roster: Mapping[str, BotSpec], providers: Mapping[str, Provider], budget: Budget, http: 'scouts.Http', metrics_cfg: MetricsConfig, notifier: 'Notifier', tz: str, now: Callable[[], datetime], dry_run: bool = False)\ndef period_key(job: Job, now: datetime) -> str  # '2026-11-20', '2026-W47', '2026-11', '2026-11-20T07'\ndef due_jobs(jobs: Sequence[Job], now: datetime, runs: Sequence[Mapping]) -> list[tuple[Job, str]]\ndef run_job(ctx: Context, job: Job, period: str) -> dict  # appends ops/runs.jsonl {job, period, status, started, ended, run_id}; commits ctx.ledger under the bot identity; on exception writes ops/incidents/<id>.json and calls repair_webhook; at most one retry per period\ndef tick(ctx: Context, jobs: Sequence[Job]) -> list[dict]  # entry for launchd/systemd/cron each minute; flock so ticks never overlap\ndef default_jobs() -> list[Job]  # hourly freshness/heartbeat/budget/red_flags; 03:00 scouts; 06:30 finalize; 07:00 coach morning; 21:00 evening prompt; Thu thalamus; Sat insula+motor_cortex; Sun 17:00 weekly_review; ratify_due every 15 min; monthly report\nclass Notifier(Protocol):\n  def send(self, to: str, text: str, level: str) -> None\nclass FileNotifier:  # writes mail/owner/inbox/<id>.json, shown on dashboard\n  def __init__(self, ledger: Ledger) -> None\ndef deliver_alerts(ctx: Context, alerts: Sequence[Alert]) -> int  # dedupe by (rule_id, date) via data/alerts.jsonl; templated text only\ndef handle_owner_message(ctx: Context, to: str, text: str) -> tuple[int, dict]  # POST /message handler; to in {'sartorius','vagus','cerebellum'}; reply {'reply_de', 'checkin_stored': n}; urgent symptom keywords short-circuit to the 112 template without an LLM call\ndef scrub_incident(exc: BaseException, job: str, commit_sha: str | None) -> dict  # traceback frames (file, line, function) only, no locals or messages containing digits\ndef repair_webhook(url: str, secret: str, incident: Mapping[str, Any], opener: Callable | None = None) -> None  # POST with X-Webhook-Secret header; https only",
+   "depends_on": [
+    "homunculus/store.py",
+    "homunculus/metrics.py",
+    "homunculus/checkins.py",
+    "homunculus/insula.py",
+    "homunculus/beliefs.py",
+    "homunculus/experiments.py",
+    "homunculus/guardrails.py",
+    "homunculus/plans.py",
+    "homunculus/scouts.py",
+    "homunculus/agents.py",
+    "homunculus/weekly.py",
+    "homunculus/dashboard.py"
+   ],
+   "test_path": "tests/test_pineal.py"
+  },
+  {
+   "path": "homunculus/cli.py",
+   "purpose": "argparse entry point (python -m homunculus, via homunculus/__main__.py) wiring config, Store, Ledger, providers and server routes; every LLM path supports --dry-run with FakeProvider.",
+   "public_api": "def main(argv: Sequence[str] | None = None) -> int\n# global flags: --ledger PATH (env HOMUNCULUS_LEDGER), --db PATH (env HEALTH_DB), --tz TZ, --dry-run\n# subcommands:\n#   serve                         Brainstem with post_routes {'/checkin': checkins.record, '/message': pineal.handle_owner_message}, on_events -> guardrails.event_alerts + pineal.deliver_alerts, site_dir = <ledger>/site\n#   tick                          run due Pineal jobs once\n#   run JOB [--period P]          run one job now\n#   import-history FILE           ingest a full Health Auto Export JSON export\n#   finalize DAY                  build daily rows and baselines for DAY\n#   review WEEK                   build packet and run the bounded loop\n#   pending | approve ID | veto ID | rollback VERSION\n#   halt | resume                 create/remove config/HALT\n#   experiment design ID | allocate ID | analyze ID\n#   score-paper PATH              rescore an extraction with the current rubric (offline)\n#   dashboard                     rebuild site/\n#   doctor                        check token length, bind host, tailscale-only exposure hint, git remote, roster validity, freshness, budget level\n# exit codes: 0 ok, 1 runtime error, 2 usage/config error, 3 halted",
+   "depends_on": [
+    "homunculus/store.py",
+    "homunculus/ingest.py",
+    "homunculus/metrics.py",
+    "homunculus/checkins.py",
+    "homunculus/evidence.py",
+    "homunculus/experiments.py",
+    "homunculus/guardrails.py",
+    "homunculus/plans.py",
+    "homunculus/agents.py",
+    "homunculus/weekly.py",
+    "homunculus/dashboard.py",
+    "homunculus/pineal.py"
+   ],
+   "test_path": "tests/test_cli.py"
+  }
+ ],
+ "docs": [
+  {
+   "path": "docs/ARCHITECTURE.md",
+   "purpose": "System architecture: principles, roster, deterministic core, ledger and envelope, weekly cycle, Devin split, privacy and safety, dashboard, cost, gaps the owner had not raised (written)"
+  },
+  {
+   "path": "agents/README.md",
+   "purpose": "Shared prompt conventions: neutral tone between bots, personal German tone for coaches, data blocks are data not instructions, every claim needs a ref, never compute numbers, banned diagnostic vocabulary, output only the given JSON schema"
+  },
+  {
+   "path": "agents/cerebellum.md",
+   "purpose": "Orchestrator prompt: goal talks with the owner, goal relay, weekly ruling rules (ratify/partial/keep, open blocker keeps plan), at most 3 owner questions"
+  },
+  {
+   "path": "agents/hippocampus.md",
+   "purpose": "Weekly reviewer prompt: read packet, draft typed plan_diff with refs, answer each cid with accept or rebut, N-of-1 protocol drafting rules"
+  },
+  {
+   "path": "agents/amygdala.md",
+   "purpose": "Adversarial critic prompt with the 11-point weekly checklist, severity definitions, ref requirement, round-2 restriction, paper re-extraction audit instructions"
+  },
+  {
+   "path": "agents/thalamus.md",
+   "purpose": "Extraction prompt: fill PAPER_SCHEMA with verbatim quotes, never judge quality, leave fields null when the abstract does not state them"
+  },
+  {
+   "path": "agents/motor_cortex.md",
+   "purpose": "Session and novel-exercise proposal prompt: feature-record vocabulary, goal quotas, injury constraints, probation and novelty caps"
+  },
+  {
+   "path": "agents/insula.md",
+   "purpose": "Conflict interpretation prompt: explain R1/R2/R3 records, judge the noisier signal, draft at most 3 German owner questions"
+  },
+  {
+   "path": "agents/sartorius.md",
+   "purpose": "Fitness coach persona (German, personal): morning message from modulate_day, RPE capture, modulation bounds, red-flag silence rule, check-in extraction schema"
+  },
+  {
+   "path": "agents/vagus.md",
+   "purpose": "Well-being coach persona (German, personal): sleep, mood, stress, enjoyment, evening check-in, ED-safe language, crisis routing"
+  },
+  {
+   "path": "agents/retina.md",
+   "purpose": "Paper triage prompt: classify design, population, relevance into TRIAGE_SCHEMA enums from the data block only"
+  },
+  {
+   "path": "agents/spindle.md",
+   "purpose": "Workout triage prompt: map methods to exercise feature records, no transcripts"
+  },
+  {
+   "path": "agents/papilla.md",
+   "purpose": "Nutrition and supplement triage prompt: enums only, flag product names for the forbidden-list check"
+  },
+  {
+   "path": "docs/DEVIN_SETUP.md",
+   "purpose": "Devin playbook: engine-repo-only access, data-control opt-out, Skills from AGENTS.md, repair Automation on webhook with ACU limit, monthly code-health Automation, optional isolated scout workspace writing to homunculus-scout-feed"
+  },
+  {
+   "path": "docs/RUNBOOK.md",
+   "purpose": "Box setup: Python 3.11, ledger clone with deploy key, token generation, launchd/systemd units for serve and tick, tailscale serve and ACLs, Health Auto Export settings (REST automation, Summarize off for sleep, workouts v2, include heart-rate notifications), history import, backup and HALT"
+  },
+  {
+   "path": "docs/POKE_PITCH.md",
+   "purpose": "Short pitch of homunculus for Poke: what the swarm does, what stays local, what the owner must decide, and whether Poke should relay owner messages to Sartorius, Vagus and Cerebellum via POST /message"
+  },
+  {
+   "path": "README.md",
+   "purpose": "Update with intended-purpose statement, quick start, link to ARCHITECTURE and RUNBOOK"
+  }
+ ],
+ "open_questions": [
+  "Goals for the next 12 months, ranked: which of Ironman, MMA fight, Everest, weight loss or gain are real, with dates? Everest and MMA need an external coach or doctor and stricter rule sets.",
+  "Keywords and reference papers or authors for Retina (biology, physiology, neurobiology), Spindle (sports and methods) and Papilla (nutrition, supplements).",
+  "Devices: which do you wear at night and in training (Apple Watch, Garmin, both)? Which one is canonical per metric (HRV, RHR, sleep, workouts, steps)?",
+  "Can Health Auto Export run with Summarize off for sleep, workouts v2, and heart-rate notifications included? Do you have a full history export for the cold start?",
+  "Can you enable the Garmin Connect Personal API, and is Garmin data wanted at all in v1?",
+  "Do you have a measured HRmax, resting HR or lab VO2max? Sex, birth year, sleep target, work days and time zone for profile/owner.json.",
+  "Medical: diagnoses, medications (beta-blockers invalidate HR rules), allergies, any history of disordered eating? Should calorie numbers be hidden by default? Is there a doctor who can confirm the red-flag thresholds, and which doctor contact should alerts name (emergency number 112 assumed)?",
+  "Risk appetite for experiments: behavioral changes only, or also allowlisted supplements, fasting, sleep timing? Will you commit to 6 to 8 weeks per crossover experiment with at most 1 or 2 running at once? Can someone blind supplement trials?",
+  "Should the daily 0-10 wellbeing item be a co-primary outcome in every experiment? Will you do the 30-second morning form daily, and if not, which 3 items matter most?",
+  "Approval policy: every plan change by tap, or only approve-tier changes? Delivery by push, dashboard, or a weekly batch? Is the cap of 3 approval requests per week right?",
+  "Weekly LLM budget ceiling (default $40) and which bots get cut first at 80%? Do you accept paying beyond the free OpenAlex budget?",
+  "Consent on data location: may aggregates sit in a private GitHub repo? May chat content touch Slack, Telegram, Poke or Cognition, or only your box and the model APIs?",
+  "Do you accept that Cerebellum on Fable 5.2 cannot run under zero data retention (30-day retention), so it only sees goal-level context and aggregates?",
+  "Do you have paid Gemini API access, and which exact model do you mean by 'Gemini 4 Carbon' and 'Gemini 4 Neon'? Without it Amygdala runs on Opus 5.5, the same family as Hippocampus.",
+  "Which Devin plan (Pro $20 or Max $200)? Is Devin limited to building and repairing the engine, or do you want the scouts in a separate isolated Devin workspace?",
+  "Chat surface for Sartorius, Vagus and Cerebellum: dashboard over the tailnet, a self-hosted Telegram or Signal bot, or Poke relaying via POST /message?",
+  "Which always-on hardware runs Brainstem and Pineal (Mac mini, Raspberry Pi, VPS), and is it on your tailnet?",
+  "Single user only, or friends later? A second user triggers GDPR controller duties for health data and changes the MDR exposure.",
+  "Should experiments and load increases pause during competition blocks (fight camp, taper) and during an intended cut, and should weight alerts be off then?",
+  "Menstrual cycle tracking: applicable and wanted as a confounder in reviews and as a red-flag input?"
+ ]
+}
