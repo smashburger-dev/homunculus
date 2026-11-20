@@ -1,0 +1,13 @@
+# personal health data never enters git unencrypted
+*.db
+*.db-journal
+*.sqlite
+health_raw/
+ledger/private/
+.env
+*.key
+__pycache__/
+*.pyc
+.venv/
+dist/
+site/
