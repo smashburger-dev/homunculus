@@ -317,6 +317,18 @@ class BuildTests(unittest.TestCase):
         self.assertIn("30,00 $", pages["budget.html"])
         self.assertIn('action="/checkin"', pages["checkin.html"])
         self.assertIn(TODAY, pages["checkin.html"])
+        self.assertFalse(any('data-synthetic="demo"' in page for page in pages.values()))
+
+    def test_demo_build_marks_every_page_and_uses_relative_urls(self) -> None:
+        paths = dashboard.build(self.store, self.ledger, self.tmp / "site", NOW, self.cfg, demo=True)
+        for path in paths:
+            page = path.read_text(encoding="utf-8")
+            _assert_safe_page(self, page)
+            self.assertEqual(page.count(dashboard.DEMO_BANNER), 1, path.name)
+            self.assertIn("synthetisch", page)
+            self.assertIn("fiktiv", page)
+            self.assertEqual(re.findall(r'(?:href|src|action)="/', page), [], path.name)
+        self.assertIn('action="checkin"', paths[-1].read_text(encoding="utf-8"))
 
     def _today_page(self) -> str:
         paths = dashboard.build(self.store, self.ledger, self.tmp / "site", NOW, self.cfg)

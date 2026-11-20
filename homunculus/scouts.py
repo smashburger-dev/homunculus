@@ -614,6 +614,14 @@ def _section(keywords: Mapping[str, Any], scout: str | None) -> Mapping[str, Any
     return inner if isinstance(inner, Mapping) else keywords
 
 
+def has_keywords(keywords: Any, scout: str) -> bool:
+    """True when the scout's section holds a query or a ranking term; else a run would find nothing."""
+    if not isinstance(keywords, Mapping):
+        return False
+    section = _section(keywords, scout)
+    return bool(section.get("queries") or section.get("terms"))
+
+
 def _term_weights(section: Mapping[str, Any]) -> dict[str, float]:
     terms = section.get("terms") or {}
     if isinstance(terms, Mapping):

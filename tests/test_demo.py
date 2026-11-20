@@ -106,6 +106,8 @@ class DemoEndToEndTest(DemoCase):
         self.assertNotIn("<script src", html)
         for page in ("plan.html", "week.html", "challenges.html", "budget.html", "checkin.html"):
             self.assertTrue((self.root / "site" / page).is_file(), page)
+        for page in (self.root / "site").glob("*.html"):
+            self.assertIn('data-synthetic="demo"', page.read_text(encoding="utf-8"), page.name)
 
     def test_dashboard_shows_conflicts_and_experiment(self) -> None:
         site = self.root / "site"

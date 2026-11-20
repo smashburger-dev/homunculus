@@ -113,6 +113,11 @@ LEVEL_DE: Mapping[str, str] = {
     "normal": "normal", "reduced": "reduziert (ab 80 %)", "core_only": "nur Kernjobs (100 %)",
 }
 REDUCE_AT = 0.8
+DEMO_BANNER = (
+    '<p class="demo" role="note" data-synthetic="demo">Demo: Alle Werte sind synthetisch, '
+    "die Person ist fiktiv. Das Check-in-Formular speichert nichts. "
+    '<span lang="en">Every value is synthetic; the person is fictional.</span></p>'
+)
 
 _CSP = ("default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
         "form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
@@ -157,6 +162,7 @@ border:1px solid var(--line);border-radius:8px;padding:.5rem}
 button{background:var(--accent);color:var(--bg);border:0;border-radius:8px;
 padding:.65rem 1.3rem;font:inherit;font-weight:600}
 footer{color:var(--muted);font-size:.85rem;padding-bottom:2rem}
+.demo{border:1px dashed var(--accent);border-radius:8px;padding:.4rem .8rem;margin:0 0 .5rem}
 """.strip()
 
 
@@ -949,12 +955,22 @@ def _write_atomic(path: Path, text: str) -> Path:
     return path
 
 
-def build(store: Store, ledger: Ledger, out_dir: Path, now: datetime, cfg: MetricsConfig) -> list[Path]:
-    """Render every page and write it atomically into out_dir; returns paths in PAGES order."""
+def _with_banner(page: str) -> str:
+    return page.replace("<header>", "<header>" + DEMO_BANNER, 1)
+
+
+def build(store: Store, ledger: Ledger, out_dir: Path, now: datetime, cfg: MetricsConfig,
+          demo: bool = False) -> list[Path]:
+    """Render every page and write it atomically into out_dir; returns paths in PAGES order.
+
+    demo=True puts DEMO_BANNER on every page and points the check-in form at a
+    relative URL, so the pages work from any sub-path of a static host.
+    """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     day = _local_day(now, cfg.tz)
     review = _latest_review(_all_messages(ledger))
+    form = checkins.morning_form_html(day, "checkin" if demo else "/checkin")
     pages = {
         "index.html": _today_html(store, ledger, now, cfg, day),
         "plan.html": render_plan(*_plan_pair(ledger)),
@@ -962,6 +978,7 @@ def build(store: Store, ledger: Ledger, out_dir: Path, now: datetime, cfg: Metri
         "challenges.html": render_challenges(review, _week_conflicts(ledger, review)),
         "experiments.html": render_experiments(_experiments(ledger), _frontier_html(ledger)),
         "budget.html": render_budget(*_budget_inputs(ledger, now)),
-        "checkin.html": _page("checkin.html", "Check-in", f"<section>{checkins.morning_form_html(day)}</section>"),
+        "checkin.html": _page("checkin.html", "Check-in", f"<section>{form}</section>"),
     }
-    return [_write_atomic(out / name, pages[name]) for name, _ in PAGES]
+    finish = _with_banner if demo else str
+    return [_write_atomic(out / name, finish(pages[name])) for name, _ in PAGES]

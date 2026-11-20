@@ -35,8 +35,7 @@ from .beliefs import Prior
 
 # --- versioned constants (DC values: docs/EVIDENCE_WEIGHTS.md, reviewed commits only) ---
 
-# The thal-2 rules below are live. The label stays 'thal-1' until the CLI wiring
-# step bumps it together with tests/test_cli.py, which pins the stored label.
+# The thal-2 rules below are live. tests/test_cli.py pins the stored label.
 RUBRIC_VERSION: str = "thal-2"
 DESIGNS = (
     "meta_rct", "rct_parallel", "rct_crossover", "cohort_prospective", "case_control",

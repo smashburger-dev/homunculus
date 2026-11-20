@@ -456,6 +456,10 @@ class JobFunctionTest(PinealCase):
     def test_scout_without_keywords_is_skipped(self) -> None:
         out = pineal.run_job(self.ctx, self.job("retina"), DAY)
         self.assertEqual(out["status"], "skipped")
+        empty = {s: {"queries": [], "terms": [], "pub_type_weights": {}} for s in ("retina", "spindle", "papilla")}
+        self.ledger.write_json("config/keywords.json", empty, author="pineal")  # the init-ledger template
+        out = pineal.run_job(self.ctx, self.job("spindle"), DAY)
+        self.assertEqual((out["status"], out["message"]), ("skipped", "no keywords"))
 
     def test_llm_job_defers_on_budget(self) -> None:
         self.ledger.write_text("config/HALT", "", author="pineal")

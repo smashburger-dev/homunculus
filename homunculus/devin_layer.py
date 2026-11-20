@@ -737,6 +737,7 @@ WEBHOOK_HEADER = "X-Webhook-Secret"
 WEBHOOK_SECRET_NAME = "HOMUNCULUS_WEBHOOK_SECRET"
 RELAY_URL_NAME = "HOMUNCULUS_RELAY_URL"  # https://<worker host>, no trailing path
 RELAY_TOKEN_NAME = "HOMUNCULUS_RELAY_TOKEN"  # the Worker's FETCH_TOKEN
+MAILTO_NAME = "HOMUNCULUS_MAILTO"  # contact address the scouts and the full-text resolver send
 RELAY_HOST = "<your-relay>.workers.dev"  # placeholder: replace with the Worker's host in the Automations form
 RELAY_POINTER_MAX_BYTES = 1024
 DEFAULT_MAX_ITEMS = 10  # Devin's documented default per script run
@@ -897,7 +898,8 @@ def _script(defn: AutomationDef, x: _Export) -> dict:
 
 def _secrets(defn: AutomationDef, x: _Export) -> list[str]:
     relay = [RELAY_TOKEN_NAME, RELAY_URL_NAME] if defn.relay else []
-    return sorted([PROVIDER_SECRETS[p] for p in _providers(defn, x)] + relay)
+    mailto = [MAILTO_NAME] if EVIDENCE_JOBS.intersection(defn.jobs) else []  # PubMed and Crossref contact
+    return sorted([PROVIDER_SECRETS[p] for p in _providers(defn, x)] + relay + mailto)
 
 
 def _spec(defn: AutomationDef, x: _Export) -> dict:

@@ -343,6 +343,9 @@ class AutomationTest(unittest.TestCase):
             self.assertEqual(by_name[code_only]["secrets"], [], code_only)
             self.assertNotIn("api.anthropic.com", by_name[code_only]["network_allowlist"])
         self.assertTrue(scouts.ALLOWED_HOSTS <= set(by_name["retina-scout"]["network_allowlist"]))
+        for evidence_job in ("retina-scout", "spindle-scout", "papilla-scout", "thalamus"):
+            self.assertIn(devin_layer.MAILTO_NAME, by_name[evidence_job]["secrets"], evidence_job)
+        self.assertNotIn(devin_layer.MAILTO_NAME, by_name["weekly-review"]["secrets"])
 
     def test_committed_specs_match_the_generator(self) -> None:
         """devin/automations/<path>/ is regenerated with write_automations; hosts follow scouts.ALLOWED_HOSTS."""

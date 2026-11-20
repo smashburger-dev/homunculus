@@ -1000,7 +1000,7 @@ def step_tracker(run: Run) -> dict:
 
 
 def step_dashboard(run: Run) -> list[Path]:
-    return dashboard.build(run.store, run.ledger, run.root / "site", run.cal.now, run.cfg)
+    return dashboard.build(run.store, run.ledger, run.root / "site", run.cal.now, run.cfg, demo=True)
 
 
 # --------------------------------------------------------------------------

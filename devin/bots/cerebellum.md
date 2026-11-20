@@ -33,7 +33,7 @@ In every session: the engine is the working directory, the ledger at `$HOMUNCULU
 
 ## Automations to set up
 
-`homunculus-cerebellum-sunday` and `homunculus-cerebellum-monthly` from `devin/automations/<path>/`: RRULE and time zone from the specs, ACU limit 1 each, network `github.com` and `api.anthropic.com`, secret `ANTHROPIC_API_KEY`, the specs' prompts. Ask the owner before you create or change any Automation.
+`homunculus-cerebellum-sunday` and `homunculus-cerebellum-monthly` from `devin/automations/<path>/`: RRULE and time zone from the specs, ACU limit 1 each, network `github.com` only and no secret, because both jobs run code and call no model, the specs' prompts. Goal talks in chat still call Fable 5.2, so the Bot keeps `ANTHROPIC_API_KEY` as a secret. Ask the owner before you create or change any Automation.
 
 Usage caps on this Bot and the others are the owner's call. Never raise one on your own.
 

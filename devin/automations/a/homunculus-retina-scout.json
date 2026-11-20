@@ -39,7 +39,8 @@
     "state_file": "STATE_FILE"
   },
   "secrets": [
-    "ANTHROPIC_API_KEY"
+    "ANTHROPIC_API_KEY",
+    "HOMUNCULUS_MAILTO"
   ],
   "trigger": {
     "rrule": "FREQ=DAILY;BYHOUR=3;BYMINUTE=0;BYSECOND=0",

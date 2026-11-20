@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"><meta name="referrer" content="no-referrer"><meta name="robots" content="noindex,nofollow"><title>Experimente · homunculus</title><style>:root{color-scheme:light dark;--bg:#f7f7f5;--card:#fff;--fg:#1d1d1b;--muted:#5f5f5a;
+--line:#e3e3de;--accent:#0f766e}
+@media (prefers-color-scheme:dark){:root{--bg:#121413;--card:#1a1d1c;--fg:#e6e6e1;
+--muted:#a2a29b;--line:#2c302e;--accent:#5eead4}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
+header,main,footer{max-width:46rem;margin:0 auto;padding:0 1rem}
+header{padding-top:1rem}
+nav{display:flex;flex-wrap:wrap;gap:.25rem .9rem;margin:.5rem 0 1rem}
+nav a{color:var(--muted);text-decoration:none;padding:.2rem 0}
+nav a[aria-current=page]{color:var(--fg);font-weight:600;border-bottom:2px solid var(--accent)}
+h1{font-size:1.35rem;margin:.2rem 0}
+h2{font-size:1.05rem;margin:0 0 .6rem}
+h3{font-size:1rem;margin:.8rem 0 .3rem}
+a{color:var(--accent)}
+section,article{background:var(--card);border:1px solid var(--line);border-radius:12px;
+padding:1rem;margin:0 0 1rem}
+table{width:100%;border-collapse:collapse}
+th,td{padding:.4rem .3rem;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{font-weight:600;color:var(--muted);font-size:.85rem}
+.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.muted{color:var(--muted)}
+.big{font-size:1.6rem;font-weight:600;font-variant-numeric:tabular-nums}
+.badge{display:inline-block;border:1px solid var(--accent);color:var(--accent);
+border-radius:999px;padding:0 .55rem;font-size:.8rem;white-space:nowrap}
+.alert{border-left:4px solid var(--fg);padding:.4rem .8rem;margin:.5rem 0}
+.alert.urgent{border-left-width:8px;font-weight:600}
+.spark,.bar{color:var(--accent);vertical-align:middle}
+.body{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;margin:.5rem 0}
+code{overflow-wrap:anywhere}
+ul{padding-left:1.2rem;margin:.3rem 0}
+fieldset{border:1px solid var(--line);border-radius:8px;margin:0 0 .8rem;padding:.6rem .8rem}
+fieldset label{display:inline-block;min-width:2.6rem;padding:.35rem .2rem}
+textarea{width:100%;font:inherit;background:var(--bg);color:var(--fg);
+border:1px solid var(--line);border-radius:8px;padding:.5rem}
+button{background:var(--accent);color:var(--bg);border:0;border-radius:8px;
+padding:.65rem 1.3rem;font:inherit;font-weight:600}
+footer{color:var(--muted);font-size:.85rem;padding-bottom:2rem}
+.demo{border:1px dashed var(--accent);border-radius:8px;padding:.4rem .8rem;margin:0 0 .5rem}</style></head><body><header><p class="demo" role="note" data-synthetic="demo">Demo: Alle Werte sind synthetisch, die Person ist fiktiv. Das Check-in-Formular speichert nichts. <span lang="en">Every value is synthetic; the person is fictional.</span></p><h1>Experimente</h1><nav><a href="index.html">Heute</a><a href="plan.html">Plan</a><a href="week.html">Woche</a><a href="challenges.html">Einwände</a><a href="experiments.html" aria-current=page>Experimente</a><a href="budget.html">Budget</a><a href="checkin.html">Check-in</a></nav></header><main><article><h2><code>exp-abendlicht</code> <span class="badge">läuft</span></h2><table><thead><tr><th>Feld</th><th>Wert</th></tr></thead><tbody><tr><td>Intervention</td><td>Licht ab 21 Uhr gedimmt gegen Licht wie gewohnt</td></tr><tr><td>Zielgröße</td><td>hrv_sdnn_ln (watch)</td></tr><tr><td>Design</td><td>paired_blocks, 6 Paare à 7 Tage, 2 Tage Auswaschung</td></tr><tr><td>Start</td><td>2026-11-16</td></tr></tbody></table></article><section><h2>Frontier</h2><p class="muted">Neue Arbeiten mit niedriger Sicherheit, aber hohem Potenzial und sauberer Methodik. Code prüft die Wirkkette Glied für Glied.</p><table><thead><tr><th>Intervention</th><th>Zielgröße</th><th>Entscheidung</th><th class="num">Schwächstes Glied</th><th class="num">Am Menschen gezeigt</th><th>Gründe</th></tr></thead><tbody><tr><td>Time-restricted eating</td><td>Overnight heart rate variability</td><td>N-of-1-Kandidat</td><td class="num">0,5</td><td class="num">67 %</td><td>–</td></tr></tbody></table></section><section><h2>Lexikon</h2><table><thead><tr><th>Von</th><th>Nach</th><th>Urteil</th><th class="num">Stützung</th><th>Mensch</th></tr></thead><tbody><tr><td>Time-restricted eating</td><td>Circadian clock alignment</td><td>gestützt</td><td class="num">2,5</td><td>ja</td></tr><tr><td>Circadian clock alignment</td><td>Nocturnal vagal tone</td><td>gestützt</td><td class="num">0,5</td><td>nein</td></tr><tr><td>Nocturnal vagal tone</td><td>Overnight heart rate variability</td><td>gestützt</td><td class="num">0,5</td><td>ja</td></tr></tbody></table><p>Offene Fragen:</p><ul><li>Hebt eine bessere Ausrichtung der inneren Uhr den nächtlichen Vagotonus auch beim Menschen?</li></ul></section></main><footer><p lang="de">Persönliches Werkzeug zur Trainings- und Lebensstilplanung für eine gesunde erwachsene Person, zur persönlichen, nicht kommerziellen Nutzung. Nicht dazu bestimmt, Krankheiten oder Verletzungen zu diagnostizieren, zu verhüten, zu überwachen, vorherzusagen, zu behandeln oder zu lindern.</p><p lang="en">Personal training and lifestyle planning tool for one healthy adult, for personal non-commercial use. Not intended to diagnose, prevent, monitor, predict, treat or alleviate any disease or injury.</p></footer></body></html>

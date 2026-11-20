@@ -30,7 +30,8 @@
   "runs_on": "cloud",
   "schema": 1,
   "secrets": [
-    "ANTHROPIC_API_KEY"
+    "ANTHROPIC_API_KEY",
+    "HOMUNCULUS_MAILTO"
   ],
   "trigger": {
     "rrule": "FREQ=WEEKLY;BYDAY=TH,FR;BYHOUR=4;BYMINUTE=0;BYSECOND=0",

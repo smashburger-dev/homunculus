@@ -1006,7 +1006,7 @@ def _job_red_flags(ctx: Context, _period: str) -> JobResult:
 def _scout_job(scout: str) -> Callable[[Context, str], JobResult]:
     def run(ctx: Context, _period: str) -> JobResult:
         keywords = ctx.ledger.read_json("config/keywords.json")
-        if not isinstance(keywords, Mapping) or not keywords:
+        if not scouts.has_keywords(keywords, scout):
             return JobResult("skipped", (), "no keywords")
         if ctx.budget.level() != "normal":
             return JobResult("skipped", (), "scouts paused by budget")

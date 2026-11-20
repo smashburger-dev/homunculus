@@ -657,6 +657,9 @@ class DoctorTest(CliCase):
         self.assertIn("ok   roster", out)
         self.assertIn("ok   plan: v0001", out)
         self.assertIn("budget", out)
+        names = [line[5:].split(":")[0] for line in out.splitlines() if line[:4].strip() in ("ok", "warn", "fail", "info")]
+        help_text = cli.build_parser()._subparsers._group_actions[0].choices["doctor"].description
+        self.assertEqual(", ".join(names).replace("bind", "bind host"), help_text.removeprefix("check "))
 
     def test_reports_missing_plan_and_push_channel(self) -> None:
         env = {"HEALTH_TOKEN": TOKEN}

@@ -7,7 +7,7 @@ Plan for about two hours. Run the synthetic demo (step 12) before any real data 
 ## 0. Decide the path
 
 - Path (a), serverless: no hardware. Health Auto Export sends one daily summary to a Devin webhook. Coarse data, red flags twice a day, the daily summaries live in the private ledger's git history.
-- Path (b), own box: a Mac mini or Raspberry Pi runs `homunculus serve` and Pineal, and is a Devin Outpost, so raw samples never leave it. Hourly data and red flags. Red flags reach your phone only through `HOMUNCULUS_PUSH_URL`, for example an ntfy topic, and `HOMUNCULUS_PUSH_TOKEN`, its access token, both in the box's env file. Path (b) requires both: without them Pineal writes alerts to `mail/owner/inbox/` and nowhere else, so `tick --devin-path b` still runs its jobs but exits 1 on every run, and `serve` warns at start. Set the box up first with [RUNBOOK.md](RUNBOOK.md), then come back here.
+- Path (b), own box: a Mac mini or Raspberry Pi runs `homunculus serve` and Pineal, and is a Devin Outpost, so raw samples never leave it. Hourly data and red flags. Red flags reach your phone only through `HOMUNCULUS_PUSH_URL`, for example an ntfy topic, and `HOMUNCULUS_PUSH_TOKEN`, its access token, both in the box's env file. Path (b) requires both. Without the URL Pineal writes alerts to `mail/owner/inbox/` and nowhere else, so `tick --devin-path b` still runs its jobs but exits 1 on every run, and `serve` warns at start. Without the token anyone who knows the URL can read the alerts, and `doctor` warns. Set the box up first with [RUNBOOK.md](RUNBOOK.md), then come back here.
 
 You can start on (a) and move to (b) later: the ledger format is the same. Write the letter down; every Bot instruction and Automation uses it.
 
@@ -21,7 +21,7 @@ cd ~/homunculus
 python3 -m homunculus init-ledger ~/homunculus-ledger-<you>
 ```
 
-Create an empty private GitHub repo `homunculus-ledger-<you>`, add it as `origin` of the new ledger and push. Never make it public, never fork it into a public account, never turn on GitHub Pages for it.
+Create an empty private GitHub repo `homunculus-ledger-<you>`, add it as `origin` of the new ledger, and push at the end of this step. Never make it public, never fork it into a public account, never turn on GitHub Pages for it.
 
 Edit `profile/owner.json` (time zone, sleep target, training status) and `config/cadence.json`:
 
@@ -29,13 +29,15 @@ Edit `profile/owner.json` (time zone, sleep target, training status) and `config
 {"schema": 1, "tz": "Europe/Berlin", "jobs": {}, "devin": {"max_acu": {}}}
 ```
 
-`jobs` takes overrides such as `{"sartorius_morning": {"at": "06:45"}}`; `devin.max_acu` takes per-Automation ACU limits such as `{"weekly-review": 4}`. Commit, then write the first plan:
+`jobs` takes overrides such as `{"sartorius_morning": {"at": "06:45"}}`; `devin.max_acu` takes per-Automation ACU limits such as `{"weekly-review": 4}`. `init-ledger` writes `{"schema": 1, "jobs": {}}` without `tz`. Add it: `devin-export` reads the time zone from `config/cadence.json` or `--tz`, never from `profile/owner.json`, and falls back to UTC. `init-ledger` commits nothing, so commit the skeleton with your edits, then write the first plan:
 
 ```sh
+git -C ~/homunculus-ledger-<you> add -A
+git -C ~/homunculus-ledger-<you> commit -m "Ledger skeleton"
 python3 -m homunculus --ledger ~/homunculus-ledger-<you> init-plan
 ```
 
-The starter plan has no fixed sessions; the first weekly review proposes them from `config/goals.md`. `--from FILE` takes your own plan content instead, without a kcal target. `init-plan` commits on its own. Push.
+The starter plan has no fixed sessions; the first weekly review proposes them from `config/goals.md`. `--from FILE` takes your own plan content instead, without a kcal target. `init-plan` commits on its own. Then push: `git -C ~/homunculus-ledger-<you> push -u origin HEAD`.
 
 ## 2. Turn on the data-control opt-out
 
@@ -87,6 +89,8 @@ Per Bot, in its connections, add secrets by name. Values come from the provider 
 | `ANTHROPIC_API_KEY` | yes | yes | yes | yes |
 | `GEMINI_API_KEY` | | | | only once Amygdala moves to a paid Gemini model |
 | `HOMUNCULUS_MAILTO` | | | | yes, a contact address for PubMed and Crossref |
+| `HOMUNCULUS_RELAY_URL` | | | | path (a), the Worker's `https://<host>` without a path |
+| `HOMUNCULUS_RELAY_TOKEN` | | | | path (a), the Worker's `FETCH_TOKEN` |
 
 Use an Anthropic key from a workspace with a monthly spend limit. Tracker tokens (Garmin, WHOOP and the rest) never go into Devin: they live on the box, outside every git tree ([TRACKER_CONTRACT.md](TRACKER_CONTRACT.md)). On path (b), `HOMUNCULUS_PUSH_URL` and `HOMUNCULUS_PUSH_TOKEN` stay out of Devin too: Pineal on the box sends the push, so they go into the box's env file ([RUNBOOK.md](RUNBOOK.md#2-engine-ledger-secrets)).
 
@@ -152,7 +156,7 @@ python3 -m unittest discover -s tests
 1. Hippocampus, `weekly-review`. Expect exit 0 and JSON whose `runs` show the job, and no Report.
 2. Sartorius, `sartorius-morning`. Expect one iMessage with the placeholder text `x`.
 3. Vagus and Cerebellum the same way in Slack.
-4. Path (a): post a synthetic payload to the webhook, for example `{"data": {"metrics": [{"name": "step_count", "units": "count", "data": [{"date": "2026-11-19 12:00:00 +0000", "qty": 1000, "source": "Synthetic"}]}]}}`. Check that the ledger gained one file under `data/summaries/` and one under `data/daily/`, then revert that commit in the ledger.
+4. Path (a): post a synthetic payload to the webhook, for example `{"data": {"metrics": [{"name": "step_count", "units": "count", "data": [{"date": "2026-11-19 12:00:00 +0000", "qty": 1000, "source": "Synthetic"}]}]}}`. Check that the ledger gained one file under `data/summaries/` and two under `data/daily/`, for 2026-11-19 and the following wake date 2026-11-20, then revert that commit in the ledger.
 
 Run without `--dry-run` only after all four work. On path (b), add `--ledger` with a scratch copy of the ledger to each dry run: a dry run still appends to `ops/runs.jsonl`, and the real job would then count as done for that period.
 

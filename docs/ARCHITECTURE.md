@@ -6,7 +6,7 @@ Status: design, 2026-11-20. Claims marked UNVERIFIED were not confirmed against 
 
 homunculus coaches one person. It reads their tracker data (Apple Health through Health Auto Export, later Garmin), their daily check-ins and new research, and keeps a training, nutrition and recovery plan up to date. The plan changes once a week, after an argued review. On any day the coaches adjust the session only inside bounds the plan already sets.
 
-Better numbers are a means. Success means the owner enjoys training and life more, so a daily 0–10 wellbeing score sits next to every physiological metric and every experiment.
+Better numbers are a means. Success means the owner enjoys training and life more, so a daily 0 to 10 wellbeing score sits next to every physiological metric and every experiment.
 
 ## Principles
 
@@ -65,11 +65,11 @@ A Health Auto Export history import gives baselines on day one. Without it, HRV 
 
 `O_d` is the mean z of HRV m7, −RHR and TST. `S_d` is the mean item z against each item's own 28-day baseline. `D_d = S_d − O_d`. Rule R1 fires at |D| ≥ 1.5 on 3 of 5 days with one sign. R2 fires on one day at |D| ≥ 2.5 when S and O have opposite signs and each |·| ≥ 1. R3 regresses sRPE load on TRIMP over 60 days and flags a session residual z ≥ 2 ("felt much harder than heart rate says"). An input failing its quality check yields `DATA_GAP` instead. Each record stores numbers, window and rule ID. Insula explains the conflicts; it never creates them.
 
-### Evidence scoring (`evidence.py`, rubric `thal-1`)
+### Evidence scoring (`evidence.py`, rubric `thal-2`)
 
 Thalamus fills `paper.json`: design, n, population, outcome, effect with CI, registration, attrition, blinding, funding, I². Each field carries a verbatim quote, and a quote that is not a substring of the fetched abstract voids its field. Code overwrites title, authors, journal and `update_to` from Crossref.
 
-Certainty `c` runs 0–4. RCTs and meta-analyses of RCTs start at 4, cohorts at 2, cross-sectional and acute mechanistic studies at 1, animal at 0.5, in vitro at 0.25. A retraction sets 0, an expression of concern caps at 1. Downgrades cover bias, imprecision against the owner's SWC, inconsistency, population mismatch and trust (preprint, product-linked funding, implausible SMD > 1, GRIM failure). Non-randomized studies can gain for large effects or dose-response, and replications add up to +1.
+Certainty `c` runs 0 to 4. RCTs and meta-analyses of RCTs start at 4, cohorts at 2, cross-sectional and acute mechanistic studies at 1, animal at 0.5, in vitro at 0.25. A retraction sets 0, an expression of concern caps at 1. Downgrades cover bias, imprecision against the owner's SWC, inconsistency, population mismatch and trust (preprint, product-linked funding, implausible SMD > 1, GRIM failure). Non-randomized studies can gain for large effects or dose-response, and replications add up to +1.
 
 A paper becomes `actionable` at c ≥ 2 when a systematic review or two independent RCTs in a matching population stand behind it. A single RCT, or 1 ≤ c < 2, can only seed an N-of-1 experiment. Below 1 it goes to the watchlist. Amygdala re-extracts 10% of papers, and any field disagreement blocks scoring.
 
@@ -81,7 +81,7 @@ A paper becomes `actionable` at c ≥ 2 when a systematic review or two independ
 
 ### N-of-1 experiments (`experiments.py`)
 
-Only reversible, fast-acting, low-risk interventions qualify. The baseline is 21–28 days of one locked outcome from one locked source. Then come m pairs of L-day blocks, AB or BA per pair, with w washout days excluded at the start of each block.
+Only reversible, fast-acting, low-risk interventions qualify. The baseline is 21 to 28 days of one locked outcome from one locked source. Then come m pairs of L-day blocks, AB or BA per pair, with w washout days excluded at the start of each block.
 
 Before the start, code computes `n_eff = n(1−ρ)/(1+ρ)`, `SE = sqrt((2σ²/n_eff + τ_drift²)/m)` and `MDE = (t_{.975,m−1} + t_{.80,m−1})·SE`. It refuses the experiment when m < 6 (with 4 pairs no result can reach p < 0.05), when MDE > 2·SWC, or when the baseline mean lies outside ±1σ of the 90-day mean. `protocol.json` is committed before day 1 with its exclusion rules. The allocation seed is `int(sha256(protocol_bytes)[:16], 16)`, so nobody can re-roll after peeking.
 
@@ -93,7 +93,7 @@ Analysis is an exact sign-flip test on the pair differences plus a normal-normal
 |---|---|
 | Weekly sRPE load ≤ +10% vs trailing 4-week mean | auto |
 | Swap within the same pattern and load | notify |
-| Load +10–20%; novel exercise; supplement; kcal change > 5%; justification from a single study | approve |
+| Load +10 to 20%; novel exercise; supplement; kcal change > 5%; justification from a single study | approve |
 | Load > +20%, or > +30% over 2 weeks; more than 1 added hard session per week | reject |
 | Return after ≥ 7 days off | capped at 70% of the prior week |
 
@@ -103,7 +103,7 @@ A novel exercise enters at RPE ≤ 6 and ≤ 2 sets, with no eccentric overload,
 
 Nutrition has floors. Energy availability stays ≥ 30 kcal/kg FFM/day as a 7-day mean, and changes below 35 need approval. The kcal target moves at most 10% or 250 kcal a week, loss is capped at 1% BW/week, and no fast longer than 24 h is recommended. `ed_watch` fires on intake under the floor on 3 days a week, restrictive language, or more than one weigh-in a day. It pauses all deficit goals and points to professional help. Intake is the daily `intake_kcal` row, the sum of logged `dietary_energy` samples; energy availability per day is `(intake_kcal - active_kcal) / ffm_kg`. A day without a log stays empty, never 0, so untracked days do not count as fasts, and without `ffm_kg` in the profile only a logged 0 kcal day counts. `intake_kcal` feeds code checks only and stays out of LLM packets. The weekly review and Pineal's check-in and goal-talk contexts both compute it.
 
-`config/forbidden.json` blocks prescription drugs, the WADA Prohibited List, dehydration cuts above 2–3% of body mass and medical altitude protocols. Supplements come from an allowlist of Kölner Liste or Informed Sport tested products and are checked against `profile/meds.json`. Geyer 2004 found undeclared steroids in 14.8% of 634 supplements.
+`config/forbidden.json` blocks prescription drugs, the WADA Prohibited List, dehydration cuts above 2 to 3% of body mass and medical altitude protocols. Supplements come from an allowlist of Kölner Liste or Informed Sport tested products and are checked against `profile/meds.json`. Geyer 2004 found undeclared steroids in 14.8% of 634 supplements.
 
 Red flags are computed by code and sent as fixed German templates, with no LLM in the alert path. A doctor should confirm the thresholds.
 
@@ -193,12 +193,12 @@ Eleven bots as Devin sessions would pay for idle VMs, break the model tiers and 
 
 | Job | Runs on |
 |---|---|
-| All eleven LLM bots | Python on the box, calling the Anthropic Messages API (Gemini REST for Amygdala) with the model from `roster.json` |
-| Ingest, scheduling, metrics, scoring, guardrails, commits | Python on the box |
+| All eleven LLM bots | `homunculus` commands that call the Anthropic Messages API (Gemini REST for Amygdala once its model ID is confirmed) with the model from `roster.json`. With Devin they run inside the four Bots' sessions, without Devin in Pineal on the box |
+| Ingest, scheduling, metrics, scoring, guardrails, commits | Python. Path (a): Devin Automations and the `relay/` Worker. Path (b): Brainstem and Pineal on the box |
 | Building the engine | Devin sessions opening PRs against `homunculus` |
 | Repair after a failed job | Devin Automation on a webhook. Pineal sends a scrubbed incident (job, traceback without locals, commit sha) |
 | Monthly code-health review | Scheduled Devin Automation on the engine repo |
-| Scouts, if the owner wants them inside Devin | A separate workspace with no secrets and no ledger. It writes schema-valid candidates to `homunculus-scout-feed`, and Pineal pulls and re-validates them |
+| Scouts | Path (a): script Automations in the Hippocampus Bot that poll PubMed and start a session only for new ids. Path (b): Pineal on the box |
 
 Every Automation gets an ACU limit, and data-control opt-out is on. `docs/DEVIN_SETUP.md` has the steps.
 
@@ -233,7 +233,7 @@ Anthropic first-party prices per million tokens: Fable 5.2 $8/$40, Opus 5.5 $4/$
 | Hippocampus, 3 turns | 450K in, 45K out | 2.7 |
 | Amygdala, 2 turns (Opus price as proxy) | 250K in, 15K out | 1.3 |
 | Cerebellum (Fable) | 150K in, 15K out | 1.8 |
-| Total | | about 13; budget 20–35 with thinking |
+| Total | | about 13; budget 20 to 35 with thinking |
 
 Every call appends `usage` to `ops/budget.jsonl`, priced from `config/budget.json`. The default weekly cap is $40. At 80% the coaches drop to effort low and the scouts pause. At 100% only ingest, red flags and the weekly review run, and an alert goes out. The Devin plan ($20 Pro or $200 Max) and repair sessions come on top. Week one measures real thinking-token use.
 
@@ -243,7 +243,7 @@ Every call appends `usage` to `ops/budget.jsonl`, priced from `config/budget.jso
 - Eating-disorder risk. Daily weight feedback with calorie targets is a known trigger, hence the energy floor, weekly-averaged weights and `ed_watch`.
 - Supplement contamination and drug interactions.
 - Measurement limits: SDNN vs RMSSD, unreliable wrist sleep stages, VO2max as a trend only, double-counted steps across devices, baselines reset by device or firmware changes.
-- Cold start. Trends need 4–9 weeks of data or a history import.
+- Cold start. Trends need 4 to 9 weeks of data or a history import.
 - Statistics discipline: preregistration, one primary outcome, ≥ 6 pairs, regression to the mean.
 - Hallucinated and retracted citations, and prompt injection from scraped pages.
 - Retention per provider, and the GDPR duties that start with a second user.

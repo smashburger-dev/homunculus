@@ -1658,7 +1658,7 @@ def _add_tool_commands(subs: Any) -> None:
     score.add_argument("path")
     score.add_argument("--appraise", action="store_true", help="add promise, quality gate and frontier status")
     _sub(subs, "dashboard", cmd_dashboard, "rebuild site/")
-    _sub(subs, "doctor", cmd_doctor, "check token, bind host, exposure, push, plan, git, roster, freshness, budget")
+    _sub(subs, "doctor", cmd_doctor, "check token, bind host, exposure, push, plan, git, roster, freshness, budget, halt")
     _sub(subs, "init-ledger", cmd_init_ledger, "create the private ledger skeleton and git init it"
          ).add_argument("path")
     demo = _sub(subs, "demo", cmd_demo, "run the whole pipeline on synthetic data in a temporary ledger")
